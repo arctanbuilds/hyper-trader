@@ -7,9 +7,21 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import { Separator } from "@/components/ui/separator";
-import { Save, Shield, Zap, Target, Gauge, ExternalLink, Wallet } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Save, Shield, Zap, Target, Gauge, ExternalLink, Wallet, BarChart3, Clock, TrendingUp, Layers } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { useState, useEffect } from "react";
+
+const ALLOWED_ASSETS = [
+  { id: "BTC", label: "Bitcoin", ticker: "BTC", maxLev: 40 },
+  { id: "ETH", label: "Ethereum", ticker: "ETH", maxLev: 25 },
+  { id: "SOL", label: "Solana", ticker: "SOL", maxLev: 20 },
+  { id: "GOLD", label: "Gold", ticker: "xyz:GOLD", maxLev: 25 },
+  { id: "SILVER", label: "Silver", ticker: "xyz:SILVER", maxLev: 25 },
+  { id: "OIL", label: "Oil WTI", ticker: "xyz:CL", maxLev: 20 },
+  { id: "SP500", label: "S&P 500", ticker: "xyz:SP500", maxLev: 50 },
+  { id: "EURUSD", label: "EUR/USD", ticker: "xyz:EUR", maxLev: 50 },
+];
 
 export default function Settings() {
   const { toast } = useToast();
@@ -101,6 +113,42 @@ export default function Settings() {
         </CardContent>
       </Card>
 
+      {/* Asset Selection */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm flex items-center gap-2">
+            <Layers className="w-4 h-4" /> Tradeable Assets
+          </CardTitle>
+          <CardDescription className="text-xs">
+            Select which assets the bot can trade. Includes main perps and HIP-3 commodity/forex perps.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            {ALLOWED_ASSETS.map((asset) => {
+              // For now all assets are enabled — the engine uses the full whitelist
+              return (
+                <div
+                  key={asset.id}
+                  className="flex items-center justify-between p-2.5 rounded-md border border-border bg-muted/30"
+                >
+                  <div>
+                    <span className="text-xs font-medium">{asset.label}</span>
+                    <p className="text-[10px] text-muted-foreground font-mono">{asset.ticker}</p>
+                  </div>
+                  <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+                    {asset.maxLev}x
+                  </Badge>
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-[10px] text-muted-foreground mt-2">
+            Max leverage shown is per-asset Hyperliquid limit. Bot uses max available for each.
+          </p>
+        </CardContent>
+      </Card>
+
       {/* Strategy Parameters */}
       <Card>
         <CardHeader>
@@ -108,7 +156,7 @@ export default function Settings() {
             <Target className="w-4 h-4" /> Strategy Parameters
           </CardTitle>
           <CardDescription className="text-xs">
-            RSI thresholds and signal configuration
+            Multi-timeframe RSI thresholds and signal configuration
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
@@ -147,6 +195,46 @@ export default function Settings() {
             </div>
           </div>
 
+          <Separator />
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label className="text-xs">Min Confluence Score (1–7)</Label>
+              <div className="flex items-center gap-3">
+                <Slider
+                  value={[form.minConfluenceScore || 3]}
+                  onValueChange={([v]) => setForm({ ...form, minConfluenceScore: v })}
+                  min={1}
+                  max={7}
+                  step={1}
+                  className="flex-1"
+                />
+                <span className="text-xs font-mono w-8 text-right text-primary">
+                  {form.minConfluenceScore || 3}/7
+                </span>
+              </div>
+              <p className="text-[10px] text-muted-foreground">Higher = stricter signal filtering</p>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs">Min Risk:Reward Ratio</Label>
+              <div className="flex items-center gap-3">
+                <Slider
+                  value={[form.minRiskRewardRatio || 1.0]}
+                  onValueChange={([v]) => setForm({ ...form, minRiskRewardRatio: v })}
+                  min={0.5}
+                  max={5.0}
+                  step={0.1}
+                  className="flex-1"
+                />
+                <span className="text-xs font-mono w-12 text-right text-primary">
+                  1:{(form.minRiskRewardRatio || 1.0).toFixed(1)}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <Separator />
+
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label className="text-xs">Min 24h Volume (USD)</Label>
@@ -172,6 +260,60 @@ export default function Settings() {
         </CardContent>
       </Card>
 
+      {/* Confluence Filters */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm flex items-center gap-2">
+            <BarChart3 className="w-4 h-4" /> Confluence Filters
+          </CardTitle>
+          <CardDescription className="text-xs">
+            Toggle individual confluence checks. Each adds +1 to the score.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <Label className="text-xs">EMA Trend Filter</Label>
+              <p className="text-[10px] text-muted-foreground">Require price above/below EMA stack</p>
+            </div>
+            <Switch
+              checked={form.useEmaFilter ?? true}
+              onCheckedChange={(v) => setForm({ ...form, useEmaFilter: v })}
+            />
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <Label className="text-xs">Session Timing Filter</Label>
+              <p className="text-[10px] text-muted-foreground">Only trade during London/NY sessions</p>
+            </div>
+            <Switch
+              checked={form.useSessionFilter ?? true}
+              onCheckedChange={(v) => setForm({ ...form, useSessionFilter: v })}
+            />
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <Label className="text-xs">Macro Trend Filter</Label>
+              <p className="text-[10px] text-muted-foreground">Multi-timeframe RSI alignment</p>
+            </div>
+            <Switch
+              checked={form.useMacroFilter ?? true}
+              onCheckedChange={(v) => setForm({ ...form, useMacroFilter: v })}
+            />
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <Label className="text-xs">Liquidation Zone Filter</Label>
+              <p className="text-[10px] text-muted-foreground">Avoid entry near liquidation clusters</p>
+            </div>
+            <Switch
+              checked={form.useLiquidationFilter ?? true}
+              onCheckedChange={(v) => setForm({ ...form, useLiquidationFilter: v })}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
       {/* Risk Management */}
       <Card>
         <CardHeader>
@@ -179,7 +321,7 @@ export default function Settings() {
             <Gauge className="w-4 h-4" /> Risk Management
           </CardTitle>
           <CardDescription className="text-xs">
-            Leverage, position sizing, and stop/TP configuration
+            Leverage, position sizing, dual take profit, and stop/loss configuration
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
@@ -188,15 +330,16 @@ export default function Settings() {
               <Label className="text-xs">Max Leverage</Label>
               <div className="flex items-center gap-3">
                 <Slider
-                  value={[form.maxLeverage || 20]}
+                  value={[form.maxLeverage || 50]}
                   onValueChange={([v]) => setForm({ ...form, maxLeverage: v })}
                   min={1}
                   max={50}
                   step={1}
                   className="flex-1"
                 />
-                <span className="text-xs font-mono w-8 text-right font-medium">{form.maxLeverage || 20}x</span>
+                <span className="text-xs font-mono w-8 text-right font-medium">{form.maxLeverage || 50}x</span>
               </div>
+              <p className="text-[10px] text-muted-foreground">Uses max available per asset</p>
             </div>
             <div className="space-y-2">
               <Label className="text-xs">Max Open Positions</Label>
@@ -214,7 +357,7 @@ export default function Settings() {
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label className="text-xs">Trade Size (% of capital)</Label>
               <Input
@@ -226,24 +369,55 @@ export default function Settings() {
               />
             </div>
             <div className="space-y-2">
+              <Label className="text-xs">Max Risk Per Trade (%)</Label>
+              <Input
+                type="number"
+                value={form.maxRiskPerTradePct ?? 0.25}
+                onChange={(e) => setForm({ ...form, maxRiskPerTradePct: parseFloat(e.target.value) })}
+                className="font-mono text-xs"
+                step="0.05"
+              />
+              <p className="text-[10px] text-muted-foreground">Hard max loss per position</p>
+            </div>
+          </div>
+
+          <Separator />
+
+          <div className="grid grid-cols-3 gap-4">
+            <div className="space-y-2">
               <Label className="text-xs">Stop Loss %</Label>
               <Input
                 type="number"
-                value={form.stopLossPct || 2}
+                value={form.stopLossPct ?? 0.35}
                 onChange={(e) => setForm({ ...form, stopLossPct: parseFloat(e.target.value) })}
                 className="font-mono text-xs"
+                step="0.05"
                 data-testid="input-stop-loss"
               />
             </div>
             <div className="space-y-2">
-              <Label className="text-xs">Take Profit %</Label>
+              <Label className="text-xs">Take Profit 1 %</Label>
               <Input
                 type="number"
-                value={form.takeProfitPct || 5}
+                value={form.takeProfitPct ?? 0.5}
                 onChange={(e) => setForm({ ...form, takeProfitPct: parseFloat(e.target.value) })}
                 className="font-mono text-xs"
-                data-testid="input-take-profit"
+                step="0.1"
+                data-testid="input-take-profit-1"
               />
+              <p className="text-[10px] text-muted-foreground">Close 50% at TP1</p>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs">Take Profit 2 %</Label>
+              <Input
+                type="number"
+                value={form.takeProfit2Pct ?? 1.0}
+                onChange={(e) => setForm({ ...form, takeProfit2Pct: parseFloat(e.target.value) })}
+                className="font-mono text-xs"
+                step="0.1"
+                data-testid="input-take-profit-2"
+              />
+              <p className="text-[10px] text-muted-foreground">Close remaining at TP2</p>
             </div>
           </div>
 
@@ -266,9 +440,10 @@ export default function Settings() {
               <Label className="text-xs">Trailing Stop %</Label>
               <Input
                 type="number"
-                value={form.trailingStopPct || 1.5}
+                value={form.trailingStopPct ?? 0.3}
                 onChange={(e) => setForm({ ...form, trailingStopPct: parseFloat(e.target.value) })}
                 className="font-mono text-xs"
+                step="0.05"
                 data-testid="input-trailing-stop"
               />
             </div>
@@ -276,7 +451,45 @@ export default function Settings() {
         </CardContent>
       </Card>
 
-      {/* Target */}
+      {/* Circuit Breakers */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm flex items-center gap-2">
+            <Clock className="w-4 h-4" /> Circuit Breakers
+          </CardTitle>
+          <CardDescription className="text-xs">
+            Daily and weekly loss limits to protect capital
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label className="text-xs">Max Daily Loss (%)</Label>
+              <Input
+                type="number"
+                value={form.maxDailyLossPct ?? 0.75}
+                onChange={(e) => setForm({ ...form, maxDailyLossPct: parseFloat(e.target.value) })}
+                className="font-mono text-xs"
+                step="0.1"
+              />
+              <p className="text-[10px] text-muted-foreground">Bot pauses if daily loss exceeds this</p>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs">Max Weekly Loss (%)</Label>
+              <Input
+                type="number"
+                value={form.maxWeeklyLossPct ?? 1.5}
+                onChange={(e) => setForm({ ...form, maxWeeklyLossPct: parseFloat(e.target.value) })}
+                className="font-mono text-xs"
+                step="0.1"
+              />
+              <p className="text-[10px] text-muted-foreground">Bot pauses if weekly loss exceeds this</p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Performance Target */}
       <Card>
         <CardHeader>
           <CardTitle className="text-sm flex items-center gap-2">

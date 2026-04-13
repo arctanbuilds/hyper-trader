@@ -6,12 +6,40 @@ import { Button } from "@/components/ui/button";
 import {
   TrendingUp, TrendingDown, DollarSign, Target,
   BarChart3, Activity, RefreshCw, ArrowUpRight, ArrowDownRight, Wallet,
+  Shield, Clock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
-  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  AreaChart, Area, CartesianGrid,
+  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
+
+// Display-friendly asset names
+const ASSET_DISPLAY: Record<string, string> = {
+  "BTC": "Bitcoin",
+  "ETH": "Ethereum",
+  "SOL": "Solana",
+  "xyz:GOLD": "Gold",
+  "xyz:SILVER": "Silver",
+  "xyz:CL": "Oil WTI",
+  "xyz:BRENTOIL": "Oil Brent",
+  "xyz:SP500": "S&P 500",
+  "xyz:EUR": "EUR/USD",
+};
+
+function getAssetLabel(coin: string): string {
+  return ASSET_DISPLAY[coin] || coin;
+}
+
+function getSessionInfo(): { session: string; color: string } {
+  const now = new Date();
+  const utcHour = now.getUTCHours();
+  // London: 07-16 UTC, NY: 13-21 UTC, overlap: 13-16 UTC, Asia: 23-08 UTC
+  if (utcHour >= 13 && utcHour < 16) return { session: "London/NY Overlap", color: "text-emerald-400" };
+  if (utcHour >= 7 && utcHour < 16) return { session: "London Session", color: "text-blue-400" };
+  if (utcHour >= 13 && utcHour < 21) return { session: "New York Session", color: "text-yellow-400" };
+  if (utcHour >= 23 || utcHour < 8) return { session: "Asia Session", color: "text-purple-400" };
+  return { session: "Off-Session", color: "text-muted-foreground" };
+}
 
 export default function Dashboard() {
   const { data: status, isLoading: statusLoading } = useQuery({
@@ -63,13 +91,21 @@ export default function Dashboard() {
     equity: p.totalEquity,
   }));
 
+  const sessionInfo = getSessionInfo();
+
   return (
     <div className="p-6 space-y-6 max-w-[1400px]">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
-          <p className="text-sm text-muted-foreground">Real-time trading overview</p>
+          <div className="flex items-center gap-3 mt-0.5">
+            <p className="text-sm text-muted-foreground">Real-time trading overview</p>
+            <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
+              <Clock className="w-3 h-3" />
+              <span className={sessionInfo.color}>{sessionInfo.session}</span>
+            </Badge>
+          </div>
         </div>
         <Button
           size="sm"
@@ -220,8 +256,13 @@ export default function Dashboard() {
                         {trade.side}
                       </Badge>
                       <div>
-                        <span className="text-sm font-medium">{trade.coin}</span>
+                        <span className="text-sm font-medium">{getAssetLabel(trade.coin)}</span>
                         <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
+                        {trade.confluenceScore != null && (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0">
+                            C:{trade.confluenceScore}
+                          </Badge>
+                        )}
                       </div>
                     </div>
                     <div className="text-right">
@@ -231,8 +272,15 @@ export default function Dashboard() {
                       )}>
                         {(trade.pnl || 0) >= 0 ? "+" : ""}{(trade.pnl || 0).toFixed(2)}%
                       </div>
-                      <div className="text-[10px] text-muted-foreground font-mono">
-                        ${trade.entryPrice?.toFixed(2)}
+                      <div className="flex items-center gap-1.5 justify-end">
+                        <span className="text-[10px] text-muted-foreground font-mono">
+                          ${trade.entryPrice?.toFixed(2)}
+                        </span>
+                        {trade.tp1Hit && (
+                          <Badge className="text-[8px] px-1 py-0 bg-emerald-500/20 text-emerald-400 border-0">
+                            TP1
+                          </Badge>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -267,6 +315,7 @@ export default function Dashboard() {
                   log.type === "scan" && "bg-yellow-500",
                   log.type === "system" && "bg-muted-foreground",
                   log.type === "config_change" && "bg-purple-500",
+                  log.type === "circuit_breaker" && "bg-orange-500",
                 )} />
                 <div className="flex-1 min-w-0">
                   <p className="text-xs truncate">{log.message}</p>

@@ -2,6 +2,7 @@ import type { Express } from "express";
 import { type Server } from "http";
 import { storage } from "./storage";
 import { tradingEngine } from "./trading-engine";
+import { getLearningStats, reviewClosedTrades, generateInsights } from "./learning-engine";
 import { insertBotConfigSchema } from "@shared/schema";
 import { WebSocketServer, WebSocket } from "ws";
 
@@ -158,6 +159,31 @@ export async function registerRoutes(
       res.json({ connected: true, ...data as any });
     } catch (e: any) {
       res.json({ connected: false, error: e.message });
+    }
+  });
+
+  // ============ LEARNING / DECISIONS ============
+  app.get("/api/learning/stats", (_req, res) => {
+    const stats = getLearningStats();
+    res.json(stats);
+  });
+
+  app.get("/api/learning/insights", (_req, res) => {
+    res.json(storage.getAllInsights());
+  });
+
+  app.get("/api/learning/decisions", (req, res) => {
+    const limit = parseInt(req.query.limit as string) || 100;
+    res.json(storage.getAllDecisions(limit));
+  });
+
+  app.post("/api/learning/review", async (_req, res) => {
+    try {
+      const reviewed = reviewClosedTrades();
+      generateInsights();
+      res.json({ success: true, reviewed });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 

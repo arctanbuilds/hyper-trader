@@ -1,12 +1,15 @@
 import { db } from "./db";
-import { eq, desc, and, gte } from "drizzle-orm";
+import { eq, desc, and, gte, isNull, isNotNull } from "drizzle-orm";
 import {
   botConfig, trades, pnlSnapshots, activityLog, marketScans,
+  tradeDecisions, learningInsights,
   type BotConfig, type InsertBotConfig,
   type Trade, type InsertTrade,
   type PnlSnapshot, type InsertPnlSnapshot,
   type ActivityLogEntry, type InsertActivityLog,
   type MarketScan, type InsertMarketScan,
+  type TradeDecision, type InsertTradeDecision,
+  type LearningInsight, type InsertLearningInsight,
 } from "@shared/schema";
 
 export interface IStorage {
@@ -20,6 +23,7 @@ export interface IStorage {
   getOpenTrades(): Trade[];
   getAllTrades(limit?: number): Trade[];
   getTradeById(id: number): Trade | undefined;
+  getClosedTradesSince(since: string): Trade[];
   
   // PnL Snapshots
   createPnlSnapshot(snap: InsertPnlSnapshot): PnlSnapshot;
@@ -33,6 +37,22 @@ export interface IStorage {
   upsertMarketScan(scan: InsertMarketScan): MarketScan;
   getLatestScans(): MarketScan[];
   getScansWithSignal(): MarketScan[];
+  
+  // Trade Decisions (Learning Memory)
+  createDecision(decision: InsertTradeDecision): TradeDecision;
+  updateDecision(id: number, data: Partial<InsertTradeDecision>): TradeDecision | undefined;
+  getDecisionsByTradeId(tradeId: number): TradeDecision[];
+  getUnreviewedDecisions(limit?: number): TradeDecision[];
+  getAllDecisions(limit?: number): TradeDecision[];
+  getDecisionsByCoin(coin: string, limit?: number): TradeDecision[];
+  getDecisionsByOutcome(outcome: string, limit?: number): TradeDecision[];
+  
+  // Learning Insights
+  createInsight(insight: InsertLearningInsight): LearningInsight;
+  updateInsight(id: number, data: Partial<InsertLearningInsight>): LearningInsight | undefined;
+  getActiveInsights(): LearningInsight[];
+  getAllInsights(): LearningInsight[];
+  getInsightByRule(rule: string): LearningInsight | undefined;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -42,7 +62,7 @@ export class DatabaseStorage implements IStorage {
     if (!existing) {
       db.insert(botConfig).values({
         isRunning: false,
-        maxLeverage: 20,
+        maxLeverage: 50,
         maxPositions: 5,
         weeklyTargetPct: 50,
         maxDrawdownPct: 10,
@@ -50,11 +70,21 @@ export class DatabaseStorage implements IStorage {
         rsiOverboughtThreshold: 80,
         scanIntervalSecs: 60,
         tradeAmountPct: 10,
-        stopLossPct: 2,
-        takeProfitPct: 5,
-        trailingStopPct: 1.5,
+        stopLossPct: 0.35,
+        takeProfitPct: 0.5,
+        takeProfit2Pct: 1.0,
+        trailingStopPct: 0.3,
         useTrailingStop: true,
+        maxRiskPerTradePct: 0.25,
+        minRiskRewardRatio: 1.0,
+        minConfluenceScore: 3,
         minVolume24h: 1000000,
+        useMacroFilter: true,
+        useSessionFilter: true,
+        useEmaFilter: true,
+        useLiquidationFilter: true,
+        maxDailyLossPct: 0.75,
+        maxWeeklyLossPct: 1.5,
         updatedAt: new Date().toISOString(),
       }).run();
     }
@@ -95,6 +125,12 @@ export class DatabaseStorage implements IStorage {
     return db.select().from(trades).where(eq(trades.id, id)).get();
   }
 
+  getClosedTradesSince(since: string): Trade[] {
+    return db.select().from(trades)
+      .where(and(eq(trades.status, "closed"), gte(trades.closedAt, since)))
+      .orderBy(desc(trades.id)).all();
+  }
+
   createPnlSnapshot(snap: InsertPnlSnapshot): PnlSnapshot {
     return db.insert(pnlSnapshots).values(snap).returning().get();
   }
@@ -117,7 +153,6 @@ export class DatabaseStorage implements IStorage {
   }
 
   upsertMarketScan(scan: InsertMarketScan): MarketScan {
-    // Delete old scan for this coin, then insert new
     db.delete(marketScans).where(eq(marketScans.coin, scan.coin)).run();
     return db.insert(marketScans).values(scan).returning().get();
   }
@@ -134,6 +169,77 @@ export class DatabaseStorage implements IStorage {
         )
       ).all()
       .filter(s => s.signal && s.signal !== "neutral");
+  }
+
+  // ============ TRADE DECISIONS ============
+
+  createDecision(decision: InsertTradeDecision): TradeDecision {
+    return db.insert(tradeDecisions).values(decision).returning().get();
+  }
+
+  updateDecision(id: number, data: Partial<InsertTradeDecision>): TradeDecision | undefined {
+    db.update(tradeDecisions).set(data).where(eq(tradeDecisions.id, id)).run();
+    return db.select().from(tradeDecisions).where(eq(tradeDecisions.id, id)).get();
+  }
+
+  getDecisionsByTradeId(tradeId: number): TradeDecision[] {
+    return db.select().from(tradeDecisions)
+      .where(eq(tradeDecisions.tradeId, tradeId))
+      .orderBy(tradeDecisions.id).all();
+  }
+
+  getUnreviewedDecisions(limit: number = 50): TradeDecision[] {
+    return db.select().from(tradeDecisions)
+      .where(and(
+        eq(tradeDecisions.action, "entry"),
+        isNull(tradeDecisions.outcome),
+        isNotNull(tradeDecisions.tradeId),
+      ))
+      .orderBy(desc(tradeDecisions.id)).limit(limit).all();
+  }
+
+  getAllDecisions(limit: number = 500): TradeDecision[] {
+    return db.select().from(tradeDecisions)
+      .orderBy(desc(tradeDecisions.id)).limit(limit).all();
+  }
+
+  getDecisionsByCoin(coin: string, limit: number = 100): TradeDecision[] {
+    return db.select().from(tradeDecisions)
+      .where(eq(tradeDecisions.coin, coin))
+      .orderBy(desc(tradeDecisions.id)).limit(limit).all();
+  }
+
+  getDecisionsByOutcome(outcome: string, limit: number = 100): TradeDecision[] {
+    return db.select().from(tradeDecisions)
+      .where(eq(tradeDecisions.outcome, outcome))
+      .orderBy(desc(tradeDecisions.id)).limit(limit).all();
+  }
+
+  // ============ LEARNING INSIGHTS ============
+
+  createInsight(insight: InsertLearningInsight): LearningInsight {
+    return db.insert(learningInsights).values(insight).returning().get();
+  }
+
+  updateInsight(id: number, data: Partial<InsertLearningInsight>): LearningInsight | undefined {
+    db.update(learningInsights).set(data).where(eq(learningInsights.id, id)).run();
+    return db.select().from(learningInsights).where(eq(learningInsights.id, id)).get();
+  }
+
+  getActiveInsights(): LearningInsight[] {
+    return db.select().from(learningInsights)
+      .where(eq(learningInsights.isActive, true))
+      .orderBy(desc(learningInsights.confidence)).all();
+  }
+
+  getAllInsights(): LearningInsight[] {
+    return db.select().from(learningInsights)
+      .orderBy(desc(learningInsights.updatedAt)).all();
+  }
+
+  getInsightByRule(rule: string): LearningInsight | undefined {
+    return db.select().from(learningInsights)
+      .where(eq(learningInsights.rule, rule)).get();
   }
 }
 

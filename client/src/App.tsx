@@ -9,6 +9,7 @@ import Trades from "./pages/trades";
 import Scanner from "./pages/scanner";
 import Settings from "./pages/settings";
 import Logs from "./pages/logs";
+import Learning from "./pages/learning";
 import NotFound from "./pages/not-found";
 import Sidebar from "./components/sidebar";
 
@@ -28,6 +29,7 @@ function AppLayout() {
           <Route path="/scanner" component={Scanner} />
           <Route path="/settings" component={Settings} />
           <Route path="/logs" component={Logs} />
+          <Route path="/learning" component={Learning} />
           <Route component={NotFound} />
         </Switch>
       </main>

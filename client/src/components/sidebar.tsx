@@ -11,6 +11,7 @@ import {
   Square,
   Zap,
   TrendingUp,
+  Brain,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -20,6 +21,7 @@ const navItems = [
   { path: "/", label: "Dashboard", icon: LayoutDashboard },
   { path: "/trades", label: "Trades", icon: ArrowLeftRight },
   { path: "/scanner", label: "Scanner", icon: ScanSearch },
+  { path: "/learning", label: "Learning", icon: Brain },
   { path: "/settings", label: "Settings", icon: Settings },
   { path: "/logs", label: "Logs", icon: ScrollText },
 ];
@@ -139,7 +141,7 @@ export default function Sidebar() {
       <div className="p-3 border-t border-sidebar-border">
         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
           <TrendingUp className="w-3 h-3" />
-          <span>v1.0 — Hyperliquid Perps</span>
+          <span>v4.0 — Self-Learning Engine</span>
         </div>
       </div>
     </aside>

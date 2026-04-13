@@ -7,9 +7,36 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
-import { X, ArrowUpRight, ArrowDownRight } from "lucide-react";
+import {
+  Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { X, ArrowUpRight, ArrowDownRight, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
+
+// Display-friendly asset names
+const ASSET_DISPLAY: Record<string, string> = {
+  "BTC": "Bitcoin",
+  "ETH": "Ethereum",
+  "SOL": "Solana",
+  "xyz:GOLD": "Gold",
+  "xyz:SILVER": "Silver",
+  "xyz:CL": "Oil WTI",
+  "xyz:BRENTOIL": "Oil Brent",
+  "xyz:SP500": "S&P 500",
+  "xyz:EUR": "EUR/USD",
+};
+
+function getAssetLabel(coin: string): string {
+  return ASSET_DISPLAY[coin] || coin;
+}
+
+function formatPrice(price: number | null | undefined): string {
+  if (price == null) return "—";
+  if (price >= 1000) return `$${price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  if (price >= 1) return `$${price.toFixed(2)}`;
+  return `$${price.toFixed(4)}`;
+}
 
 export default function Trades() {
   const { toast } = useToast();
@@ -48,7 +75,10 @@ export default function Trades() {
             <TableHead className="text-xs">Lev</TableHead>
             <TableHead className="text-xs">RSI</TableHead>
             <TableHead className="text-xs">SL</TableHead>
-            <TableHead className="text-xs">TP</TableHead>
+            <TableHead className="text-xs">TP1</TableHead>
+            <TableHead className="text-xs">TP2</TableHead>
+            <TableHead className="text-xs">C.Score</TableHead>
+            <TableHead className="text-xs">R:R</TableHead>
             <TableHead className="text-xs text-right">P&L</TableHead>
             <TableHead className="text-xs">Reason</TableHead>
             {showClose && <TableHead className="text-xs w-10"></TableHead>}
@@ -57,14 +87,19 @@ export default function Trades() {
         <TableBody>
           {trades.length === 0 ? (
             <TableRow>
-              <TableCell colSpan={showClose ? 11 : 11} className="text-center text-sm text-muted-foreground py-8">
+              <TableCell colSpan={showClose ? 15 : 15} className="text-center text-sm text-muted-foreground py-8">
                 No trades
               </TableCell>
             </TableRow>
           ) : (
             trades.map((trade: any) => (
               <TableRow key={trade.id} data-testid={`row-trade-${trade.id}`}>
-                <TableCell className="font-medium text-xs">{trade.coin}</TableCell>
+                <TableCell className="font-medium text-xs">
+                  {getAssetLabel(trade.coin)}
+                  {trade.setupType && (
+                    <span className="text-[9px] text-muted-foreground block">{trade.setupType}</span>
+                  )}
+                </TableCell>
                 <TableCell>
                   <Badge
                     variant={trade.side === "long" ? "default" : "destructive"}
@@ -78,27 +113,75 @@ export default function Trades() {
                     {trade.side}
                   </Badge>
                 </TableCell>
-                <TableCell className="font-mono text-xs">${trade.entryPrice?.toFixed(2)}</TableCell>
+                <TableCell className="font-mono text-xs">{formatPrice(trade.entryPrice)}</TableCell>
                 {!showClose && (
                   <TableCell className="font-mono text-xs">
-                    {trade.exitPrice ? `$${trade.exitPrice.toFixed(2)}` : "—"}
+                    {trade.exitPrice ? formatPrice(trade.exitPrice) : "—"}
                   </TableCell>
                 )}
                 <TableCell className="font-mono text-xs">{trade.size}%</TableCell>
                 <TableCell className="font-mono text-xs">{trade.leverage}x</TableCell>
                 <TableCell className="font-mono text-xs">
-                  <span className={cn(
-                    (trade.rsiAtEntry || 50) < 30 ? "text-emerald-500" :
-                    (trade.rsiAtEntry || 50) > 70 ? "text-red-500" : ""
-                  )}>
-                    {trade.rsiAtEntry?.toFixed(1) || "—"}
-                  </span>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className={cn(
+                          (trade.rsiAtEntry || 50) < 30 ? "text-emerald-500" :
+                          (trade.rsiAtEntry || 50) > 70 ? "text-red-500" : ""
+                        )}>
+                          {trade.rsiAtEntry?.toFixed(1) || "—"}
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent className="text-xs">
+                        <div>1h: {trade.rsiAtEntry?.toFixed(1) || "—"}</div>
+                        <div>4h: {trade.rsi4h?.toFixed(1) || "—"}</div>
+                        <div>1d: {trade.rsi1d?.toFixed(1) || "—"}</div>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
                 </TableCell>
                 <TableCell className="font-mono text-xs text-red-400">
-                  ${trade.stopLoss?.toFixed(2) || "—"}
+                  {formatPrice(trade.stopLoss)}
                 </TableCell>
                 <TableCell className="font-mono text-xs text-emerald-400">
-                  ${trade.takeProfit?.toFixed(2) || "—"}
+                  <span className={cn(trade.tp1Hit && "line-through opacity-50")}>
+                    {formatPrice(trade.takeProfit1)}
+                  </span>
+                  {trade.tp1Hit && (
+                    <Badge className="ml-1 text-[8px] px-1 py-0 bg-emerald-500/20 text-emerald-400 border-0">
+                      HIT
+                    </Badge>
+                  )}
+                </TableCell>
+                <TableCell className="font-mono text-xs text-emerald-400">
+                  {formatPrice(trade.takeProfit2)}
+                </TableCell>
+                <TableCell>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "text-[10px] px-1.5 py-0",
+                            (trade.confluenceScore || 0) >= 5 ? "border-emerald-500/50 text-emerald-400" :
+                            (trade.confluenceScore || 0) >= 3 ? "border-yellow-500/50 text-yellow-400" :
+                            "border-muted-foreground/50"
+                          )}
+                        >
+                          {trade.confluenceScore ?? 0}/7
+                        </Badge>
+                      </TooltipTrigger>
+                      {trade.confluenceDetails && (
+                        <TooltipContent className="text-xs max-w-[250px]">
+                          {trade.confluenceDetails}
+                        </TooltipContent>
+                      )}
+                    </Tooltip>
+                  </TooltipProvider>
+                </TableCell>
+                <TableCell className="font-mono text-xs">
+                  {trade.riskRewardRatio ? `1:${trade.riskRewardRatio.toFixed(1)}` : "—"}
                 </TableCell>
                 <TableCell className={cn(
                   "font-mono text-xs font-medium text-right",
@@ -135,7 +218,7 @@ export default function Trades() {
     <div className="p-6 space-y-6 max-w-[1400px]">
       <div>
         <h2 className="text-xl font-semibold tracking-tight">Trades</h2>
-        <p className="text-sm text-muted-foreground">Manage open positions and view trade history</p>
+        <p className="text-sm text-muted-foreground">Manage open positions and view trade history — dual TP, confluence scores, and R:R ratios</p>
       </div>
 
       <Tabs defaultValue="open">
