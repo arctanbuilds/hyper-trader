@@ -351,15 +351,18 @@ class TradingEngine {
 
   private async refreshEquity(): Promise<number> {
     const config = storage.getConfig();
-    if (!config?.walletAddress) return this.lastKnownEquity || 1000;
+    if (!config?.walletAddress) return this.lastKnownEquity;
     try {
       const state = await fetchUserState(config.walletAddress);
       if (state?.marginSummary?.accountValue) {
-        this.lastKnownEquity = parseFloat(state.marginSummary.accountValue);
-        if (this.startingEquity === 0) this.startingEquity = this.lastKnownEquity;
+        const val = parseFloat(state.marginSummary.accountValue);
+        if (val > 0) {
+          this.lastKnownEquity = val;
+          if (this.startingEquity === 0) this.startingEquity = val;
+        }
       }
     } catch { /* use last known */ }
-    return this.lastKnownEquity || 1000;
+    return this.lastKnownEquity;
   }
 
   async runScanCycle() {
@@ -372,6 +375,14 @@ class TradingEngine {
       if (!config?.isRunning) { this.isScanning = false; return; }
       this.resetLossTrackers();
       const equity = await this.refreshEquity();
+
+      // HARD GUARD: never trade with fake/zero equity — must read real AUM
+      if (equity <= 0) {
+        log(`Skipping scan — could not read real AUM (equity: $${equity})`, "engine");
+        this.isScanning = false;
+        this.scheduleNextScan();
+        return;
+      }
 
       // === PERIODIC LEARNING REVIEW (every 10 scans) ===
       if (this.scanCount % 10 === 0) {
@@ -687,7 +698,7 @@ class TradingEngine {
         if (ctxs[i]?.midPx) mids[universe[i].name] = ctxs[i].midPx;
       }
     }
-    const currentEquity = equity || this.lastKnownEquity || 1000;
+    const currentEquity = equity || this.lastKnownEquity || 0;
 
     for (const trade of openTrades) {
       const currentPrice = parseFloat(mids[trade.coin] || "0");
@@ -809,13 +820,13 @@ class TradingEngine {
   private takePnlSnapshot(equity?: number) {
     const allTrades = storage.getAllTrades();
     const openTrades = storage.getOpenTrades();
-    const currentEquity = equity || this.lastKnownEquity || 1000;
+    const currentEquity = equity || this.lastKnownEquity || 0;
     const closedPnl = allTrades.filter(t => t.status === "closed").reduce((s, t) => s + (t.pnl || 0), 0);
     const openPnl = openTrades.reduce((s, t) => s + (t.pnl || 0), 0);
     const totalPnl = closedPnl + openPnl;
 
     storage.createPnlSnapshot({
-      totalEquity: currentEquity > 0 ? currentEquity : (this.startingEquity || 1000) * (1 + totalPnl / 100),
+      totalEquity: currentEquity > 0 ? currentEquity : (this.startingEquity || 0) * (1 + totalPnl / 100),
       totalPnl, totalPnlPct: totalPnl, openPositions: openTrades.length,
       timestamp: new Date().toISOString(),
     });
@@ -853,7 +864,7 @@ class TradingEngine {
     const pnlPct = trade.side === "long"
       ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100 * trade.leverage
       : ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100 * trade.leverage;
-    const eq = this.lastKnownEquity || 1000;
+    const eq = this.lastKnownEquity || 0;
     const pnlUsd = (eq * (trade.size / 100)) * (pnlPct / 100);
 
     const updated = storage.updateTrade(trade.id, {
