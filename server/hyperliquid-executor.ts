@@ -62,8 +62,9 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
     if (assetIndexCache[coin]) return assetIndexCache[coin].index;
 
     // Determine which dex to query
+    // HIP-3 assets use "xyz" dex and keep the full "xyz:NAME" format in the universe
     const dex = coin.startsWith("xyz:") ? "xyz" : "";
-    const lookupName = coin.startsWith("xyz:") ? coin.slice(4) : coin; // strip "xyz:" prefix
+    const lookupName = coin; // keep full name — xyz dex universe uses "xyz:NAME" format
 
     const body: any = { type: "meta" };
     if (dex) body.dex = dex;
