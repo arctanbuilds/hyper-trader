@@ -140,6 +140,7 @@ export async function registerRoutes(
   });
 
   // ============ ACCOUNT INFO (proxied from Hyperliquid) ============
+  // Supports both Standard and Unified Account modes
   app.get("/api/account", async (req, res) => {
     const config = storage.getConfig();
     if (!config?.walletAddress) {
@@ -147,16 +148,56 @@ export async function registerRoutes(
     }
 
     try {
-      const response = await fetch("https://api.hyperliquid.xyz/info", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: "clearinghouseState",
-          user: config.walletAddress,
+      const [perpsResponse, spotResponse] = await Promise.all([
+        fetch("https://api.hyperliquid.xyz/info", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "clearinghouseState",
+            user: config.walletAddress,
+          }),
         }),
+        fetch("https://api.hyperliquid.xyz/info", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "spotClearinghouseState",
+            user: config.walletAddress,
+          }),
+        }),
+      ]);
+      
+      const perpsData: any = await perpsResponse.json();
+      const spotData: any = await spotResponse.json();
+      
+      // Unified account: balance is in spot state, perps shows $0
+      const perpsEquity = parseFloat(perpsData?.marginSummary?.accountValue || "0");
+      const spotBalances = spotData?.balances || [];
+      const usdcBalance = spotBalances.find((b: any) => b.coin === "USDC");
+      const spotEquity = parseFloat(usdcBalance?.total || "0");
+      const effectiveEquity = Math.max(perpsEquity, spotEquity);
+      
+      // Override marginSummary with correct values for unified accounts
+      if (spotEquity > perpsEquity) {
+        perpsData.marginSummary = {
+          ...perpsData.marginSummary,
+          accountValue: spotEquity.toString(),
+          totalRawUsd: spotEquity.toString(),
+        };
+        perpsData.crossMarginSummary = {
+          ...perpsData.crossMarginSummary,
+          accountValue: spotEquity.toString(),
+          totalRawUsd: spotEquity.toString(),
+        };
+        perpsData.withdrawable = spotEquity.toString();
+      }
+      
+      res.json({ 
+        connected: true, 
+        accountMode: spotEquity > perpsEquity ? "unified" : "standard",
+        spotBalances,
+        ...perpsData,
       });
-      const data = await response.json();
-      res.json({ connected: true, ...data as any });
     } catch (e: any) {
       res.json({ connected: false, error: e.message });
     }

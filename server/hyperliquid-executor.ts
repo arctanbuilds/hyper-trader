@@ -227,20 +227,45 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
     },
 
     async getAccountValue() {
-      const res = await fetch(HL_INFO_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: "clearinghouseState",
-          user: walletAddress,
+      // Query both perps clearinghouse AND spot clearinghouse
+      // Unified account mode reports balances in spotClearinghouseState
+      const [perpsRes, spotRes] = await Promise.all([
+        fetch(HL_INFO_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "clearinghouseState",
+            user: walletAddress,
+          }),
         }),
-      });
-      const data: any = await res.json();
-      const margin = data?.marginSummary || {};
-      return {
-        equity: parseFloat(margin.accountValue || "0"),
-        availableBalance: parseFloat(margin.totalRawUsd || "0"),
-      };
+        fetch(HL_INFO_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "spotClearinghouseState",
+            user: walletAddress,
+          }),
+        }),
+      ]);
+      
+      const perpsData: any = await perpsRes.json();
+      const spotData: any = await spotRes.json();
+      
+      // Check perps balance first (standard mode)
+      const perpsEquity = parseFloat(perpsData?.marginSummary?.accountValue || "0");
+      
+      // Check spot USDC balance (unified account mode)
+      const spotBalances = spotData?.balances || [];
+      const usdcBalance = spotBalances.find((b: any) => b.coin === "USDC");
+      const spotEquity = parseFloat(usdcBalance?.total || "0");
+      
+      // Use whichever is higher — unified mode shows balance in spot
+      const equity = Math.max(perpsEquity, spotEquity);
+      const availableBalance = perpsEquity > 0 
+        ? parseFloat(perpsData?.marginSummary?.totalRawUsd || "0")
+        : spotEquity;
+      
+      return { equity, availableBalance };
     },
   };
 }
