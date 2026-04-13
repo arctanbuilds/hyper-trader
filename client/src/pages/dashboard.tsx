@@ -81,9 +81,17 @@ export default function Dashboard() {
   });
 
   const combinedPnl = parseFloat(status?.combinedPnl || "0");
+  const combinedPnlUsd = parseFloat(status?.combinedPnlUsd || "0");
+  const totalPnlUsd = parseFloat(status?.totalPnlUsd || "0");
+  const openPnlUsd = parseFloat(status?.openPnlUsd || "0");
   const accountBalance = account?.marginSummary?.accountValue
     ? parseFloat(account.marginSummary.accountValue)
     : 0;
+
+  const fmtUsd = (v: number) => {
+    const sign = v >= 0 ? "+" : "";
+    return `${sign}${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDC`;
+  };
 
   const pnlChartData = [...(pnlData || [])].reverse().slice(-50).map((p: any) => ({
     time: new Date(p.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -152,8 +160,11 @@ export default function Dashboard() {
             )} data-testid="text-total-pnl">
               {combinedPnl >= 0 ? "+" : ""}{combinedPnl.toFixed(2)}%
             </div>
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Target: +50%/week
+            <p className={cn(
+              "text-[11px] font-mono mt-0.5",
+              combinedPnlUsd >= 0 ? "text-emerald-400/70" : "text-red-400/70"
+            )}>
+              {fmtUsd(combinedPnlUsd)}
             </p>
           </CardContent>
         </Card>
@@ -167,8 +178,11 @@ export default function Dashboard() {
             <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
               {status?.openPositions || 0}
             </div>
-            <p className="text-[10px] text-muted-foreground mt-1">
-              Open P&L: {parseFloat(status?.openPnl || "0") >= 0 ? "+" : ""}{status?.openPnl || "0.00"}%
+            <p className={cn(
+              "text-[10px] font-mono mt-1",
+              parseFloat(status?.openPnl || "0") >= 0 ? "text-emerald-400/70" : "text-red-400/70"
+            )}>
+              {parseFloat(status?.openPnl || "0") >= 0 ? "+" : ""}{status?.openPnl || "0.00"}% ({fmtUsd(openPnlUsd)})
             </p>
           </CardContent>
         </Card>
@@ -202,6 +216,9 @@ export default function Dashboard() {
                 <span className="text-sm font-mono">{status.strategyStats.confluence.trades} trades</span>
                 <span className="text-sm font-mono">{status.strategyStats.confluence.winRate}% WR</span>
                 <span className="text-sm font-mono text-muted-foreground">{status.strategyStats.confluence.openPositions} open</span>
+                <span className={cn("text-sm font-mono", parseFloat(status.strategyStats.confluence.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
+                  {parseFloat(status.strategyStats.confluence.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.confluence.pnlUsd || "0").toFixed(2)} USDC
+                </span>
               </div>
             </CardContent>
           </Card>
@@ -215,6 +232,9 @@ export default function Dashboard() {
                 <span className="text-sm font-mono">{status.strategyStats.extreme_rsi.trades} trades</span>
                 <span className="text-sm font-mono">{status.strategyStats.extreme_rsi.winRate}% WR</span>
                 <span className="text-sm font-mono text-muted-foreground">{status.strategyStats.extreme_rsi.openPositions} open</span>
+                <span className={cn("text-sm font-mono", parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
+                  {parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0").toFixed(2)} USDC
+                </span>
               </div>
             </CardContent>
           </Card>
@@ -309,6 +329,12 @@ export default function Dashboard() {
                         (trade.pnl || 0) >= 0 ? "text-emerald-500" : "text-red-500"
                       )}>
                         {(trade.pnl || 0) >= 0 ? "+" : ""}{(trade.pnl || 0).toFixed(2)}%
+                      </div>
+                      <div className={cn(
+                        "text-[10px] font-mono",
+                        (trade.pnlUsd || 0) >= 0 ? "text-emerald-400/60" : "text-red-400/60"
+                      )}>
+                        {fmtUsd(trade.pnlUsd || 0)}
                       </div>
                       <div className="flex items-center gap-1.5 justify-end">
                         <span className="text-[10px] text-muted-foreground font-mono">

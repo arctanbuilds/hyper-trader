@@ -1293,6 +1293,10 @@ class TradingEngine {
 
   async forceScan() { await this.runScanCycle(); }
 
+  getLastKnownEquity(): number {
+    return this.lastKnownEquity;
+  }
+
   async getStatus() {
     const config = await storage.getConfig();
     const openTrades = await storage.getOpenTrades();
@@ -1320,11 +1324,35 @@ class TradingEngine {
 
     const combinedPnlOfAum = closedPnlOfAum + openPnlOfAum;
 
+    // Dollar P&L: % of AUM → actual USDC
+    const closedPnlUsd = startEq > 0 ? startEq * (closedPnlOfAum / 100) : 0;
+    const openPnlUsd = currentEquity > 0 ? currentEquity * (openPnlOfAum / 100) : 0;
+    const combinedPnlUsd = closedPnlUsd + openPnlUsd;
+    const dailyLossUsd = currentEquity > 0 ? currentEquity * (this.dailyLoss / 100) : 0;
+    const weeklyLossUsd = currentEquity > 0 ? currentEquity * (this.weeklyLoss / 100) : 0;
+
+    // Per-trade dollar P&L for open positions
+    const openTradesWithUsd = openTrades.map(t => {
+      const tradeCapUsd = currentEquity * ((t.size || 10) / 100);
+      const pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
+      return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)) };
+    });
+
     // Per-strategy stats
     const confluenceTrades = closedTrades.filter(t => (t.strategy || "confluence") === "confluence");
     const extremeTrades = closedTrades.filter(t => t.strategy === "extreme_rsi");
     const confluenceWinRate = confluenceTrades.length > 0 ? (confluenceTrades.filter(t => (t.pnl || 0) > 0).length / confluenceTrades.length) * 100 : 0;
     const extremeWinRate = extremeTrades.length > 0 ? (extremeTrades.filter(t => (t.pnl || 0) > 0).length / extremeTrades.length) * 100 : 0;
+
+    // Per-strategy dollar P&L
+    const confluencePnlUsd = confluenceTrades.reduce((s, t) => {
+      const cap = startEq * ((t.size || 10) / 100);
+      return s + cap * ((t.pnl || 0) / 100);
+    }, 0);
+    const extremePnlUsd = extremeTrades.reduce((s, t) => {
+      const cap = startEq * ((t.size || 10) / 100);
+      return s + cap * ((t.pnl || 0) / 100);
+    }, 0);
 
     return {
       isRunning: config?.isRunning || false,
@@ -1333,20 +1361,26 @@ class TradingEngine {
       closedTrades: closedTrades.length,
       winRate: winRate.toFixed(1),
       totalPnl: closedPnlOfAum.toFixed(2),
+      totalPnlUsd: closedPnlUsd.toFixed(4),
       openPnl: openPnlOfAum.toFixed(2),
+      openPnlUsd: openPnlUsd.toFixed(4),
       combinedPnl: combinedPnlOfAum.toFixed(2),
+      combinedPnlUsd: combinedPnlUsd.toFixed(4),
       session: si.session,
       sessionDescription: si.description,
       dailyLoss: this.dailyLoss.toFixed(2),
+      dailyLossUsd: dailyLossUsd.toFixed(4),
       weeklyLoss: this.weeklyLoss.toFixed(2),
+      weeklyLossUsd: weeklyLossUsd.toFixed(4),
       equity: currentEquity.toFixed(2),
       startingEquity: startEq.toFixed(2),
       learningStats: stats,
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
+      openTradesWithUsd,
       // Per-strategy breakdown
       strategyStats: {
-        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length },
-        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length },
+        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluencePnlUsd.toFixed(4) },
+        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4) },
       },
     };
   }

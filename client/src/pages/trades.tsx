@@ -79,7 +79,8 @@ export default function Trades() {
             <TableHead className="text-xs">TP2</TableHead>
             <TableHead className="text-xs">C.Score</TableHead>
             <TableHead className="text-xs">R:R</TableHead>
-            <TableHead className="text-xs text-right">P&L</TableHead>
+            <TableHead className="text-xs text-right">P&L %</TableHead>
+            <TableHead className="text-xs text-right">P&L USDC</TableHead>
             <TableHead className="text-xs">Reason</TableHead>
             {showClose && <TableHead className="text-xs w-10"></TableHead>}
           </TableRow>
@@ -87,7 +88,7 @@ export default function Trades() {
         <TableBody>
           {trades.length === 0 ? (
             <TableRow>
-              <TableCell colSpan={showClose ? 15 : 15} className="text-center text-sm text-muted-foreground py-8">
+              <TableCell colSpan={showClose ? 16 : 16} className="text-center text-sm text-muted-foreground py-8">
                 No trades
               </TableCell>
             </TableRow>
@@ -196,6 +197,12 @@ export default function Trades() {
                   (trade.pnl || 0) >= 0 ? "text-emerald-500" : "text-red-500"
                 )}>
                   {(trade.pnl || 0) >= 0 ? "+" : ""}{(trade.pnl || 0).toFixed(2)}%
+                </TableCell>
+                <TableCell className={cn(
+                  "font-mono text-xs font-medium text-right",
+                  (trade.pnlUsd || 0) >= 0 ? "text-emerald-500" : "text-red-500"
+                )}>
+                  {(trade.pnlUsd || 0) >= 0 ? "+" : ""}{(trade.pnlUsd || 0).toFixed(2)}
                 </TableCell>
                 <TableCell className="text-[10px] text-muted-foreground max-w-[200px] truncate">
                   {trade.status === "open" ? trade.reason : trade.closeReason}

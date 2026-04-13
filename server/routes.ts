@@ -94,11 +94,18 @@ export async function registerRoutes(
   // ============ TRADES ============
   app.get("/api/trades", async (req, res) => {
     const status = req.query.status as string | undefined;
-    if (status === "open") {
-      res.json(await storage.getOpenTrades());
-    } else {
-      res.json(await storage.getAllTrades(200));
-    }
+    const trades = status === "open"
+      ? await storage.getOpenTrades()
+      : await storage.getAllTrades(200);
+
+    // Enrich each trade with dollar P&L
+    const equity = tradingEngine.getLastKnownEquity();
+    const enriched = trades.map((t: any) => {
+      const tradeCapUsd = equity * ((t.size || 10) / 100);
+      const pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
+      return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)) };
+    });
+    res.json(enriched);
   });
 
   app.get("/api/trades/:id", async (req, res) => {
