@@ -31,6 +31,7 @@ interface AssetConfig {
   pricePrecision: number;
   category: "crypto" | "commodity" | "forex" | "index";
   minNotional: number;
+  isolatedOnly?: boolean;  // Some HIP-3 assets only support isolated margin
 }
 
 const ALLOWED_ASSETS: AssetConfig[] = [
@@ -40,7 +41,7 @@ const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "xyz:GOLD",      displayName: "Gold",        dex: "xyz", maxLeverage: 25, szDecimals: 4, pricePrecision: 2, category: "commodity", minNotional: 10 },
   { coin: "xyz:SILVER",    displayName: "Silver",      dex: "xyz", maxLeverage: 25, szDecimals: 2, pricePrecision: 3, category: "commodity", minNotional: 10 },
   { coin: "xyz:CL",        displayName: "Oil (WTI)",   dex: "xyz", maxLeverage: 20, szDecimals: 3, pricePrecision: 3, category: "commodity", minNotional: 10 },
-  { coin: "xyz:BRENTOIL",  displayName: "Oil (Brent)", dex: "xyz", maxLeverage: 20, szDecimals: 2, pricePrecision: 3, category: "commodity", minNotional: 10 },
+  { coin: "xyz:BRENTOIL",  displayName: "Oil (Brent)", dex: "xyz", maxLeverage: 20, szDecimals: 2, pricePrecision: 3, category: "commodity", minNotional: 10, isolatedOnly: true },
   { coin: "xyz:SP500",     displayName: "S&P 500",     dex: "xyz", maxLeverage: 50, szDecimals: 3, pricePrecision: 2, category: "index",     minNotional: 10 },
   { coin: "xyz:EUR",       displayName: "EUR/USD",     dex: "xyz", maxLeverage: 50, szDecimals: 1, pricePrecision: 5, category: "forex",     minNotional: 10 },
 ];
@@ -670,18 +671,65 @@ class TradingEngine {
           if (config.apiSecret && config.walletAddress) {
             try {
               const executor = createExecutor(config.apiSecret, config.walletAddress);
-              await executor.setLeverage(sig.asset.coin, leverage, true);
-              const slippageMult = side === "long" ? 1.005 : 0.995;
+              // Use isolated margin for assets that require it
+              const isCross = !sig.asset.isolatedOnly;
+              await executor.setLeverage(sig.asset.coin, leverage, isCross);
+              // Use aggressive slippage (1%) for IOC to ensure fills
+              const slippageMult = side === "long" ? 1.01 : 0.99;
               const orderPrice = sig.price * slippageMult;
               const roundedSize = parseFloat(assetSize.toFixed(sig.asset.szDecimals));
-              await executor.placeOrder({
+              if (roundedSize <= 0) {
+                reasoning.push(`SKIP: Rounded size is 0 (too small for szDecimals=${sig.asset.szDecimals})`);
+                logDecision({
+                  coin: sig.asset.coin, action: "skip", side, price: sig.price,
+                  confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
+                });
+                continue;
+              }
+              const orderResult = await executor.placeOrder({
                 coin: sig.asset.coin, isBuy: side === "long", sz: roundedSize,
                 limitPx: parseFloat(orderPrice.toFixed(sig.asset.pricePrecision)),
                 orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
               });
-              reasoning.push(`Order placed: sz=${roundedSize} @ $${orderPrice.toFixed(sig.asset.pricePrecision)}`);
+              
+              // Check if order was accepted and filled
+              const status = orderResult?.response?.data?.statuses?.[0];
+              const fillPx = status?.filled?.avgPx;
+              const totalSz = status?.filled?.totalSz;
+              const errorMsg = status?.error || orderResult?.response?.data?.error;
+              
+              if (errorMsg) {
+                reasoning.push(`ORDER REJECTED: ${errorMsg}`);
+                log(`Order rejected for ${sig.asset.coin}: ${errorMsg}`, "engine");
+                storage.createLog({ type: "order_error", message: `ORDER REJECTED: ${sig.asset.displayName} — ${errorMsg}`, timestamp: new Date().toISOString() });
+                logDecision({
+                  coin: sig.asset.coin, action: "skip", side, price: sig.price,
+                  confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
+                });
+                continue;
+              }
+              
+              if (fillPx && parseFloat(totalSz) > 0) {
+                reasoning.push(`FILLED: sz=${totalSz} @ $${fillPx}`);
+                // Update entry price to actual fill price
+                sig.price = parseFloat(fillPx);
+              } else if (status?.resting) {
+                reasoning.push(`Order resting (oid: ${status.resting.oid})`);
+              } else {
+                // IOC with no fill = order expired
+                reasoning.push(`IOC NOT FILLED — order expired (response: ${JSON.stringify(status || orderResult).slice(0, 200)})`);
+                log(`IOC not filled for ${sig.asset.coin}: ${JSON.stringify(status || orderResult).slice(0, 200)}`, "engine");
+                storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: ${sig.asset.displayName} ${side} sz=${roundedSize} @ $${orderPrice.toFixed(sig.asset.pricePrecision)}`, timestamp: new Date().toISOString() });
+                logDecision({
+                  coin: sig.asset.coin, action: "skip", side, price: sig.price,
+                  confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
+                });
+                continue;
+              }
             } catch (execErr) {
               reasoning.push(`ORDER FAILED: ${execErr}`);
+              log(`Order execution failed for ${sig.asset.coin}: ${execErr}`, "engine");
+              storage.createLog({ type: "order_error", message: `ORDER FAILED: ${sig.asset.displayName} — ${execErr}`, timestamp: new Date().toISOString() });
               logDecision({
                 coin: sig.asset.coin, action: "skip", side, price: sig.price,
                 confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
@@ -837,7 +885,7 @@ class TradingEngine {
             const pos = positions.find((p: any) => p.position?.coin === trade.coin);
             if (pos) {
               const sz = Math.abs(parseFloat(pos.position.szi || "0"));
-              const slippage = trade.side === "long" ? 0.995 : 1.005;
+              const slippage = trade.side === "long" ? 0.99 : 1.01; // 1% slippage for IOC close
               await executor.placeOrder({
                 coin: trade.coin, isBuy: trade.side === "short", sz,
                 limitPx: parseFloat((currentPrice * slippage).toFixed(pp)),
@@ -905,7 +953,7 @@ class TradingEngine {
         const pos = positions.find((p: any) => p.position?.coin === trade.coin);
         if (pos) {
           const sz = Math.abs(parseFloat(pos.position.szi || "0"));
-          const slippage = trade.side === "long" ? 0.995 : 1.005;
+          const slippage = trade.side === "long" ? 0.99 : 1.01; // 1% slippage for IOC close
           await executor.placeOrder({
             coin: trade.coin, isBuy: trade.side === "short", sz,
             limitPx: parseFloat((currentPrice * slippage).toFixed(ac?.pricePrecision || 2)),
