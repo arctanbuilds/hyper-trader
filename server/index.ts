@@ -60,6 +60,11 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // Initialize PostgreSQL database and tables
+  const { storage } = await import("./storage");
+  await storage.init();
+  log("PostgreSQL database initialized");
+
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {

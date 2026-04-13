@@ -431,7 +431,7 @@ class TradingEngine {
   private scanCount = 0; // Track scans for periodic learning review
 
   async start() {
-    const config = storage.getConfig();
+    const config = await storage.getConfig();
     if (!config) return;
     this.resetLossTrackers();
     
@@ -443,8 +443,8 @@ class TradingEngine {
       }
     }
 
-    const insights = storage.getActiveInsights();
-    storage.createLog({
+    const insights = await storage.getActiveInsights();
+    await storage.createLog({
       type: "system",
       message: `Engine v4 started | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage per asset | ${insights.length} active learning insights`,
       timestamp: new Date().toISOString(),
@@ -453,9 +453,9 @@ class TradingEngine {
     this.scheduleNextScan();
   }
 
-  stop() {
+  async stop() {
     if (this.scanTimer) { clearTimeout(this.scanTimer); this.scanTimer = null; }
-    storage.createLog({ type: "system", message: "Trading engine stopped", timestamp: new Date().toISOString() });
+    await storage.createLog({ type: "system", message: "Trading engine stopped", timestamp: new Date().toISOString() });
   }
 
   private resetLossTrackers() {
@@ -466,14 +466,14 @@ class TradingEngine {
     if (this.weeklyLossReset !== week) { this.weeklyLoss = 0; this.weeklyLossUsd = 0; this.weeklyLossReset = week; }
   }
 
-  private scheduleNextScan() {
-    const config = storage.getConfig();
+  private async scheduleNextScan() {
+    const config = await storage.getConfig();
     if (!config?.isRunning) return;
     this.scanTimer = setTimeout(() => this.runScanCycle(), (config.scanIntervalSecs || 30) * 1000);
   }
 
   private async refreshEquity(): Promise<number> {
-    const config = storage.getConfig();
+    const config = await storage.getConfig();
     if (!config?.walletAddress) return this.lastKnownEquity;
     try {
       const state = await fetchUserState(config.walletAddress);
@@ -494,7 +494,7 @@ class TradingEngine {
     this.scanCount++;
 
     try {
-      const config = storage.getConfig();
+      const config = await storage.getConfig();
       if (!config?.isRunning) { this.isScanning = false; return; }
       this.resetLossTrackers();
       const equity = await this.refreshEquity();
@@ -509,11 +509,11 @@ class TradingEngine {
 
       // === PERIODIC LEARNING REVIEW (every 10 scans) ===
       if (this.scanCount % 10 === 0) {
-        const reviewed = reviewClosedTrades();
+        const reviewed = await reviewClosedTrades();
         if (reviewed > 0) {
-          generateInsights();
-          const stats = getLearningStats();
-          storage.createLog({
+          await generateInsights();
+          const stats = await getLearningStats();
+          await storage.createLog({
             type: "learning",
             message: `Learning review: ${stats.reviewedDecisions} decisions reviewed, ${stats.activeInsights} active insights, ${(stats.overallWinRate * 100).toFixed(0)}% overall win rate`,
             timestamp: new Date().toISOString(),
@@ -525,12 +525,12 @@ class TradingEngine {
       const maxDailyLoss = config.maxDailyLossPct || 0.75;
       const maxWeeklyLoss = config.maxWeeklyLossPct || 1.5;
       if (this.dailyLoss >= maxDailyLoss) {
-        logDecision({ coin: "ALL", action: "circuit_breaker", price: 0, reasoning: `Daily loss ${this.dailyLoss.toFixed(2)}% >= ${maxDailyLoss}% limit ($${this.dailyLossUsd.toFixed(2)}) — all entries paused`, equity });
-        storage.createLog({ type: "circuit_breaker", message: `Daily loss limit: ${this.dailyLoss.toFixed(2)}% ($${this.dailyLossUsd.toFixed(2)})`, timestamp: new Date().toISOString() });
+        await logDecision({ coin: "ALL", action: "circuit_breaker", price: 0, reasoning: `Daily loss ${this.dailyLoss.toFixed(2)}% >= ${maxDailyLoss}% limit ($${this.dailyLossUsd.toFixed(2)}) — all entries paused`, equity });
+        await storage.createLog({ type: "circuit_breaker", message: `Daily loss limit: ${this.dailyLoss.toFixed(2)}% ($${this.dailyLossUsd.toFixed(2)})`, timestamp: new Date().toISOString() });
         this.isScanning = false; this.scheduleNextScan(); return;
       }
       if (this.weeklyLoss >= maxWeeklyLoss) {
-        logDecision({ coin: "ALL", action: "circuit_breaker", price: 0, reasoning: `Weekly loss ${this.weeklyLoss.toFixed(2)}% >= ${maxWeeklyLoss}% limit — all entries paused`, equity });
+        await logDecision({ coin: "ALL", action: "circuit_breaker", price: 0, reasoning: `Weekly loss ${this.weeklyLoss.toFixed(2)}% >= ${maxWeeklyLoss}% limit — all entries paused`, equity });
         this.isScanning = false; this.scheduleNextScan(); return;
       }
 
@@ -601,7 +601,7 @@ class TradingEngine {
           fundingRate: funding, change24h, volume24h, config, category: asset.category,
         });
 
-        storage.upsertMarketScan({
+        await storage.upsertMarketScan({
           coin: asset.coin, price, rsi: rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
           volume24h, change24h,
           signal: confluence.signal === "neutral" ? "neutral" : confluence.signal === "long" ? "oversold_long" : "overbought_short",
@@ -619,7 +619,7 @@ class TradingEngine {
       }
 
       signals.sort((a, b) => b.confluence.score - a.confluence.score);
-      storage.createLog({
+      await storage.createLog({
         type: "scan",
         message: `Scan: ${signals.length} signals | ${sessionInfo.session} | AUM: $${equity.toLocaleString()}`,
         data: JSON.stringify(signals.slice(0, 5).map(s => `${s.asset.displayName} RSI:${s.rsi1h.toFixed(0)} C:${s.confluence.score} ${s.confluence.signal}`)),
@@ -627,7 +627,7 @@ class TradingEngine {
       });
 
       // === EXECUTE TRADES ===
-      const openTrades = storage.getOpenTrades();
+      const openTrades = await storage.getOpenTrades();
       const openCoins = new Set(openTrades.map(t => t.coin));
       const maxPos = config.maxPositions || 8;
       const slotsAvailable = maxPos - openTrades.length;
@@ -653,7 +653,7 @@ class TradingEngine {
           // Confluence gate
           if (sig.confluence.score < minConfluence) {
             reasoning.push(`SKIP: Confluence ${sig.confluence.score} < min ${minConfluence}`);
-            logDecision({
+            await logDecision({
               coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price,
               rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
               ema10: sig.ema10, ema21: sig.ema21, ema50: sig.ema50,
@@ -669,7 +669,7 @@ class TradingEngine {
           // R:R gate
           if (sig.confluence.riskRewardRatio < minRR) {
             reasoning.push(`SKIP: R:R ${sig.confluence.riskRewardRatio.toFixed(2)} < min ${minRR}`);
-            logDecision({
+            await logDecision({
               coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price,
               rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
               confluenceScore: sig.confluence.score, riskRewardRatio: sig.confluence.riskRewardRatio,
@@ -681,7 +681,7 @@ class TradingEngine {
           // Session filter
           if (useSessionFilter && !sessionInfo.isHighVolume && sig.asset.category !== "crypto") {
             reasoning.push(`SKIP: ${sig.asset.category} asset in low-volume ${sessionInfo.session} session`);
-            logDecision({
+            await logDecision({
               coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price,
               confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
             });
@@ -689,7 +689,7 @@ class TradingEngine {
           }
 
           // === CHECK LEARNING INSIGHTS ===
-          const insightCheck = checkInsights({
+          const insightCheck = await checkInsights({
             coin: sig.asset.coin,
             side: sig.confluence.signal,
             session: sessionInfo.session,
@@ -699,13 +699,13 @@ class TradingEngine {
 
           if (insightCheck.shouldBlock) {
             reasoning.push(`BLOCKED BY LEARNING: ${insightCheck.blockReason}`);
-            logDecision({
+            await logDecision({
               coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price,
               rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
               confluenceScore: sig.confluence.score, riskRewardRatio: sig.confluence.riskRewardRatio,
               reasoning: reasoning.join(" | "), equity,
             });
-            storage.createLog({
+            await storage.createLog({
               type: "learning",
               message: `BLOCKED: ${sig.asset.displayName} ${sig.confluence.signal} — ${insightCheck.blockReason}`,
               timestamp: new Date().toISOString(),
@@ -722,7 +722,7 @@ class TradingEngine {
           // Re-check adjusted confluence
           if (adjustedConfluence < minConfluence) {
             reasoning.push(`SKIP: Adjusted confluence ${adjustedConfluence} < min ${minConfluence} (learning penalized)`);
-            logDecision({
+            await logDecision({
               coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price,
               confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
             });
@@ -733,7 +733,7 @@ class TradingEngine {
           const pos = calculateAdaptivePosition({ equity, price: sig.price, asset: sig.asset, config });
           if (!pos.canTrade) {
             reasoning.push(`SKIP: ${pos.skipReason}`);
-            logDecision({
+            await logDecision({
               coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price,
               confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
             });
@@ -782,8 +782,8 @@ class TradingEngine {
               if (errorMsg) {
                 reasoning.push(`ORDER REJECTED: ${errorMsg}`);
                 log(`Order rejected for ${sig.asset.coin}: ${errorMsg}`, "engine");
-                storage.createLog({ type: "order_error", message: `ORDER REJECTED: ${sig.asset.displayName} — ${errorMsg}`, timestamp: new Date().toISOString() });
-                logDecision({
+                await storage.createLog({ type: "order_error", message: `ORDER REJECTED: ${sig.asset.displayName} — ${errorMsg}`, timestamp: new Date().toISOString() });
+                await logDecision({
                   coin: sig.asset.coin, action: "skip", side, price: sig.price,
                   confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
                 });
@@ -800,8 +800,8 @@ class TradingEngine {
                 // IOC with no fill = order expired
                 reasoning.push(`IOC NOT FILLED — order expired (response: ${JSON.stringify(status || orderResult).slice(0, 200)})`);
                 log(`IOC not filled for ${sig.asset.coin}: ${JSON.stringify(status || orderResult).slice(0, 200)}`, "engine");
-                storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: ${sig.asset.displayName} ${side} sz=${roundedSize} @ $${displayPrice(orderPrice, sig.asset.szDecimals)}`, timestamp: new Date().toISOString() });
-                logDecision({
+                await storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: ${sig.asset.displayName} ${side} sz=${roundedSize} @ $${displayPrice(orderPrice, sig.asset.szDecimals)}`, timestamp: new Date().toISOString() });
+                await logDecision({
                   coin: sig.asset.coin, action: "skip", side, price: sig.price,
                   confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
                 });
@@ -810,8 +810,8 @@ class TradingEngine {
             } catch (execErr) {
               reasoning.push(`ORDER FAILED: ${execErr}`);
               log(`Order execution failed for ${sig.asset.coin}: ${execErr}`, "engine");
-              storage.createLog({ type: "order_error", message: `ORDER FAILED: ${sig.asset.displayName} — ${execErr}`, timestamp: new Date().toISOString() });
-              logDecision({
+              await storage.createLog({ type: "order_error", message: `ORDER FAILED: ${sig.asset.displayName} — ${execErr}`, timestamp: new Date().toISOString() });
+              await logDecision({
                 coin: sig.asset.coin, action: "skip", side, price: sig.price,
                 confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
               });
@@ -819,7 +819,7 @@ class TradingEngine {
             }
           }
 
-          const trade = storage.createTrade({
+          const trade = await storage.createTrade({
             coin: sig.asset.coin, side, entryPrice: sig.price, size: tradeAmountPct, leverage,
             rsiAtEntry: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
             ema10: sig.ema10, ema21: sig.ema21, ema50: sig.ema50,
@@ -833,7 +833,7 @@ class TradingEngine {
           });
 
           // Log entry decision with full reasoning
-          logDecision({
+          await logDecision({
             tradeId: trade.id, coin: sig.asset.coin, action: "entry", side, price: sig.price,
             rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
             ema10: sig.ema10, ema21: sig.ema21, ema50: sig.ema50,
@@ -844,7 +844,7 @@ class TradingEngine {
             reasoning: reasoning.join(" | "), equity, leverage, positionSizeUsd: capitalForTrade,
           });
 
-          storage.createLog({
+          await storage.createLog({
             type: "trade_open",
             message: `${side.toUpperCase()} ${sig.asset.displayName} @ $${displayPrice(sig.price, sig.asset.szDecimals)} | ${leverage}x MAX | C:${sig.confluence.score} | $${capitalForTrade.toFixed(0)} capital`,
             data: JSON.stringify(trade),
@@ -856,20 +856,20 @@ class TradingEngine {
       }
 
       await this.checkExits(equity);
-      this.takePnlSnapshot(equity);
+      await this.takePnlSnapshot(equity);
 
     } catch (e) {
       log(`Scan error: ${e}`, "engine");
-      storage.createLog({ type: "error", message: `Scan error: ${e}`, timestamp: new Date().toISOString() });
+      await storage.createLog({ type: "error", message: `Scan error: ${e}`, timestamp: new Date().toISOString() }).catch(() => {});
     }
     this.isScanning = false;
     this.scheduleNextScan();
   }
 
   private async checkExits(equity?: number) {
-    const config = storage.getConfig();
+    const config = await storage.getConfig();
     if (!config) return;
-    const openTrades = storage.getOpenTrades();
+    const openTrades = await storage.getOpenTrades();
     const mids = await fetchAllMids();
     
     const xyzData = await fetchMetaAndAssetCtxs("xyz");
@@ -924,9 +924,9 @@ class TradingEngine {
         const shouldUpdate = trade.side === "long" ? newSL > currentSL : newSL < currentSL;
         if (shouldUpdate) {
           const lockedProfit = lockPct * trade.leverage;
-          storage.updateTrade(trade.id, { stopLoss: newSL, tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
+          await storage.updateTrade(trade.id, { stopLoss: newSL, tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
           if (lockedProfit > 0.5) { // Only log significant ratchets
-            storage.createLog({ type: "trade_sl_ratchet", message: `SL RATCHET: ${trade.coin} SL → $${displayPrice(newSL, szd)} (locking ${lockedProfit.toFixed(1)}% profit)`, timestamp: new Date().toISOString() });
+            await storage.createLog({ type: "trade_sl_ratchet", message: `SL RATCHET: ${trade.coin} SL → $${displayPrice(newSL, szd)} (locking ${lockedProfit.toFixed(1)}% profit)`, timestamp: new Date().toISOString() });
           }
         }
       }
@@ -953,13 +953,13 @@ class TradingEngine {
                        (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
         if (tp1Hit) {
           // SL ratcheting already handles the SL move, just mark tp1 hit
-          storage.updateTrade(trade.id, { tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
-          logDecision({
+          await storage.updateTrade(trade.id, { tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
+          await logDecision({
             tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
             reasoning: `TP1 hit @ $${displayPrice(currentPrice, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
             equity: currentEquity, leverage: trade.leverage,
           });
-          storage.createLog({ type: "trade_tp1", message: `TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)}`, timestamp: new Date().toISOString() });
+          await storage.createLog({ type: "trade_tp1", message: `TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)}`, timestamp: new Date().toISOString() });
           continue;
         }
       }
@@ -1020,32 +1020,32 @@ class TradingEngine {
           } catch (e) { log(`Close error: ${e}`, "engine"); }
         }
 
-        storage.updateTrade(trade.id, {
+        await storage.updateTrade(trade.id, {
           exitPrice: currentPrice, pnl: leveragedPnl, pnlPct: leveragedPnl, peakPnlPct: currentPeak,
           status: "closed", closeReason, closedAt: new Date().toISOString(),
         });
 
         // Log exit decision
-        logDecision({
+        await logDecision({
           tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
           reasoning: `EXIT: ${closeReason} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | Held: ${trade.openedAt ? Math.round((Date.now() - new Date(trade.openedAt).getTime()) / 60000) : 0}min | Peak: ${currentPeak.toFixed(2)}%`,
           equity: currentEquity, leverage: trade.leverage,
         });
 
-        storage.createLog({
+        await storage.createLog({
           type: "trade_close",
           message: `CLOSED ${trade.side.toUpperCase()} ${trade.coin} | ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | ${closeReason}`,
           timestamp: new Date().toISOString(),
         });
       } else {
-        storage.updateTrade(trade.id, { pnl: leveragedPnl, pnlPct: leveragedPnl, peakPnlPct: currentPeak });
+        await storage.updateTrade(trade.id, { pnl: leveragedPnl, pnlPct: leveragedPnl, peakPnlPct: currentPeak });
       }
     }
   }
 
-  private takePnlSnapshot(equity?: number) {
-    const allTrades = storage.getAllTrades();
-    const openTrades = storage.getOpenTrades();
+  private async takePnlSnapshot(equity?: number) {
+    const allTrades = await storage.getAllTrades();
+    const openTrades = await storage.getOpenTrades();
     const closedTrades = allTrades.filter(t => t.status === "closed");
     const currentEquity = equity || this.lastKnownEquity || 0;
 
@@ -1054,7 +1054,7 @@ class TradingEngine {
     const openPnlOfAum = openTrades.reduce((s, t) => s + ((t.pnl || 0) * ((t.size || 10) / 100)), 0);
     const totalPnl = closedPnlOfAum + openPnlOfAum;
 
-    storage.createPnlSnapshot({
+    await storage.createPnlSnapshot({
       totalEquity: currentEquity > 0 ? currentEquity : (this.startingEquity || 0) * (1 + totalPnl / 100),
       totalPnl, totalPnlPct: totalPnl, openPositions: openTrades.length,
       timestamp: new Date().toISOString(),
@@ -1062,7 +1062,7 @@ class TradingEngine {
   }
 
   async forceCloseTrade(tradeId: number) {
-    const trade = storage.getTradeById(tradeId);
+    const trade = await storage.getTradeById(tradeId);
     if (!trade || trade.status !== "open") return null;
     const mids = await fetchAllMids();
     const xyzData = await fetchMetaAndAssetCtxs("xyz");
@@ -1073,7 +1073,7 @@ class TradingEngine {
     }
     const currentPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
     const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
-    const config = storage.getConfig();
+    const config = await storage.getConfig();
     if (config?.apiSecret && config?.walletAddress) {
       try {
         const executor = createExecutor(config.apiSecret, config.walletAddress);
@@ -1096,15 +1096,15 @@ class TradingEngine {
     const eq = this.lastKnownEquity || 0;
     const pnlUsd = (eq * (trade.size / 100)) * (pnlPct / 100);
 
-    const updated = storage.updateTrade(trade.id, {
+    const updated = await storage.updateTrade(trade.id, {
       exitPrice: currentPrice, pnl: pnlPct, pnlPct, status: "closed",
       closeReason: "Manual close", closedAt: new Date().toISOString(),
     });
-    logDecision({
+    await logDecision({
       tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
       reasoning: `MANUAL CLOSE | P&L: ${pnlPct.toFixed(2)}% ($${pnlUsd.toFixed(2)})`, equity: eq, leverage: trade.leverage,
     });
-    storage.createLog({
+    await storage.createLog({
       type: "trade_close",
       message: `Manual close ${trade.side.toUpperCase()} ${trade.coin} | ${pnlPct.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
       timestamp: new Date().toISOString(),
@@ -1114,15 +1114,15 @@ class TradingEngine {
 
   async forceScan() { await this.runScanCycle(); }
 
-  getStatus() {
-    const config = storage.getConfig();
-    const openTrades = storage.getOpenTrades();
-    const allTrades = storage.getAllTrades();
+  async getStatus() {
+    const config = await storage.getConfig();
+    const openTrades = await storage.getOpenTrades();
+    const allTrades = await storage.getAllTrades();
     const closedTrades = allTrades.filter(t => t.status === "closed");
     const winTrades = closedTrades.filter(t => (t.pnl || 0) > 0);
     const winRate = closedTrades.length > 0 ? (winTrades.length / closedTrades.length) * 100 : 0;
     const si = getSessionInfo();
-    const stats = getLearningStats();
+    const stats = await getLearningStats();
 
     // P&L as % of AUM (not raw leveraged P&L)
     // Each trade's AUM impact = leveragedPnl% * (tradeSize% / 100)

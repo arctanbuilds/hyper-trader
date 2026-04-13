@@ -24,27 +24,27 @@ export async function registerRoutes(
   }
 
   // Broadcast status every 10 seconds
-  setInterval(() => {
-    const status = tradingEngine.getStatus();
+  setInterval(async () => {
+    const status = await tradingEngine.getStatus();
     broadcast({ type: "status", data: status });
   }, 10000);
 
   // ============ STATUS ============
-  app.get("/api/status", (_req, res) => {
-    const status = tradingEngine.getStatus();
+  app.get("/api/status", async (_req, res) => {
+    const status = await tradingEngine.getStatus();
     res.json(status);
   });
 
   // ============ BOT CONFIG ============
-  app.get("/api/config", (_req, res) => {
-    const config = storage.getConfig();
+  app.get("/api/config", async (_req, res) => {
+    const config = await storage.getConfig();
     res.json(config);
   });
 
-  app.patch("/api/config", (req, res) => {
+  app.patch("/api/config", async (req, res) => {
     try {
-      const updated = storage.updateConfig(req.body);
-      storage.createLog({
+      const updated = await storage.updateConfig(req.body);
+      await storage.createLog({
         type: "config_change",
         message: `Config updated: ${Object.keys(req.body).join(", ")}`,
         data: JSON.stringify(req.body),
@@ -57,33 +57,33 @@ export async function registerRoutes(
   });
 
   // ============ BOT CONTROL ============
-  app.post("/api/bot/start", (_req, res) => {
-    const config = storage.getConfig();
+  app.post("/api/bot/start", async (_req, res) => {
+    const config = await storage.getConfig();
     if (!config) return res.status(400).json({ error: "No config found" });
     
-    storage.updateConfig({ isRunning: true });
+    await storage.updateConfig({ isRunning: true });
     tradingEngine.start();
-    broadcast({ type: "status", data: tradingEngine.getStatus() });
+    broadcast({ type: "status", data: await tradingEngine.getStatus() });
     res.json({ success: true, message: "Bot started" });
   });
 
-  app.post("/api/bot/stop", (_req, res) => {
-    storage.updateConfig({ isRunning: false });
+  app.post("/api/bot/stop", async (_req, res) => {
+    await storage.updateConfig({ isRunning: false });
     tradingEngine.stop();
-    broadcast({ type: "status", data: tradingEngine.getStatus() });
+    broadcast({ type: "status", data: await tradingEngine.getStatus() });
     res.json({ success: true, message: "Bot stopped" });
   });
 
   app.post("/api/bot/scan", async (_req, res) => {
     try {
       // Temporarily set running to allow scan
-      const config = storage.getConfig();
+      const config = await storage.getConfig();
       const wasRunning = config?.isRunning;
-      if (!wasRunning) storage.updateConfig({ isRunning: true });
+      if (!wasRunning) await storage.updateConfig({ isRunning: true });
       
       await tradingEngine.forceScan();
       
-      if (!wasRunning) storage.updateConfig({ isRunning: false });
+      if (!wasRunning) await storage.updateConfig({ isRunning: false });
       
       res.json({ success: true, message: "Scan completed" });
     } catch (e: any) {
@@ -92,17 +92,17 @@ export async function registerRoutes(
   });
 
   // ============ TRADES ============
-  app.get("/api/trades", (req, res) => {
+  app.get("/api/trades", async (req, res) => {
     const status = req.query.status as string | undefined;
     if (status === "open") {
-      res.json(storage.getOpenTrades());
+      res.json(await storage.getOpenTrades());
     } else {
-      res.json(storage.getAllTrades(200));
+      res.json(await storage.getAllTrades(200));
     }
   });
 
-  app.get("/api/trades/:id", (req, res) => {
-    const trade = storage.getTradeById(parseInt(req.params.id));
+  app.get("/api/trades/:id", async (req, res) => {
+    const trade = await storage.getTradeById(parseInt(req.params.id));
     if (!trade) return res.status(404).json({ error: "Trade not found" });
     res.json(trade);
   });
@@ -119,30 +119,30 @@ export async function registerRoutes(
   });
 
   // ============ P&L ============
-  app.get("/api/pnl", (req, res) => {
+  app.get("/api/pnl", async (req, res) => {
     const since = req.query.since as string | undefined;
-    res.json(storage.getPnlSnapshots(since));
+    res.json(await storage.getPnlSnapshots(since));
   });
 
   // ============ MARKET SCANS ============
-  app.get("/api/scans", (_req, res) => {
-    res.json(storage.getLatestScans());
+  app.get("/api/scans", async (_req, res) => {
+    res.json(await storage.getLatestScans());
   });
 
-  app.get("/api/scans/signals", (_req, res) => {
-    res.json(storage.getScansWithSignal());
+  app.get("/api/scans/signals", async (_req, res) => {
+    res.json(await storage.getScansWithSignal());
   });
 
   // ============ ACTIVITY LOG ============
-  app.get("/api/logs", (req, res) => {
+  app.get("/api/logs", async (req, res) => {
     const limit = parseInt(req.query.limit as string) || 200;
-    res.json(storage.getLogs(limit));
+    res.json(await storage.getLogs(limit));
   });
 
   // ============ ACCOUNT INFO (proxied from Hyperliquid) ============
   // Supports both Standard and Unified Account modes
   app.get("/api/account", async (req, res) => {
-    const config = storage.getConfig();
+    const config = await storage.getConfig();
     if (!config?.walletAddress) {
       return res.json({ connected: false, balance: 0, positions: [] });
     }
@@ -204,24 +204,24 @@ export async function registerRoutes(
   });
 
   // ============ LEARNING / DECISIONS ============
-  app.get("/api/learning/stats", (_req, res) => {
-    const stats = getLearningStats();
+  app.get("/api/learning/stats", async (_req, res) => {
+    const stats = await getLearningStats();
     res.json(stats);
   });
 
-  app.get("/api/learning/insights", (_req, res) => {
-    res.json(storage.getAllInsights());
+  app.get("/api/learning/insights", async (_req, res) => {
+    res.json(await storage.getAllInsights());
   });
 
-  app.get("/api/learning/decisions", (req, res) => {
+  app.get("/api/learning/decisions", async (req, res) => {
     const limit = parseInt(req.query.limit as string) || 100;
-    res.json(storage.getAllDecisions(limit));
+    res.json(await storage.getAllDecisions(limit));
   });
 
   app.post("/api/learning/review", async (_req, res) => {
     try {
-      const reviewed = reviewClosedTrades();
-      generateInsights();
+      const reviewed = await reviewClosedTrades();
+      await generateInsights();
       res.json({ success: true, reviewed });
     } catch (e: any) {
       res.status(500).json({ error: e.message });

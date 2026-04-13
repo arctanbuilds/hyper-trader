@@ -1,161 +1,177 @@
-import Database from "better-sqlite3";
-import { drizzle } from "drizzle-orm/better-sqlite3";
+import pg from "pg";
+import { drizzle } from "drizzle-orm/node-postgres";
 import * as schema from "@shared/schema";
 
-const sqlite = new Database("./data.db");
-sqlite.pragma("journal_mode = WAL");
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  throw new Error("DATABASE_URL environment variable is required");
+}
 
-// Auto-create tables at startup (no drizzle-kit needed at runtime)
-sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS bot_config (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    is_running INTEGER DEFAULT 0,
-    api_key TEXT DEFAULT '',
-    api_secret TEXT DEFAULT '',
-    wallet_address TEXT DEFAULT '',
-    max_leverage INTEGER DEFAULT 50,
-    max_positions INTEGER DEFAULT 5,
-    trade_amount_pct REAL DEFAULT 10,
-    weekly_target_pct REAL DEFAULT 50,
-    max_drawdown_pct REAL DEFAULT 10,
-    rsi_oversold_threshold INTEGER DEFAULT 20,
-    rsi_overbought_threshold INTEGER DEFAULT 80,
-    stop_loss_pct REAL DEFAULT 0.35,
-    take_profit_pct REAL DEFAULT 0.5,
-    take_profit_2_pct REAL DEFAULT 1.0,
-    trailing_stop_pct REAL DEFAULT 0.3,
-    use_trailing_stop INTEGER DEFAULT 1,
-    max_risk_per_trade_pct REAL DEFAULT 0.25,
-    min_risk_reward_ratio REAL DEFAULT 1.0,
-    min_confluence_score INTEGER DEFAULT 3,
-    min_volume_24h REAL DEFAULT 1000000,
-    use_macro_filter INTEGER DEFAULT 1,
-    use_session_filter INTEGER DEFAULT 1,
-    use_ema_filter INTEGER DEFAULT 1,
-    use_liquidation_filter INTEGER DEFAULT 1,
-    scan_interval_secs INTEGER DEFAULT 60,
-    max_daily_loss_pct REAL DEFAULT 0.75,
-    max_weekly_loss_pct REAL DEFAULT 1.5,
-    updated_at TEXT DEFAULT ''
-  );
-  CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    coin TEXT NOT NULL,
-    side TEXT NOT NULL,
-    entry_price REAL NOT NULL,
-    exit_price REAL,
-    size REAL NOT NULL,
-    leverage INTEGER NOT NULL,
-    rsi_at_entry REAL,
-    rsi_4h REAL,
-    rsi_1d REAL,
-    ema_10 REAL,
-    ema_21 REAL,
-    ema_50 REAL,
-    stop_loss REAL,
-    take_profit_1 REAL,
-    take_profit_2 REAL,
-    tp1_hit INTEGER DEFAULT 0,
-    confluence_score INTEGER DEFAULT 0,
-    confluence_details TEXT DEFAULT '',
-    risk_reward_ratio REAL,
-    pnl REAL,
-    pnl_pct REAL,
-    peak_pnl_pct REAL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'open',
-    reason TEXT DEFAULT '',
-    close_reason TEXT DEFAULT '',
-    setup_type TEXT DEFAULT '',
-    opened_at TEXT NOT NULL,
-    closed_at TEXT
-  );
-  CREATE TABLE IF NOT EXISTS pnl_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    total_equity REAL NOT NULL,
-    total_pnl REAL NOT NULL,
-    total_pnl_pct REAL NOT NULL,
-    open_positions INTEGER NOT NULL,
-    timestamp TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS activity_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL,
-    message TEXT NOT NULL,
-    data TEXT DEFAULT '',
-    timestamp TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS market_scans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    coin TEXT NOT NULL,
-    price REAL NOT NULL,
-    rsi REAL,
-    rsi_4h REAL,
-    rsi_1d REAL,
-    ema_10 REAL,
-    ema_21 REAL,
-    ema_50 REAL,
-    volume_24h REAL,
-    change_24h REAL,
-    signal TEXT,
-    funding_rate REAL,
-    open_interest REAL,
-    confluence_score INTEGER DEFAULT 0,
-    confluence_details TEXT DEFAULT '',
-    risk_reward_ratio REAL,
-    timestamp TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS trade_decisions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trade_id INTEGER,
-    coin TEXT NOT NULL,
-    action TEXT NOT NULL,
-    side TEXT,
-    price REAL NOT NULL,
-    rsi_1h REAL,
-    rsi_4h REAL,
-    rsi_1d REAL,
-    ema_10 REAL,
-    ema_21 REAL,
-    ema_50 REAL,
-    volume_24h REAL,
-    change_24h REAL,
-    funding_rate REAL,
-    open_interest REAL,
-    confluence_score INTEGER,
-    confluence_details TEXT,
-    risk_reward_ratio REAL,
-    reasoning TEXT NOT NULL,
-    equity REAL,
-    leverage INTEGER,
-    position_size_usd REAL,
-    session TEXT,
-    day_of_week INTEGER,
-    hour_utc INTEGER,
-    outcome TEXT,
-    outcome_pnl_pct REAL,
-    outcome_pnl_usd REAL,
-    hold_duration_mins INTEGER,
-    exit_type TEXT,
-    was_good_decision INTEGER,
-    review_notes TEXT,
-    timestamp TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS learning_insights (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    category TEXT NOT NULL,
-    rule TEXT NOT NULL,
-    description TEXT NOT NULL,
-    sample_size INTEGER NOT NULL,
-    win_rate REAL,
-    avg_pnl_pct REAL,
-    avg_pnl_win_pct REAL,
-    avg_pnl_loss_pct REAL,
-    confidence REAL NOT NULL,
-    is_active INTEGER DEFAULT 1,
-    trades_affected INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-`);
+const pool = new pg.Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+});
 
-export const db = drizzle(sqlite, { schema });
+export const db = drizzle(pool, { schema });
+
+// Create all tables at startup (idempotent)
+export async function initDatabase() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bot_config (
+        id SERIAL PRIMARY KEY,
+        is_running BOOLEAN DEFAULT false,
+        api_key TEXT DEFAULT '',
+        api_secret TEXT DEFAULT '',
+        wallet_address TEXT DEFAULT '',
+        max_leverage INTEGER DEFAULT 50,
+        max_positions INTEGER DEFAULT 5,
+        trade_amount_pct DOUBLE PRECISION DEFAULT 10,
+        weekly_target_pct DOUBLE PRECISION DEFAULT 50,
+        max_drawdown_pct DOUBLE PRECISION DEFAULT 10,
+        rsi_oversold_threshold INTEGER DEFAULT 20,
+        rsi_overbought_threshold INTEGER DEFAULT 80,
+        stop_loss_pct DOUBLE PRECISION DEFAULT 0.35,
+        take_profit_pct DOUBLE PRECISION DEFAULT 0.5,
+        take_profit_2_pct DOUBLE PRECISION DEFAULT 1.0,
+        trailing_stop_pct DOUBLE PRECISION DEFAULT 0.3,
+        use_trailing_stop BOOLEAN DEFAULT true,
+        max_risk_per_trade_pct DOUBLE PRECISION DEFAULT 0.25,
+        min_risk_reward_ratio DOUBLE PRECISION DEFAULT 1.0,
+        min_confluence_score INTEGER DEFAULT 3,
+        min_volume_24h DOUBLE PRECISION DEFAULT 1000000,
+        use_macro_filter BOOLEAN DEFAULT true,
+        use_session_filter BOOLEAN DEFAULT true,
+        use_ema_filter BOOLEAN DEFAULT true,
+        use_liquidation_filter BOOLEAN DEFAULT true,
+        scan_interval_secs INTEGER DEFAULT 60,
+        max_daily_loss_pct DOUBLE PRECISION DEFAULT 0.75,
+        max_weekly_loss_pct DOUBLE PRECISION DEFAULT 1.5,
+        updated_at TEXT DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
+        coin TEXT NOT NULL,
+        side TEXT NOT NULL,
+        entry_price DOUBLE PRECISION NOT NULL,
+        exit_price DOUBLE PRECISION,
+        size DOUBLE PRECISION NOT NULL,
+        leverage INTEGER NOT NULL,
+        rsi_at_entry DOUBLE PRECISION,
+        rsi_4h DOUBLE PRECISION,
+        rsi_1d DOUBLE PRECISION,
+        ema_10 DOUBLE PRECISION,
+        ema_21 DOUBLE PRECISION,
+        ema_50 DOUBLE PRECISION,
+        stop_loss DOUBLE PRECISION,
+        take_profit_1 DOUBLE PRECISION,
+        take_profit_2 DOUBLE PRECISION,
+        tp1_hit BOOLEAN DEFAULT false,
+        confluence_score INTEGER DEFAULT 0,
+        confluence_details TEXT DEFAULT '',
+        risk_reward_ratio DOUBLE PRECISION,
+        pnl DOUBLE PRECISION,
+        pnl_pct DOUBLE PRECISION,
+        peak_pnl_pct DOUBLE PRECISION DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'open',
+        reason TEXT DEFAULT '',
+        close_reason TEXT DEFAULT '',
+        setup_type TEXT DEFAULT '',
+        opened_at TEXT NOT NULL,
+        closed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS pnl_snapshots (
+        id SERIAL PRIMARY KEY,
+        total_equity DOUBLE PRECISION NOT NULL,
+        total_pnl DOUBLE PRECISION NOT NULL,
+        total_pnl_pct DOUBLE PRECISION NOT NULL,
+        open_positions INTEGER NOT NULL,
+        timestamp TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS activity_log (
+        id SERIAL PRIMARY KEY,
+        type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        data TEXT DEFAULT '',
+        timestamp TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS market_scans (
+        id SERIAL PRIMARY KEY,
+        coin TEXT NOT NULL,
+        price DOUBLE PRECISION NOT NULL,
+        rsi DOUBLE PRECISION,
+        rsi_4h DOUBLE PRECISION,
+        rsi_1d DOUBLE PRECISION,
+        ema_10 DOUBLE PRECISION,
+        ema_21 DOUBLE PRECISION,
+        ema_50 DOUBLE PRECISION,
+        volume_24h DOUBLE PRECISION,
+        change_24h DOUBLE PRECISION,
+        signal TEXT,
+        funding_rate DOUBLE PRECISION,
+        open_interest DOUBLE PRECISION,
+        confluence_score INTEGER DEFAULT 0,
+        confluence_details TEXT DEFAULT '',
+        risk_reward_ratio DOUBLE PRECISION,
+        timestamp TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS trade_decisions (
+        id SERIAL PRIMARY KEY,
+        trade_id INTEGER,
+        coin TEXT NOT NULL,
+        action TEXT NOT NULL,
+        side TEXT,
+        price DOUBLE PRECISION NOT NULL,
+        rsi_1h DOUBLE PRECISION,
+        rsi_4h DOUBLE PRECISION,
+        rsi_1d DOUBLE PRECISION,
+        ema_10 DOUBLE PRECISION,
+        ema_21 DOUBLE PRECISION,
+        ema_50 DOUBLE PRECISION,
+        volume_24h DOUBLE PRECISION,
+        change_24h DOUBLE PRECISION,
+        funding_rate DOUBLE PRECISION,
+        open_interest DOUBLE PRECISION,
+        confluence_score INTEGER,
+        confluence_details TEXT,
+        risk_reward_ratio DOUBLE PRECISION,
+        reasoning TEXT NOT NULL,
+        equity DOUBLE PRECISION,
+        leverage INTEGER,
+        position_size_usd DOUBLE PRECISION,
+        session TEXT,
+        day_of_week INTEGER,
+        hour_utc INTEGER,
+        outcome TEXT,
+        outcome_pnl_pct DOUBLE PRECISION,
+        outcome_pnl_usd DOUBLE PRECISION,
+        hold_duration_mins INTEGER,
+        exit_type TEXT,
+        was_good_decision BOOLEAN,
+        review_notes TEXT,
+        timestamp TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS learning_insights (
+        id SERIAL PRIMARY KEY,
+        category TEXT NOT NULL,
+        rule TEXT NOT NULL,
+        description TEXT NOT NULL,
+        sample_size INTEGER NOT NULL,
+        win_rate DOUBLE PRECISION,
+        avg_pnl_pct DOUBLE PRECISION,
+        avg_pnl_win_pct DOUBLE PRECISION,
+        avg_pnl_loss_pct DOUBLE PRECISION,
+        confidence DOUBLE PRECISION NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        trades_affected INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    console.log("[DB] PostgreSQL tables initialized");
+  } finally {
+    client.release();
+  }
+}

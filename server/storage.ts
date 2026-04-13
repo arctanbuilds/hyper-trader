@@ -1,4 +1,4 @@
-import { db } from "./db";
+import { db, initDatabase } from "./db";
 import { eq, desc, and, gte, isNull, isNotNull } from "drizzle-orm";
 import {
   botConfig, trades, pnlSnapshots, activityLog, marketScans,
@@ -13,54 +13,56 @@ import {
 } from "@shared/schema";
 
 export interface IStorage {
+  init(): Promise<void>;
   // Bot Config
-  getConfig(): BotConfig | undefined;
-  updateConfig(data: Partial<InsertBotConfig>): BotConfig;
+  getConfig(): Promise<BotConfig | undefined>;
+  updateConfig(data: Partial<InsertBotConfig>): Promise<BotConfig>;
   
   // Trades
-  createTrade(trade: InsertTrade): Trade;
-  updateTrade(id: number, data: Partial<InsertTrade>): Trade | undefined;
-  getOpenTrades(): Trade[];
-  getAllTrades(limit?: number): Trade[];
-  getTradeById(id: number): Trade | undefined;
-  getClosedTradesSince(since: string): Trade[];
+  createTrade(trade: InsertTrade): Promise<Trade>;
+  updateTrade(id: number, data: Partial<InsertTrade>): Promise<Trade | undefined>;
+  getOpenTrades(): Promise<Trade[]>;
+  getAllTrades(limit?: number): Promise<Trade[]>;
+  getTradeById(id: number): Promise<Trade | undefined>;
+  getClosedTradesSince(since: string): Promise<Trade[]>;
   
   // PnL Snapshots
-  createPnlSnapshot(snap: InsertPnlSnapshot): PnlSnapshot;
-  getPnlSnapshots(since?: string): PnlSnapshot[];
+  createPnlSnapshot(snap: InsertPnlSnapshot): Promise<PnlSnapshot>;
+  getPnlSnapshots(since?: string): Promise<PnlSnapshot[]>;
   
   // Activity Log
-  createLog(entry: InsertActivityLog): ActivityLogEntry;
-  getLogs(limit?: number): ActivityLogEntry[];
+  createLog(entry: InsertActivityLog): Promise<ActivityLogEntry>;
+  getLogs(limit?: number): Promise<ActivityLogEntry[]>;
   
   // Market Scans
-  upsertMarketScan(scan: InsertMarketScan): MarketScan;
-  getLatestScans(): MarketScan[];
-  getScansWithSignal(): MarketScan[];
+  upsertMarketScan(scan: InsertMarketScan): Promise<MarketScan>;
+  getLatestScans(): Promise<MarketScan[]>;
+  getScansWithSignal(): Promise<MarketScan[]>;
   
   // Trade Decisions (Learning Memory)
-  createDecision(decision: InsertTradeDecision): TradeDecision;
-  updateDecision(id: number, data: Partial<InsertTradeDecision>): TradeDecision | undefined;
-  getDecisionsByTradeId(tradeId: number): TradeDecision[];
-  getUnreviewedDecisions(limit?: number): TradeDecision[];
-  getAllDecisions(limit?: number): TradeDecision[];
-  getDecisionsByCoin(coin: string, limit?: number): TradeDecision[];
-  getDecisionsByOutcome(outcome: string, limit?: number): TradeDecision[];
+  createDecision(decision: InsertTradeDecision): Promise<TradeDecision>;
+  updateDecision(id: number, data: Partial<InsertTradeDecision>): Promise<TradeDecision | undefined>;
+  getDecisionsByTradeId(tradeId: number): Promise<TradeDecision[]>;
+  getUnreviewedDecisions(limit?: number): Promise<TradeDecision[]>;
+  getAllDecisions(limit?: number): Promise<TradeDecision[]>;
+  getDecisionsByCoin(coin: string, limit?: number): Promise<TradeDecision[]>;
+  getDecisionsByOutcome(outcome: string, limit?: number): Promise<TradeDecision[]>;
   
   // Learning Insights
-  createInsight(insight: InsertLearningInsight): LearningInsight;
-  updateInsight(id: number, data: Partial<InsertLearningInsight>): LearningInsight | undefined;
-  getActiveInsights(): LearningInsight[];
-  getAllInsights(): LearningInsight[];
-  getInsightByRule(rule: string): LearningInsight | undefined;
+  createInsight(insight: InsertLearningInsight): Promise<LearningInsight>;
+  updateInsight(id: number, data: Partial<InsertLearningInsight>): Promise<LearningInsight | undefined>;
+  getActiveInsights(): Promise<LearningInsight[]>;
+  getAllInsights(): Promise<LearningInsight[]>;
+  getInsightByRule(rule: string): Promise<LearningInsight | undefined>;
 }
 
 export class DatabaseStorage implements IStorage {
-  constructor() {
+  async init() {
+    await initDatabase();
     // Ensure default config exists
-    const existing = db.select().from(botConfig).get();
-    if (!existing) {
-      db.insert(botConfig).values({
+    const rows = await db.select().from(botConfig);
+    if (rows.length === 0) {
+      await db.insert(botConfig).values({
         isRunning: false,
         maxLeverage: 50,
         maxPositions: 5,
@@ -86,160 +88,166 @@ export class DatabaseStorage implements IStorage {
         maxDailyLossPct: 0.75,
         maxWeeklyLossPct: 1.5,
         updatedAt: new Date().toISOString(),
-      }).run();
+      });
     }
   }
 
-  getConfig(): BotConfig | undefined {
-    return db.select().from(botConfig).get();
+  async getConfig(): Promise<BotConfig | undefined> {
+    const rows = await db.select().from(botConfig);
+    return rows[0];
   }
 
-  updateConfig(data: Partial<InsertBotConfig>): BotConfig {
-    const existing = this.getConfig();
+  async updateConfig(data: Partial<InsertBotConfig>): Promise<BotConfig> {
+    const existing = await this.getConfig();
     if (!existing) throw new Error("No config found");
-    db.update(botConfig)
+    await db.update(botConfig)
       .set({ ...data, updatedAt: new Date().toISOString() })
-      .where(eq(botConfig.id, existing.id))
-      .run();
-    return this.getConfig()!;
+      .where(eq(botConfig.id, existing.id));
+    return (await this.getConfig())!;
   }
 
-  createTrade(trade: InsertTrade): Trade {
-    return db.insert(trades).values(trade).returning().get();
+  async createTrade(trade: InsertTrade): Promise<Trade> {
+    const rows = await db.insert(trades).values(trade).returning();
+    return rows[0];
   }
 
-  updateTrade(id: number, data: Partial<InsertTrade>): Trade | undefined {
-    db.update(trades).set(data).where(eq(trades.id, id)).run();
-    return db.select().from(trades).where(eq(trades.id, id)).get();
+  async updateTrade(id: number, data: Partial<InsertTrade>): Promise<Trade | undefined> {
+    await db.update(trades).set(data).where(eq(trades.id, id));
+    const rows = await db.select().from(trades).where(eq(trades.id, id));
+    return rows[0];
   }
 
-  getOpenTrades(): Trade[] {
-    return db.select().from(trades).where(eq(trades.status, "open")).all();
+  async getOpenTrades(): Promise<Trade[]> {
+    return db.select().from(trades).where(eq(trades.status, "open"));
   }
 
-  getAllTrades(limit: number = 100): Trade[] {
-    return db.select().from(trades).orderBy(desc(trades.id)).limit(limit).all();
+  async getAllTrades(limit: number = 100): Promise<Trade[]> {
+    return db.select().from(trades).orderBy(desc(trades.id)).limit(limit);
   }
 
-  getTradeById(id: number): Trade | undefined {
-    return db.select().from(trades).where(eq(trades.id, id)).get();
+  async getTradeById(id: number): Promise<Trade | undefined> {
+    const rows = await db.select().from(trades).where(eq(trades.id, id));
+    return rows[0];
   }
 
-  getClosedTradesSince(since: string): Trade[] {
+  async getClosedTradesSince(since: string): Promise<Trade[]> {
     return db.select().from(trades)
       .where(and(eq(trades.status, "closed"), gte(trades.closedAt, since)))
-      .orderBy(desc(trades.id)).all();
+      .orderBy(desc(trades.id));
   }
 
-  createPnlSnapshot(snap: InsertPnlSnapshot): PnlSnapshot {
-    return db.insert(pnlSnapshots).values(snap).returning().get();
+  async createPnlSnapshot(snap: InsertPnlSnapshot): Promise<PnlSnapshot> {
+    const rows = await db.insert(pnlSnapshots).values(snap).returning();
+    return rows[0];
   }
 
-  getPnlSnapshots(since?: string): PnlSnapshot[] {
+  async getPnlSnapshots(since?: string): Promise<PnlSnapshot[]> {
     if (since) {
       return db.select().from(pnlSnapshots)
         .where(gte(pnlSnapshots.timestamp, since))
-        .orderBy(pnlSnapshots.timestamp).all();
+        .orderBy(pnlSnapshots.timestamp);
     }
-    return db.select().from(pnlSnapshots).orderBy(desc(pnlSnapshots.timestamp)).limit(500).all();
+    return db.select().from(pnlSnapshots).orderBy(desc(pnlSnapshots.timestamp)).limit(500);
   }
 
-  createLog(entry: InsertActivityLog): ActivityLogEntry {
-    return db.insert(activityLog).values(entry).returning().get();
+  async createLog(entry: InsertActivityLog): Promise<ActivityLogEntry> {
+    const rows = await db.insert(activityLog).values(entry).returning();
+    return rows[0];
   }
 
-  getLogs(limit: number = 200): ActivityLogEntry[] {
-    return db.select().from(activityLog).orderBy(desc(activityLog.id)).limit(limit).all();
+  async getLogs(limit: number = 200): Promise<ActivityLogEntry[]> {
+    return db.select().from(activityLog).orderBy(desc(activityLog.id)).limit(limit);
   }
 
-  upsertMarketScan(scan: InsertMarketScan): MarketScan {
-    db.delete(marketScans).where(eq(marketScans.coin, scan.coin)).run();
-    return db.insert(marketScans).values(scan).returning().get();
+  async upsertMarketScan(scan: InsertMarketScan): Promise<MarketScan> {
+    await db.delete(marketScans).where(eq(marketScans.coin, scan.coin));
+    const rows = await db.insert(marketScans).values(scan).returning();
+    return rows[0];
   }
 
-  getLatestScans(): MarketScan[] {
-    return db.select().from(marketScans).orderBy(desc(marketScans.rsi)).all();
+  async getLatestScans(): Promise<MarketScan[]> {
+    return db.select().from(marketScans).orderBy(desc(marketScans.rsi));
   }
 
-  getScansWithSignal(): MarketScan[] {
-    return db.select().from(marketScans)
-      .where(
-        and(
-          // not null signal and not neutral
-        )
-      ).all()
-      .filter(s => s.signal && s.signal !== "neutral");
+  async getScansWithSignal(): Promise<MarketScan[]> {
+    const all = await db.select().from(marketScans);
+    return all.filter(s => s.signal && s.signal !== "neutral");
   }
 
   // ============ TRADE DECISIONS ============
 
-  createDecision(decision: InsertTradeDecision): TradeDecision {
-    return db.insert(tradeDecisions).values(decision).returning().get();
+  async createDecision(decision: InsertTradeDecision): Promise<TradeDecision> {
+    const rows = await db.insert(tradeDecisions).values(decision).returning();
+    return rows[0];
   }
 
-  updateDecision(id: number, data: Partial<InsertTradeDecision>): TradeDecision | undefined {
-    db.update(tradeDecisions).set(data).where(eq(tradeDecisions.id, id)).run();
-    return db.select().from(tradeDecisions).where(eq(tradeDecisions.id, id)).get();
+  async updateDecision(id: number, data: Partial<InsertTradeDecision>): Promise<TradeDecision | undefined> {
+    await db.update(tradeDecisions).set(data).where(eq(tradeDecisions.id, id));
+    const rows = await db.select().from(tradeDecisions).where(eq(tradeDecisions.id, id));
+    return rows[0];
   }
 
-  getDecisionsByTradeId(tradeId: number): TradeDecision[] {
+  async getDecisionsByTradeId(tradeId: number): Promise<TradeDecision[]> {
     return db.select().from(tradeDecisions)
       .where(eq(tradeDecisions.tradeId, tradeId))
-      .orderBy(tradeDecisions.id).all();
+      .orderBy(tradeDecisions.id);
   }
 
-  getUnreviewedDecisions(limit: number = 50): TradeDecision[] {
+  async getUnreviewedDecisions(limit: number = 50): Promise<TradeDecision[]> {
     return db.select().from(tradeDecisions)
       .where(and(
         eq(tradeDecisions.action, "entry"),
         isNull(tradeDecisions.outcome),
         isNotNull(tradeDecisions.tradeId),
       ))
-      .orderBy(desc(tradeDecisions.id)).limit(limit).all();
+      .orderBy(desc(tradeDecisions.id)).limit(limit);
   }
 
-  getAllDecisions(limit: number = 500): TradeDecision[] {
+  async getAllDecisions(limit: number = 500): Promise<TradeDecision[]> {
     return db.select().from(tradeDecisions)
-      .orderBy(desc(tradeDecisions.id)).limit(limit).all();
+      .orderBy(desc(tradeDecisions.id)).limit(limit);
   }
 
-  getDecisionsByCoin(coin: string, limit: number = 100): TradeDecision[] {
+  async getDecisionsByCoin(coin: string, limit: number = 100): Promise<TradeDecision[]> {
     return db.select().from(tradeDecisions)
       .where(eq(tradeDecisions.coin, coin))
-      .orderBy(desc(tradeDecisions.id)).limit(limit).all();
+      .orderBy(desc(tradeDecisions.id)).limit(limit);
   }
 
-  getDecisionsByOutcome(outcome: string, limit: number = 100): TradeDecision[] {
+  async getDecisionsByOutcome(outcome: string, limit: number = 100): Promise<TradeDecision[]> {
     return db.select().from(tradeDecisions)
       .where(eq(tradeDecisions.outcome, outcome))
-      .orderBy(desc(tradeDecisions.id)).limit(limit).all();
+      .orderBy(desc(tradeDecisions.id)).limit(limit);
   }
 
   // ============ LEARNING INSIGHTS ============
 
-  createInsight(insight: InsertLearningInsight): LearningInsight {
-    return db.insert(learningInsights).values(insight).returning().get();
+  async createInsight(insight: InsertLearningInsight): Promise<LearningInsight> {
+    const rows = await db.insert(learningInsights).values(insight).returning();
+    return rows[0];
   }
 
-  updateInsight(id: number, data: Partial<InsertLearningInsight>): LearningInsight | undefined {
-    db.update(learningInsights).set(data).where(eq(learningInsights.id, id)).run();
-    return db.select().from(learningInsights).where(eq(learningInsights.id, id)).get();
+  async updateInsight(id: number, data: Partial<InsertLearningInsight>): Promise<LearningInsight | undefined> {
+    await db.update(learningInsights).set(data).where(eq(learningInsights.id, id));
+    const rows = await db.select().from(learningInsights).where(eq(learningInsights.id, id));
+    return rows[0];
   }
 
-  getActiveInsights(): LearningInsight[] {
+  async getActiveInsights(): Promise<LearningInsight[]> {
     return db.select().from(learningInsights)
       .where(eq(learningInsights.isActive, true))
-      .orderBy(desc(learningInsights.confidence)).all();
+      .orderBy(desc(learningInsights.confidence));
   }
 
-  getAllInsights(): LearningInsight[] {
+  async getAllInsights(): Promise<LearningInsight[]> {
     return db.select().from(learningInsights)
-      .orderBy(desc(learningInsights.updatedAt)).all();
+      .orderBy(desc(learningInsights.updatedAt));
   }
 
-  getInsightByRule(rule: string): LearningInsight | undefined {
-    return db.select().from(learningInsights)
-      .where(eq(learningInsights.rule, rule)).get();
+  async getInsightByRule(rule: string): Promise<LearningInsight | undefined> {
+    const rows = await db.select().from(learningInsights)
+      .where(eq(learningInsights.rule, rule));
+    return rows[0];
   }
 }
 

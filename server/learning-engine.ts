@@ -2,34 +2,19 @@
  * HyperTrader — Learning Engine
  * 
  * Continuously improves trading by analyzing every decision and outcome.
- * 
- * How it works:
- *   1. Every entry, skip, and exit is logged with full market context + reasoning
- *   2. After trades close, it reviews outcomes and marks decisions as good/bad
- *   3. It builds statistical patterns: which assets/sessions/setups win or lose
- *   4. Active insights are checked before every new trade as "learned rules"
- *   5. Rules auto-deactivate if they stop being predictive
- * 
- * Pattern categories:
- *   - asset: Per-asset win rates, best/worst conditions
- *   - session: Which trading sessions produce best results
- *   - confluence: Which confluence levels actually predict wins
- *   - exit: Which exit types capture most profit
- *   - sizing: Whether smaller or larger positions perform better
- *   - pattern: Specific RSI/EMA/funding combinations that work
+ * All storage calls are async (PostgreSQL).
  */
 
 import { storage } from "./storage";
 import { log } from "./index";
 import type { Trade, TradeDecision, LearningInsight } from "@shared/schema";
 
-// Minimum trades before a pattern is considered reliable
 const MIN_SAMPLE_SIZE = 5;
 const HIGH_CONFIDENCE_SAMPLE = 15;
 
 // ============ DECISION LOGGING ============
 
-export function logDecision(params: {
+export async function logDecision(params: {
   tradeId?: number;
   coin: string;
   action: "entry" | "skip" | "exit" | "tp1_hit" | "circuit_breaker";
@@ -56,7 +41,7 @@ export function logDecision(params: {
   const now = new Date();
   
   try {
-    storage.createDecision({
+    await storage.createDecision({
       tradeId: params.tradeId || null,
       coin: params.coin,
       action: params.action,
@@ -107,26 +92,20 @@ function getSession(): string {
 
 // ============ OUTCOME REVIEW ============
 
-/**
- * Called periodically to fill in outcomes for closed trades.
- * Matches trade_decisions entries to their closed trade data.
- */
-export function reviewClosedTrades() {
+export async function reviewClosedTrades() {
   try {
-    const unreviewedDecisions = storage.getUnreviewedDecisions(50);
+    const unreviewedDecisions = await storage.getUnreviewedDecisions(50);
     let reviewed = 0;
 
     for (const decision of unreviewedDecisions) {
       if (!decision.tradeId) continue;
       
-      const trade = storage.getTradeById(decision.tradeId);
+      const trade = await storage.getTradeById(decision.tradeId);
       if (!trade || trade.status === "open") continue;
       
-      // Trade is closed — fill in outcome
       const pnlPct = trade.pnl || 0;
       const outcome = pnlPct > 0.1 ? "win" : pnlPct < -0.1 ? "loss" : "breakeven";
       
-      // Calculate hold duration
       let holdDurationMins: number | null = null;
       if (trade.openedAt && trade.closedAt) {
         const open = new Date(trade.openedAt).getTime();
@@ -134,7 +113,6 @@ export function reviewClosedTrades() {
         holdDurationMins = Math.round((close - open) / 60000);
       }
       
-      // Determine exit type
       let exitType = "unknown";
       const closeReason = (trade.closeReason || "").toLowerCase();
       if (closeReason.includes("tp2")) exitType = "tp2";
@@ -143,10 +121,8 @@ export function reviewClosedTrades() {
       else if (closeReason.includes("stop loss")) exitType = "sl";
       else if (closeReason.includes("rsi recover")) exitType = "rsi_recovery";
       else if (closeReason.includes("manual")) exitType = "manual";
+      else if (closeReason.includes("quick profit")) exitType = "quick_profit";
       
-      // Was this a good decision?
-      // Good = win OR small loss within risk parameters
-      // Bad = large loss, or win where we left too much on the table
       let wasGoodDecision = false;
       let reviewNotes = "";
       
@@ -160,16 +136,14 @@ export function reviewClosedTrades() {
           const peakPnl = trade.peakPnlPct || 0;
           const captureRatio = peakPnl > 0 ? (pnlPct / peakPnl * 100) : 100;
           reviewNotes = `Trailing captured ${captureRatio.toFixed(0)}% of peak (${peakPnl.toFixed(2)}% peak → ${pnlPct.toFixed(2)}% exit)`;
-          if (captureRatio < 50) {
-            reviewNotes += ". Consider tighter trailing or earlier TP.";
-          }
+          if (captureRatio < 50) reviewNotes += ". Consider tighter trailing or earlier TP.";
         } else {
           reviewNotes = `Win via ${exitType}. P&L: ${pnlPct.toFixed(2)}%`;
         }
       } else if (outcome === "loss") {
-        const maxRisk = 0.25; // config default
+        const maxRisk = 0.25;
         if (Math.abs(pnlPct) <= maxRisk * 1.5) {
-          wasGoodDecision = true; // Controlled loss within risk parameters
+          wasGoodDecision = true;
           reviewNotes = `Controlled loss within risk budget. SL worked correctly. P&L: ${pnlPct.toFixed(2)}%`;
         } else {
           wasGoodDecision = false;
@@ -186,12 +160,11 @@ export function reviewClosedTrades() {
         reviewNotes = `Breakeven — capital preserved. ${exitType}`;
       }
       
-      // Estimate USD P&L
       const equityAtEntry = decision.equity || 1000;
       const posSize = decision.positionSizeUsd || (equityAtEntry * 0.1);
       const pnlUsd = posSize * (pnlPct / 100);
       
-      storage.updateDecision(decision.id, {
+      await storage.updateDecision(decision.id, {
         outcome,
         outcomePnlPct: pnlPct,
         outcomePnlUsd: pnlUsd,
@@ -217,14 +190,10 @@ export function reviewClosedTrades() {
 
 // ============ PATTERN ANALYSIS & INSIGHT GENERATION ============
 
-/**
- * Analyze all reviewed decisions and generate/update learning insights.
- * Called periodically (every ~10 scan cycles).
- */
-export function generateInsights() {
+export async function generateInsights() {
   try {
-    const allDecisions = storage.getAllDecisions(500)
-      .filter(d => d.outcome != null && d.action === "entry");
+    const allDecisionsRaw = await storage.getAllDecisions(500);
+    const allDecisions = allDecisionsRaw.filter(d => d.outcome != null && d.action === "entry");
     
     if (allDecisions.length < MIN_SAMPLE_SIZE) {
       log(`Not enough data for insights (${allDecisions.length}/${MIN_SAMPLE_SIZE})`, "learning");
@@ -251,101 +220,48 @@ export function generateInsights() {
       if (winRate < 0.35) description += "UNDERPERFORMING — consider reducing allocation or tightening filters. ";
       if (winRate > 0.65) description += "STRONG PERFORMER — consider increasing allocation. ";
       
-      upsertInsight({
-        category: "asset",
-        rule,
-        description,
-        sampleSize: decisions.length,
-        winRate,
-        avgPnlPct: avgPnl,
-        avgPnlWinPct: avgWinPnl,
-        avgPnlLossPct: avgLossPnl,
-        confidence,
-        isActive: true,
-      });
+      await upsertInsight({ category: "asset", rule, description, sampleSize: decisions.length, winRate, avgPnlPct: avgPnl, avgPnlWinPct: avgWinPnl, avgPnlLossPct: avgLossPnl, confidence, isActive: true });
     }
 
     // === SESSION ANALYSIS ===
     const bySession = groupBy(allDecisions, d => d.session || "unknown");
     for (const [session, decisions] of Object.entries(bySession)) {
       if (decisions.length < MIN_SAMPLE_SIZE) continue;
-      
       const winRate = decisions.filter(d => d.outcome === "win").length / decisions.length;
       const avgPnl = avg(decisions.map(d => d.outcomePnlPct || 0));
       const confidence = Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE);
-      
       const rule = `session_${session}`;
       let description = `${session} session: ${(winRate * 100).toFixed(0)}% win rate (${decisions.length} trades). Avg P&L: ${avgPnl.toFixed(2)}%. `;
       if (winRate < 0.35) description += "AVOID trading in this session. ";
       if (winRate > 0.65) description += "Best session for entries. ";
-      
-      upsertInsight({
-        category: "session",
-        rule,
-        description,
-        sampleSize: decisions.length,
-        winRate,
-        avgPnlPct: avgPnl,
-        avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)),
-        avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)),
-        confidence,
-        isActive: true,
-      });
+      await upsertInsight({ category: "session", rule, description, sampleSize: decisions.length, winRate, avgPnlPct: avgPnl, avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)), avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)), confidence, isActive: true });
     }
 
     // === CONFLUENCE SCORE ANALYSIS ===
     const byConfluence = groupBy(allDecisions, d => String(d.confluenceScore || 0));
     for (const [scoreStr, decisions] of Object.entries(byConfluence)) {
       if (decisions.length < 3) continue;
-      
       const score = parseInt(scoreStr);
       const winRate = decisions.filter(d => d.outcome === "win").length / decisions.length;
       const avgPnl = avg(decisions.map(d => d.outcomePnlPct || 0));
-      
       const rule = `confluence_${score}`;
       let description = `Confluence ${score}/7: ${(winRate * 100).toFixed(0)}% win rate (${decisions.length} trades). `;
       if (score <= 2 && winRate < 0.4) description += "LOW CONFLUENCE = LOW WIN RATE. Increase min confluence filter. ";
       if (score >= 5 && winRate > 0.6) description += "HIGH CONFLUENCE CONFIRMED profitable. Prioritize these setups. ";
-      
-      upsertInsight({
-        category: "confluence",
-        rule,
-        description,
-        sampleSize: decisions.length,
-        winRate,
-        avgPnlPct: avgPnl,
-        avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)),
-        avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)),
-        confidence: Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE),
-        isActive: true,
-      });
+      await upsertInsight({ category: "confluence", rule, description, sampleSize: decisions.length, winRate, avgPnlPct: avgPnl, avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)), avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)), confidence: Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE), isActive: true });
     }
 
-    // === SIDE ANALYSIS (long vs short per asset) ===
+    // === SIDE ANALYSIS ===
     const bySide = groupBy(allDecisions, d => `${d.coin}_${d.side}`);
     for (const [key, decisions] of Object.entries(bySide)) {
       if (decisions.length < MIN_SAMPLE_SIZE) continue;
-      
       const winRate = decisions.filter(d => d.outcome === "win").length / decisions.length;
       const avgPnl = avg(decisions.map(d => d.outcomePnlPct || 0));
-      
       const rule = `side_${key.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase()}`;
       const [coin, side] = key.split("_");
       let description = `${coin} ${side}s: ${(winRate * 100).toFixed(0)}% win rate (${decisions.length} trades). `;
       if (winRate < 0.3) description += `AVOID ${side}ing this asset. `;
-      
-      upsertInsight({
-        category: "pattern",
-        rule,
-        description,
-        sampleSize: decisions.length,
-        winRate,
-        avgPnlPct: avgPnl,
-        avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)),
-        avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)),
-        confidence: Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE),
-        isActive: true,
-      });
+      await upsertInsight({ category: "pattern", rule, description, sampleSize: decisions.length, winRate, avgPnlPct: avgPnl, avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)), avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)), confidence: Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE), isActive: true });
     }
 
     // === EXIT TYPE ANALYSIS ===
@@ -353,25 +269,12 @@ export function generateInsights() {
     const byExit = groupBy(reviewedWithExit, d => d.exitType || "unknown");
     for (const [exitType, decisions] of Object.entries(byExit)) {
       if (decisions.length < 3) continue;
-      
       const avgPnl = avg(decisions.map(d => d.outcomePnlPct || 0));
       const rule = `exit_${exitType}`;
       let description = `Exit via ${exitType}: avg P&L ${avgPnl.toFixed(2)}% (${decisions.length} trades). `;
       if (exitType === "sl" && avgPnl < -0.5) description += "Stop losses working but consider tighter SL. ";
       if (exitType === "trailing" && avgPnl > 0.3) description += "Trailing stop capturing good profits. ";
-      
-      upsertInsight({
-        category: "exit",
-        rule,
-        description,
-        sampleSize: decisions.length,
-        winRate: decisions.filter(d => d.outcome === "win").length / decisions.length,
-        avgPnlPct: avgPnl,
-        avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)),
-        avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)),
-        confidence: Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE),
-        isActive: true,
-      });
+      await upsertInsight({ category: "exit", rule, description, sampleSize: decisions.length, winRate: decisions.filter(d => d.outcome === "win").length / decisions.length, avgPnlPct: avgPnl, avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)), avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)), confidence: Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE), isActive: true });
     }
 
     // === DAY OF WEEK ANALYSIS ===
@@ -379,28 +282,14 @@ export function generateInsights() {
     const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     for (const [dayStr, decisions] of Object.entries(byDay)) {
       if (decisions.length < 3) continue;
-      
       const day = parseInt(dayStr);
       const winRate = decisions.filter(d => d.outcome === "win").length / decisions.length;
       const avgPnl = avg(decisions.map(d => d.outcomePnlPct || 0));
-      
       const rule = `day_${dayNames[day]?.toLowerCase() || day}`;
       let description = `${dayNames[day] || day}: ${(winRate * 100).toFixed(0)}% win rate (${decisions.length} trades). Avg P&L: ${avgPnl.toFixed(2)}%. `;
       if (winRate < 0.3) description += "WEAK day — reduce exposure. ";
       if (winRate > 0.65) description += "STRONG day — increase confidence. ";
-      
-      upsertInsight({
-        category: "session",
-        rule,
-        description,
-        sampleSize: decisions.length,
-        winRate,
-        avgPnlPct: avgPnl,
-        avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)),
-        avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)),
-        confidence: Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE),
-        isActive: true,
-      });
+      await upsertInsight({ category: "session", rule, description, sampleSize: decisions.length, winRate, avgPnlPct: avgPnl, avgPnlWinPct: avg(decisions.filter(d => d.outcome === "win").map(d => d.outcomePnlPct || 0)), avgPnlLossPct: avg(decisions.filter(d => d.outcome === "loss").map(d => d.outcomePnlPct || 0)), confidence: Math.min(1, decisions.length / HIGH_CONFIDENCE_SAMPLE), isActive: true });
     }
 
     log(`Generated/updated insights from ${allDecisions.length} reviewed decisions`, "learning");
@@ -411,24 +300,20 @@ export function generateInsights() {
 
 // ============ APPLYING LEARNED RULES ============
 
-/**
- * Check all active insights before entering a trade.
- * Returns warnings, boosts, or blocks based on learned patterns.
- */
-export function checkInsights(params: {
+export async function checkInsights(params: {
   coin: string;
   side: "long" | "short";
   session: string;
   confluenceScore: number;
   dayOfWeek: number;
-}): {
+}): Promise<{
   shouldBlock: boolean;
   blockReason: string;
   warnings: string[];
   boosts: string[];
-  confidenceAdjustment: number; // Add/subtract from confluence score
-} {
-  const insights = storage.getActiveInsights();
+  confidenceAdjustment: number;
+}> {
+  const insights = await storage.getActiveInsights();
   const warnings: string[] = [];
   const boosts: string[] = [];
   let confidenceAdjustment = 0;
@@ -436,11 +321,10 @@ export function checkInsights(params: {
   let blockReason = "";
 
   for (const insight of insights) {
-    if (insight.confidence < 0.3) continue; // Skip low-confidence insights
+    if (insight.confidence < 0.3) continue;
     if ((insight.sampleSize || 0) < MIN_SAMPLE_SIZE) continue;
 
     const wr = insight.winRate || 0;
-    const avgPnl = insight.avgPnlPct || 0;
 
     // Asset-specific rule
     if (insight.category === "asset") {
@@ -451,14 +335,8 @@ export function checkInsights(params: {
           blockReason = `LEARNED: ${params.coin} has ${(wr * 100).toFixed(0)}% win rate over ${insight.sampleSize} trades — blocking entry`;
           break;
         }
-        if (wr < 0.35) {
-          warnings.push(`${params.coin}: low ${(wr * 100).toFixed(0)}% win rate (${insight.sampleSize} trades)`);
-          confidenceAdjustment -= 1;
-        }
-        if (wr > 0.65) {
-          boosts.push(`${params.coin}: strong ${(wr * 100).toFixed(0)}% win rate`);
-          confidenceAdjustment += 1;
-        }
+        if (wr < 0.35) { warnings.push(`${params.coin}: low ${(wr * 100).toFixed(0)}% win rate (${insight.sampleSize} trades)`); confidenceAdjustment -= 1; }
+        if (wr > 0.65) { boosts.push(`${params.coin}: strong ${(wr * 100).toFixed(0)}% win rate`); confidenceAdjustment += 1; }
       }
     }
 
@@ -471,32 +349,20 @@ export function checkInsights(params: {
           blockReason = `LEARNED: ${params.coin} ${params.side}s have ${(wr * 100).toFixed(0)}% win rate — blocking`;
           break;
         }
-        if (wr < 0.3) {
-          warnings.push(`${params.side}ing ${params.coin}: only ${(wr * 100).toFixed(0)}% win rate`);
-          confidenceAdjustment -= 1;
-        }
+        if (wr < 0.3) { warnings.push(`${params.side}ing ${params.coin}: only ${(wr * 100).toFixed(0)}% win rate`); confidenceAdjustment -= 1; }
       }
     }
 
     // Session rule
     if (insight.category === "session" && insight.rule === `session_${params.session}`) {
-      if (wr < 0.25 && insight.confidence > 0.6) {
-        warnings.push(`${params.session} session: ${(wr * 100).toFixed(0)}% win rate historically`);
-        confidenceAdjustment -= 1;
-      }
-      if (wr > 0.65) {
-        boosts.push(`${params.session}: strong ${(wr * 100).toFixed(0)}% historical win rate`);
-        confidenceAdjustment += 1;
-      }
+      if (wr < 0.25 && insight.confidence > 0.6) { warnings.push(`${params.session} session: ${(wr * 100).toFixed(0)}% win rate historically`); confidenceAdjustment -= 1; }
+      if (wr > 0.65) { boosts.push(`${params.session}: strong ${(wr * 100).toFixed(0)}% historical win rate`); confidenceAdjustment += 1; }
     }
 
     // Day of week rule
     const dayNames = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
     if (insight.category === "session" && insight.rule === `day_${dayNames[params.dayOfWeek]}`) {
-      if (wr < 0.3 && insight.confidence > 0.5) {
-        warnings.push(`${dayNames[params.dayOfWeek]}: weak day (${(wr * 100).toFixed(0)}% win rate)`);
-        confidenceAdjustment -= 1;
-      }
+      if (wr < 0.3 && insight.confidence > 0.5) { warnings.push(`${dayNames[params.dayOfWeek]}: weak day (${(wr * 100).toFixed(0)}% win rate)`); confidenceAdjustment -= 1; }
     }
   }
 
@@ -504,9 +370,9 @@ export function checkInsights(params: {
 }
 
 /**
- * Get a summary of what the bot has learned — for the dashboard.
+ * Get learning stats for the dashboard.
  */
-export function getLearningStats(): {
+export async function getLearningStats(): Promise<{
   totalDecisions: number;
   reviewedDecisions: number;
   totalInsights: number;
@@ -517,10 +383,10 @@ export function getLearningStats(): {
   bestAsset: { coin: string; winRate: number } | null;
   worstAsset: { coin: string; winRate: number } | null;
   bestSession: { session: string; winRate: number } | null;
-} {
-  const allDecisions = storage.getAllDecisions(1000);
+}> {
+  const allDecisions = await storage.getAllDecisions(1000);
   const reviewed = allDecisions.filter(d => d.outcome != null);
-  const allInsights = storage.getAllInsights();
+  const allInsights = await storage.getAllInsights();
   const active = allInsights.filter(i => i.isActive);
   
   const entryDecisions = reviewed.filter(d => d.action === "entry");
@@ -531,7 +397,6 @@ export function getLearningStats(): {
     ? avg(entryDecisions.map(d => d.outcomePnlPct || 0))
     : 0;
 
-  // Find best/worst assets
   const assetInsights = active.filter(i => i.category === "asset" && (i.sampleSize || 0) >= MIN_SAMPLE_SIZE);
   const sortedAssets = [...assetInsights].sort((a, b) => (b.winRate || 0) - (a.winRate || 0));
   const bestAsset = sortedAssets.length > 0
@@ -541,7 +406,6 @@ export function getLearningStats(): {
     ? { coin: sortedAssets[sortedAssets.length - 1].rule.replace("asset_", "").toUpperCase(), winRate: sortedAssets[sortedAssets.length - 1].winRate || 0 }
     : null;
 
-  // Find best session
   const sessionInsights = active.filter(i => i.category === "session" && i.rule.startsWith("session_") && (i.sampleSize || 0) >= MIN_SAMPLE_SIZE);
   const bestSession = sessionInsights.length > 0
     ? (() => {
@@ -587,7 +451,7 @@ function avg(nums: number[]): number {
   return nums.reduce((a, b) => a + b, 0) / nums.length;
 }
 
-function upsertInsight(data: {
+async function upsertInsight(data: {
   category: string;
   rule: string;
   description: string;
@@ -599,20 +463,12 @@ function upsertInsight(data: {
   confidence: number;
   isActive: boolean;
 }) {
-  const existing = storage.getInsightByRule(data.rule);
+  const existing = await storage.getInsightByRule(data.rule);
   const now = new Date().toISOString();
   
   if (existing) {
-    storage.updateInsight(existing.id, {
-      ...data,
-      updatedAt: now,
-    });
+    await storage.updateInsight(existing.id, { ...data, updatedAt: now });
   } else {
-    storage.createInsight({
-      ...data,
-      tradesAffected: 0,
-      createdAt: now,
-      updatedAt: now,
-    });
+    await storage.createInsight({ ...data, tradesAffected: 0, createdAt: now, updatedAt: now });
   }
 }

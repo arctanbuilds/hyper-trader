@@ -1,77 +1,77 @@
-import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
+import { pgTable, text, integer, doublePrecision, serial, boolean } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
 // Bot configuration — enhanced with elite strategy params
-export const botConfig = sqliteTable("bot_config", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  isRunning: integer("is_running", { mode: "boolean" }).default(false),
+export const botConfig = pgTable("bot_config", {
+  id: serial("id").primaryKey(),
+  isRunning: boolean("is_running").default(false),
   apiKey: text("api_key").default(""),
   apiSecret: text("api_secret").default(""),
   walletAddress: text("wallet_address").default(""),
   // Leverage & Position
   maxLeverage: integer("max_leverage").default(50),
   maxPositions: integer("max_positions").default(5),
-  tradeAmountPct: real("trade_amount_pct").default(10),
+  tradeAmountPct: doublePrecision("trade_amount_pct").default(10),
   // Weekly target
-  weeklyTargetPct: real("weekly_target_pct").default(50),
-  maxDrawdownPct: real("max_drawdown_pct").default(10),
+  weeklyTargetPct: doublePrecision("weekly_target_pct").default(50),
+  maxDrawdownPct: doublePrecision("max_drawdown_pct").default(10),
   // RSI thresholds
   rsiOversoldThreshold: integer("rsi_oversold_threshold").default(20),
   rsiOverboughtThreshold: integer("rsi_overbought_threshold").default(80),
   // Risk management — elite params
-  stopLossPct: real("stop_loss_pct").default(0.35),
-  takeProfitPct: real("take_profit_pct").default(0.5),
-  takeProfit2Pct: real("take_profit_2_pct").default(1.0),
-  trailingStopPct: real("trailing_stop_pct").default(0.3),
-  useTrailingStop: integer("use_trailing_stop", { mode: "boolean" }).default(true),
-  maxRiskPerTradePct: real("max_risk_per_trade_pct").default(0.25),
-  minRiskRewardRatio: real("min_risk_reward_ratio").default(1.0),
+  stopLossPct: doublePrecision("stop_loss_pct").default(0.35),
+  takeProfitPct: doublePrecision("take_profit_pct").default(0.5),
+  takeProfit2Pct: doublePrecision("take_profit_2_pct").default(1.0),
+  trailingStopPct: doublePrecision("trailing_stop_pct").default(0.3),
+  useTrailingStop: boolean("use_trailing_stop").default(true),
+  maxRiskPerTradePct: doublePrecision("max_risk_per_trade_pct").default(0.25),
+  minRiskRewardRatio: doublePrecision("min_risk_reward_ratio").default(1.0),
   // Confluence & filters
   minConfluenceScore: integer("min_confluence_score").default(3),
-  minVolume24h: real("min_volume_24h").default(1000000),
-  useMacroFilter: integer("use_macro_filter", { mode: "boolean" }).default(true),
-  useSessionFilter: integer("use_session_filter", { mode: "boolean" }).default(true),
-  useEmaFilter: integer("use_ema_filter", { mode: "boolean" }).default(true),
-  useLiquidationFilter: integer("use_liquidation_filter", { mode: "boolean" }).default(true),
+  minVolume24h: doublePrecision("min_volume_24h").default(1000000),
+  useMacroFilter: boolean("use_macro_filter").default(true),
+  useSessionFilter: boolean("use_session_filter").default(true),
+  useEmaFilter: boolean("use_ema_filter").default(true),
+  useLiquidationFilter: boolean("use_liquidation_filter").default(true),
   // Scan settings
   scanIntervalSecs: integer("scan_interval_secs").default(60),
   // Max daily/weekly loss
-  maxDailyLossPct: real("max_daily_loss_pct").default(0.75),
-  maxWeeklyLossPct: real("max_weekly_loss_pct").default(1.5),
+  maxDailyLossPct: doublePrecision("max_daily_loss_pct").default(0.75),
+  maxWeeklyLossPct: doublePrecision("max_weekly_loss_pct").default(1.5),
   updatedAt: text("updated_at").default(""),
 });
 
 // Enhanced trades with dual TP, confluence data, multi-TF info
-export const trades = sqliteTable("trades", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const trades = pgTable("trades", {
+  id: serial("id").primaryKey(),
   coin: text("coin").notNull(),
   side: text("side").notNull(), // "long" or "short"
-  entryPrice: real("entry_price").notNull(),
-  exitPrice: real("exit_price"),
-  size: real("size").notNull(),
+  entryPrice: doublePrecision("entry_price").notNull(),
+  exitPrice: doublePrecision("exit_price"),
+  size: doublePrecision("size").notNull(),
   leverage: integer("leverage").notNull(),
   // RSI at entry across timeframes
-  rsiAtEntry: real("rsi_at_entry"),
-  rsi4h: real("rsi_4h"),
-  rsi1d: real("rsi_1d"),
+  rsiAtEntry: doublePrecision("rsi_at_entry"),
+  rsi4h: doublePrecision("rsi_4h"),
+  rsi1d: doublePrecision("rsi_1d"),
   // EMA values at entry
-  ema10: real("ema_10"),
-  ema21: real("ema_21"),
-  ema50: real("ema_50"),
+  ema10: doublePrecision("ema_10"),
+  ema21: doublePrecision("ema_21"),
+  ema50: doublePrecision("ema_50"),
   // Dual take profit
-  stopLoss: real("stop_loss"),
-  takeProfit1: real("take_profit_1"),
-  takeProfit2: real("take_profit_2"),
-  tp1Hit: integer("tp1_hit", { mode: "boolean" }).default(false),
+  stopLoss: doublePrecision("stop_loss"),
+  takeProfit1: doublePrecision("take_profit_1"),
+  takeProfit2: doublePrecision("take_profit_2"),
+  tp1Hit: boolean("tp1_hit").default(false),
   // Confluence & scoring
   confluenceScore: integer("confluence_score").default(0),
   confluenceDetails: text("confluence_details").default(""),
-  riskRewardRatio: real("risk_reward_ratio"),
+  riskRewardRatio: doublePrecision("risk_reward_ratio"),
   // P&L
-  pnl: real("pnl"),
-  pnlPct: real("pnl_pct"),
-  peakPnlPct: real("peak_pnl_pct").default(0),
+  pnl: doublePrecision("pnl"),
+  pnlPct: doublePrecision("pnl_pct"),
+  peakPnlPct: doublePrecision("peak_pnl_pct").default(0),
   // Status
   status: text("status").notNull().default("open"), // open, closed, liquidated
   reason: text("reason").default(""),
@@ -82,18 +82,18 @@ export const trades = sqliteTable("trades", {
 });
 
 // P&L snapshots for charts
-export const pnlSnapshots = sqliteTable("pnl_snapshots", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  totalEquity: real("total_equity").notNull(),
-  totalPnl: real("total_pnl").notNull(),
-  totalPnlPct: real("total_pnl_pct").notNull(),
+export const pnlSnapshots = pgTable("pnl_snapshots", {
+  id: serial("id").primaryKey(),
+  totalEquity: doublePrecision("total_equity").notNull(),
+  totalPnl: doublePrecision("total_pnl").notNull(),
+  totalPnlPct: doublePrecision("total_pnl_pct").notNull(),
   openPositions: integer("open_positions").notNull(),
   timestamp: text("timestamp").notNull(),
 });
 
 // Bot activity log
-export const activityLog = sqliteTable("activity_log", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const activityLog = pgTable("activity_log", {
+  id: serial("id").primaryKey(),
   type: text("type").notNull(),
   message: text("message").notNull(),
   data: text("data").default(""),
@@ -101,98 +101,83 @@ export const activityLog = sqliteTable("activity_log", {
 });
 
 // Enhanced market scans with multi-TF and confluence
-export const marketScans = sqliteTable("market_scans", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const marketScans = pgTable("market_scans", {
+  id: serial("id").primaryKey(),
   coin: text("coin").notNull(),
-  price: real("price").notNull(),
+  price: doublePrecision("price").notNull(),
   // Multi-timeframe RSI
-  rsi: real("rsi"),
-  rsi4h: real("rsi_4h"),
-  rsi1d: real("rsi_1d"),
+  rsi: doublePrecision("rsi"),
+  rsi4h: doublePrecision("rsi_4h"),
+  rsi1d: doublePrecision("rsi_1d"),
   // EMAs
-  ema10: real("ema_10"),
-  ema21: real("ema_21"),
-  ema50: real("ema_50"),
+  ema10: doublePrecision("ema_10"),
+  ema21: doublePrecision("ema_21"),
+  ema50: doublePrecision("ema_50"),
   // Market data
-  volume24h: real("volume_24h"),
-  change24h: real("change_24h"),
+  volume24h: doublePrecision("volume_24h"),
+  change24h: doublePrecision("change_24h"),
   signal: text("signal"),
-  fundingRate: real("funding_rate"),
-  openInterest: real("open_interest"),
+  fundingRate: doublePrecision("funding_rate"),
+  openInterest: doublePrecision("open_interest"),
   // Confluence
   confluenceScore: integer("confluence_score").default(0),
   confluenceDetails: text("confluence_details").default(""),
-  riskRewardRatio: real("risk_reward_ratio"),
+  riskRewardRatio: doublePrecision("risk_reward_ratio"),
   timestamp: text("timestamp").notNull(),
 });
 
 // ============ TRADE DECISION LOG — The Learning Memory ============
-// Every entry/skip/exit decision is recorded here with full reasoning.
-// The learning engine reviews closed trades and builds adaptive rules.
-export const tradeDecisions = sqliteTable("trade_decisions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  tradeId: integer("trade_id"),                 // FK to trades (null if skipped)
+export const tradeDecisions = pgTable("trade_decisions", {
+  id: serial("id").primaryKey(),
+  tradeId: integer("trade_id"),
   coin: text("coin").notNull(),
-  action: text("action").notNull(),             // "entry", "skip", "exit", "tp1_hit", "circuit_breaker"
-  side: text("side"),                           // "long" or "short"
-  // Full market snapshot at decision time
-  price: real("price").notNull(),
-  rsi1h: real("rsi_1h"),
-  rsi4h: real("rsi_4h"),
-  rsi1d: real("rsi_1d"),
-  ema10: real("ema_10"),
-  ema21: real("ema_21"),
-  ema50: real("ema_50"),
-  volume24h: real("volume_24h"),
-  change24h: real("change_24h"),
-  fundingRate: real("funding_rate"),
-  openInterest: real("open_interest"),
-  // Decision reasoning
+  action: text("action").notNull(),
+  side: text("side"),
+  price: doublePrecision("price").notNull(),
+  rsi1h: doublePrecision("rsi_1h"),
+  rsi4h: doublePrecision("rsi_4h"),
+  rsi1d: doublePrecision("rsi_1d"),
+  ema10: doublePrecision("ema_10"),
+  ema21: doublePrecision("ema_21"),
+  ema50: doublePrecision("ema_50"),
+  volume24h: doublePrecision("volume_24h"),
+  change24h: doublePrecision("change_24h"),
+  fundingRate: doublePrecision("funding_rate"),
+  openInterest: doublePrecision("open_interest"),
   confluenceScore: integer("confluence_score"),
   confluenceDetails: text("confluence_details"),
-  riskRewardRatio: real("risk_reward_ratio"),
-  reasoning: text("reasoning").notNull(),       // Human-readable full reasoning chain
-  // Positioning at time of decision
-  equity: real("equity"),                       // AUM at decision time
+  riskRewardRatio: doublePrecision("risk_reward_ratio"),
+  reasoning: text("reasoning").notNull(),
+  equity: doublePrecision("equity"),
   leverage: integer("leverage"),
-  positionSizeUsd: real("position_size_usd"),
-  // Session context
-  session: text("session"),                     // london, ny, overlap, asia, afterhours
-  dayOfWeek: integer("day_of_week"),            // 0=Sun to 6=Sat
+  positionSizeUsd: doublePrecision("position_size_usd"),
+  session: text("session"),
+  dayOfWeek: integer("day_of_week"),
   hourUtc: integer("hour_utc"),
-  // Outcome (filled after trade closes — null for skips and open trades)
-  outcome: text("outcome"),                     // "win", "loss", "breakeven", null
-  outcomePnlPct: real("outcome_pnl_pct"),
-  outcomePnlUsd: real("outcome_pnl_usd"),
+  outcome: text("outcome"),
+  outcomePnlPct: doublePrecision("outcome_pnl_pct"),
+  outcomePnlUsd: doublePrecision("outcome_pnl_usd"),
   holdDurationMins: integer("hold_duration_mins"),
-  exitType: text("exit_type"),                  // "tp1", "tp2", "sl", "trailing", "rsi_recovery", "manual"
-  // Was the decision "correct" in hindsight?
-  wasGoodDecision: integer("was_good_decision", { mode: "boolean" }),
-  reviewNotes: text("review_notes"),            // Learning engine's hindsight analysis
+  exitType: text("exit_type"),
+  wasGoodDecision: boolean("was_good_decision"),
+  reviewNotes: text("review_notes"),
   timestamp: text("timestamp").notNull(),
 });
 
 // ============ LEARNING INSIGHTS — Accumulated Wisdom ============
-// Patterns the bot has learned from its trade history.
-// Each row is a rule/insight derived from analyzing past decisions.
-export const learningInsights = sqliteTable("learning_insights", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  // What was learned
-  category: text("category").notNull(),         // "asset", "session", "confluence", "exit", "sizing", "pattern"
-  rule: text("rule").notNull(),                 // Machine-readable rule key, e.g. "btc_avoid_asia_short"
-  description: text("description").notNull(),   // Human-readable insight
-  // Evidence
-  sampleSize: integer("sample_size").notNull(), // How many trades this is based on
-  winRate: real("win_rate"),                     // Win rate for this pattern
-  avgPnlPct: real("avg_pnl_pct"),              // Average P&L when this pattern occurs
-  avgPnlWinPct: real("avg_pnl_win_pct"),       // Average winning P&L
-  avgPnlLossPct: real("avg_pnl_loss_pct"),     // Average losing P&L
-  // Confidence
-  confidence: real("confidence").notNull(),     // 0.0-1.0 confidence in this insight
-  isActive: integer("is_active", { mode: "boolean" }).default(true), // Whether this rule is being applied
-  // Impact tracking
-  tradesAffected: integer("trades_affected").default(0), // How many future trades it influenced
-  // Timestamps
+export const learningInsights = pgTable("learning_insights", {
+  id: serial("id").primaryKey(),
+  category: text("category").notNull(),
+  rule: text("rule").notNull(),
+  description: text("description").notNull(),
+  sampleSize: integer("sample_size").notNull(),
+  winRate: doublePrecision("win_rate"),
+  avgPnlPct: doublePrecision("avg_pnl_pct"),
+  avgPnlWinPct: doublePrecision("avg_pnl_win_pct"),
+  avgPnlLossPct: doublePrecision("avg_pnl_loss_pct"),
+  confidence: doublePrecision("confidence").notNull(),
+  isActive: boolean("is_active").default(true),
+  tradesAffected: integer("trades_affected").default(0),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });
