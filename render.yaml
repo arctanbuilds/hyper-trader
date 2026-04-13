@@ -3,10 +3,10 @@ services:
     runtime: node
     name: hyper-trader
     plan: free
-    buildCommand: npm install && npm run build && npm run db:push
-    startCommand: npm start
+    buildCommand: NPM_CONFIG_PRODUCTION=false npm install && npm run build
+    startCommand: node dist/index.cjs
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
-        value: 5000
+        value: 10000
