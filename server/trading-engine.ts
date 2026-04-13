@@ -497,7 +497,7 @@ class TradingEngine {
       const openCoins = new Set(openTrades.map(t => t.coin));
       const maxPos = config.maxPositions || 5;
       const slotsAvailable = maxPos - openTrades.length;
-      const minConfluence = config.minConfluenceScore || 3;
+      const minConfluence = config.minConfluenceScore || 4;
       const minRR = config.minRiskRewardRatio || 1.0;
       const now = new Date();
 
