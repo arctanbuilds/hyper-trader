@@ -693,10 +693,11 @@ class TradingEngine {
               });
               
               // Check if order was accepted and filled
+              log(`[HL RAW] ${sig.asset.coin} response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
               const status = orderResult?.response?.data?.statuses?.[0];
               const fillPx = status?.filled?.avgPx;
               const totalSz = status?.filled?.totalSz;
-              const errorMsg = status?.error || orderResult?.response?.data?.error;
+              const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
               
               if (errorMsg) {
                 reasoning.push(`ORDER REJECTED: ${errorMsg}`);
