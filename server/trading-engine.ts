@@ -1046,10 +1046,13 @@ class TradingEngine {
   private takePnlSnapshot(equity?: number) {
     const allTrades = storage.getAllTrades();
     const openTrades = storage.getOpenTrades();
+    const closedTrades = allTrades.filter(t => t.status === "closed");
     const currentEquity = equity || this.lastKnownEquity || 0;
-    const closedPnl = allTrades.filter(t => t.status === "closed").reduce((s, t) => s + (t.pnl || 0), 0);
-    const openPnl = openTrades.reduce((s, t) => s + (t.pnl || 0), 0);
-    const totalPnl = closedPnl + openPnl;
+
+    // AUM-weighted P&L (same formula as getStatus)
+    const closedPnlOfAum = closedTrades.reduce((s, t) => s + ((t.pnl || 0) * ((t.size || 10) / 100)), 0);
+    const openPnlOfAum = openTrades.reduce((s, t) => s + ((t.pnl || 0) * ((t.size || 10) / 100)), 0);
+    const totalPnl = closedPnlOfAum + openPnlOfAum;
 
     storage.createPnlSnapshot({
       totalEquity: currentEquity > 0 ? currentEquity : (this.startingEquity || 0) * (1 + totalPnl / 100),
@@ -1116,12 +1119,30 @@ class TradingEngine {
     const openTrades = storage.getOpenTrades();
     const allTrades = storage.getAllTrades();
     const closedTrades = allTrades.filter(t => t.status === "closed");
-    const totalPnl = closedTrades.reduce((s, t) => s + (t.pnl || 0), 0);
-    const openPnl = openTrades.reduce((s, t) => s + (t.pnl || 0), 0);
     const winTrades = closedTrades.filter(t => (t.pnl || 0) > 0);
     const winRate = closedTrades.length > 0 ? (winTrades.length / closedTrades.length) * 100 : 0;
     const si = getSessionInfo();
     const stats = getLearningStats();
+
+    // P&L as % of AUM (not raw leveraged P&L)
+    // Each trade's AUM impact = leveragedPnl% * (tradeSize% / 100)
+    // e.g. -9% leveraged on a 19% position = -1.71% of AUM
+    const currentEquity = this.lastKnownEquity || 0;
+    const startEq = this.startingEquity || currentEquity;
+
+    const closedPnlOfAum = closedTrades.reduce((s, t) => {
+      const leveragedPnl = t.pnl || 0;
+      const posWeight = (t.size || 10) / 100;
+      return s + (leveragedPnl * posWeight);
+    }, 0);
+
+    const openPnlOfAum = openTrades.reduce((s, t) => {
+      const leveragedPnl = t.pnl || 0;
+      const posWeight = (t.size || 10) / 100;
+      return s + (leveragedPnl * posWeight);
+    }, 0);
+
+    const combinedPnlOfAum = closedPnlOfAum + openPnlOfAum;
 
     return {
       isRunning: config?.isRunning || false,
@@ -1129,14 +1150,15 @@ class TradingEngine {
       totalTrades: allTrades.length,
       closedTrades: closedTrades.length,
       winRate: winRate.toFixed(1),
-      totalPnl: totalPnl.toFixed(2),
-      openPnl: openPnl.toFixed(2),
-      combinedPnl: (totalPnl + openPnl).toFixed(2),
+      totalPnl: closedPnlOfAum.toFixed(2),
+      openPnl: openPnlOfAum.toFixed(2),
+      combinedPnl: combinedPnlOfAum.toFixed(2),
       session: si.session,
       sessionDescription: si.description,
       dailyLoss: this.dailyLoss.toFixed(2),
       weeklyLoss: this.weeklyLoss.toFixed(2),
-      equity: (this.lastKnownEquity || 0).toFixed(2),
+      equity: currentEquity.toFixed(2),
+      startingEquity: startEq.toFixed(2),
       // Learning stats
       learningStats: stats,
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
