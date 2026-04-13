@@ -34,15 +34,8 @@ interface AssetConfig {
 }
 
 const ALLOWED_ASSETS: AssetConfig[] = [
-  { coin: "BTC",           displayName: "Bitcoin",     dex: "",    maxLeverage: 40, szDecimals: 5, category: "crypto",    minNotional: 10 },
-  { coin: "ETH",           displayName: "Ethereum",    dex: "",    maxLeverage: 25, szDecimals: 4, category: "crypto",    minNotional: 10 },
-  { coin: "SOL",           displayName: "Solana",      dex: "",    maxLeverage: 20, szDecimals: 2, category: "crypto",    minNotional: 10 },
-  { coin: "xyz:GOLD",      displayName: "Gold",        dex: "xyz", maxLeverage: 25, szDecimals: 4, category: "commodity", minNotional: 10 },
-  { coin: "xyz:SILVER",    displayName: "Silver",      dex: "xyz", maxLeverage: 25, szDecimals: 2, category: "commodity", minNotional: 10 },
-  { coin: "xyz:CL",        displayName: "Oil (WTI)",   dex: "xyz", maxLeverage: 20, szDecimals: 3, category: "commodity", minNotional: 10, isolatedOnly: true },
-  { coin: "xyz:BRENTOIL",  displayName: "Oil (Brent)", dex: "xyz", maxLeverage: 20, szDecimals: 2, category: "commodity", minNotional: 10, isolatedOnly: true },
-  { coin: "xyz:SP500",     displayName: "S&P 500",     dex: "xyz", maxLeverage: 50, szDecimals: 3, category: "index",     minNotional: 10 },
-  { coin: "xyz:EUR",       displayName: "EUR/USD",     dex: "xyz", maxLeverage: 50, szDecimals: 1, category: "forex",     minNotional: 10, isolatedOnly: true },
+  { coin: "BTC",  displayName: "Bitcoin",  dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
+  { coin: "ETH",  displayName: "Ethereum", dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
 ];
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
