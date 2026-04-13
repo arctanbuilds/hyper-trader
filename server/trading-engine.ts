@@ -249,8 +249,8 @@ function calculateConfluence(params: {
   const details: string[] = [];
   let signal: "long" | "short" | "neutral" = "neutral";
   
-  const oversold = config.rsiOversoldThreshold || 20;
-  const overbought = config.rsiOverboughtThreshold || 80;
+  const oversold = config.rsiOversoldThreshold || 30;
+  const overbought = config.rsiOverboughtThreshold || 70;
   const slPct = config.stopLossPct || 0.35;
   const tp1Pct = config.takeProfitPct || 0.5;
   const tp2Pct = config.takeProfit2Pct || 1.0;
@@ -376,7 +376,7 @@ class TradingEngine {
   private scheduleNextScan() {
     const config = storage.getConfig();
     if (!config?.isRunning) return;
-    this.scanTimer = setTimeout(() => this.runScanCycle(), (config.scanIntervalSecs || 60) * 1000);
+    this.scanTimer = setTimeout(() => this.runScanCycle(), (config.scanIntervalSecs || 30) * 1000);
   }
 
   private async refreshEquity(): Promise<number> {
@@ -535,10 +535,10 @@ class TradingEngine {
       // === EXECUTE TRADES ===
       const openTrades = storage.getOpenTrades();
       const openCoins = new Set(openTrades.map(t => t.coin));
-      const maxPos = config.maxPositions || 5;
+      const maxPos = config.maxPositions || 8;
       const slotsAvailable = maxPos - openTrades.length;
-      const minConfluence = config.minConfluenceScore || 4;
-      const minRR = config.minRiskRewardRatio || 1.0;
+      const minConfluence = config.minConfluenceScore || 3;
+      const minRR = config.minRiskRewardRatio || 0.8;
       const now = new Date();
 
       if (slotsAvailable > 0 && signals.length > 0) {
