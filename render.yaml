@@ -2,7 +2,7 @@ services:
   - type: web
     runtime: node
     name: hyper-trader
-    plan: free
+    plan: starter
     buildCommand: NPM_CONFIG_PRODUCTION=false npm install && npm run build
     startCommand: node dist/index.cjs
     envVars:
@@ -10,3 +10,5 @@ services:
         value: production
       - key: PORT
         value: 10000
+      - key: DATABASE_URL
+        value: postgresql://hyper_trader_db_user:4YLz8bTxRObPGgEdIQtaLYVlcCdlV2tf@dpg-d7eiqi4vikkc73bnj6h0-a.virginia-postgres.render.com/hyper_trader_db
