@@ -72,37 +72,18 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
     return actualIndex;
   }
 
-  function floatToWire(x: number, szDecimals: number): string {
-    return x.toFixed(szDecimals);
-  }
-
   return {
     async placeOrder(params: OrderParams) {
       const assetIndex = await getAssetIndex(params.coin);
       
-      // Get size decimals from correct dex meta
-      const dex = params.coin.startsWith("xyz:") ? "xyz" : "";
-      const metaBody: any = { type: "meta" };
-      if (dex) metaBody.dex = dex;
-      const metaRes = await fetch(HL_INFO_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(metaBody),
-      });
-      const meta: any = await metaRes.json();
-      if (!meta || !meta.universe) {
-        throw new Error(`Failed to fetch meta for order: ${JSON.stringify(meta)?.slice(0, 200)}`);
-      }
-      const universeIdx = dex === "xyz" ? assetIndex - 10000 : assetIndex;
-      const szDecimals = meta.universe[universeIdx]?.szDecimals ?? 4;
-
-      // Build order wire — price is already formatted by the trading engine
-      // but we double-check by converting through parseFloat to strip artifacts
+      // Price and size are already properly formatted by the trading engine
+      // using formatHLPrice() and formatHLSize() — no re-formatting here.
+      // This avoids extra meta API calls and prevents double-rounding.
       const orderWire: any = {
         a: assetIndex,
         b: params.isBuy,
         p: String(params.limitPx),
-        s: floatToWire(params.sz, szDecimals),
+        s: String(params.sz),
         r: params.reduceOnly || false,
         t: params.orderType,
       };
