@@ -249,35 +249,48 @@ function calculateConfluence(params: {
   const details: string[] = [];
   let signal: "long" | "short" | "neutral" = "neutral";
   
-  const oversold = config.rsiOversoldThreshold || 30;
-  const overbought = config.rsiOverboughtThreshold || 70;
-  const slPct = config.stopLossPct || 0.35;
-  const tp1Pct = config.takeProfitPct || 0.5;
-  const tp2Pct = config.takeProfit2Pct || 1.0;
+  const oversold = config.rsiOversoldThreshold || 35;
+  const overbought = config.rsiOverboughtThreshold || 65;
+  const slPct = config.stopLossPct || 0.25;
+  const tp1Pct = config.takeProfitPct || 0.35;
+  const tp2Pct = config.takeProfit2Pct || 0.7;
 
-  // ========== SIGNAL TRIGGER: any of 1m/5m/15m/1h can trigger ==========
-  // Count how many lower TFs are oversold/overbought
+  // ========== SIGNAL TRIGGER: 1m/5m/15m/1h — scalp-oriented ==========
   const entryTFs = [
-    { tf: "1m", rsi: rsi1m },
-    { tf: "5m", rsi: rsi5m },
-    { tf: "15m", rsi: rsi15m },
-    { tf: "1h", rsi: rsi1h },
+    { tf: "1m", rsi: rsi1m, weight: 1 },
+    { tf: "5m", rsi: rsi5m, weight: 1.2 },
+    { tf: "15m", rsi: rsi15m, weight: 1.5 },
+    { tf: "1h", rsi: rsi1h, weight: 2 },
   ];
 
+  // Hard oversold/overbought
   const oversoldTFs = entryTFs.filter(t => t.rsi <= oversold);
   const overboughtTFs = entryTFs.filter(t => t.rsi >= overbought);
+  // Soft zone: leaning toward extreme (within 8 pts of threshold)
+  const softOversoldTFs = entryTFs.filter(t => t.rsi > oversold && t.rsi <= oversold + 8);
+  const softOverboughtTFs = entryTFs.filter(t => t.rsi < overbought && t.rsi >= overbought - 8);
 
   if (oversoldTFs.length > 0) {
     signal = "long";
     const tfStr = oversoldTFs.map(t => `${t.tf}:${t.rsi.toFixed(1)}`).join(", ");
     details.push(`RSI oversold on ${oversoldTFs.length} TF(s): ${tfStr}`);
-    // Bonus: multiple lower TFs aligned = stronger signal
-    if (oversoldTFs.length >= 2) { score++; details.push(`Multi-TF oversold alignment (${oversoldTFs.length}/4)`); }
+    if (oversoldTFs.length >= 2) { score++; details.push(`Multi-TF oversold (${oversoldTFs.length}/4)`); }
+    if (oversoldTFs.length >= 3) { score++; details.push(`Strong multi-TF oversold (${oversoldTFs.length}/4)`); }
   } else if (overboughtTFs.length > 0) {
     signal = "short";
     const tfStr = overboughtTFs.map(t => `${t.tf}:${t.rsi.toFixed(1)}`).join(", ");
     details.push(`RSI overbought on ${overboughtTFs.length} TF(s): ${tfStr}`);
-    if (overboughtTFs.length >= 2) { score++; details.push(`Multi-TF overbought alignment (${overboughtTFs.length}/4)`); }
+    if (overboughtTFs.length >= 2) { score++; details.push(`Multi-TF overbought (${overboughtTFs.length}/4)`); }
+    if (overboughtTFs.length >= 3) { score++; details.push(`Strong multi-TF overbought (${overboughtTFs.length}/4)`); }
+  } else if (softOversoldTFs.length >= 3) {
+    // 3+ TFs leaning oversold = soft long signal (scalp opportunity)
+    signal = "long";
+    const tfStr = softOversoldTFs.map(t => `${t.tf}:${t.rsi.toFixed(1)}`).join(", ");
+    details.push(`Soft oversold convergence (${softOversoldTFs.length} TFs leaning low): ${tfStr}`);
+  } else if (softOverboughtTFs.length >= 3) {
+    signal = "short";
+    const tfStr = softOverboughtTFs.map(t => `${t.tf}:${t.rsi.toFixed(1)}`).join(", ");
+    details.push(`Soft overbought convergence (${softOverboughtTFs.length} TFs leaning high): ${tfStr}`);
   }
   
   if (signal === "neutral") {
@@ -286,11 +299,11 @@ function calculateConfluence(params: {
   
   // ========== HIGHER TF CONFIRMATION: 4h + 1d ==========
   if (signal === "long") {
-    if (rsi4h < 40) { score++; details.push(`4H RSI confirms: ${rsi4h.toFixed(1)}`); }
-    if (rsi1d < 45) { score++; details.push(`1D RSI supports: ${rsi1d.toFixed(1)}`); }
+    if (rsi4h < 45) { score++; details.push(`4H RSI confirms: ${rsi4h.toFixed(1)}`); }
+    if (rsi1d < 50) { score++; details.push(`1D RSI supports: ${rsi1d.toFixed(1)}`); }
   } else {
-    if (rsi4h > 60) { score++; details.push(`4H RSI confirms: ${rsi4h.toFixed(1)}`); }
-    if (rsi1d > 55) { score++; details.push(`1D RSI supports: ${rsi1d.toFixed(1)}`); }
+    if (rsi4h > 55) { score++; details.push(`4H RSI confirms: ${rsi4h.toFixed(1)}`); }
+    if (rsi1d > 50) { score++; details.push(`1D RSI supports: ${rsi1d.toFixed(1)}`); }
   }
   
   // EMA alignment
