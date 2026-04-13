@@ -28,23 +28,109 @@ interface AssetConfig {
   dex: string;
   maxLeverage: number;     // ALWAYS used — no scaling down
   szDecimals: number;
-  pricePrecision: number;
   category: "crypto" | "commodity" | "forex" | "index";
   minNotional: number;
   isolatedOnly?: boolean;  // Some HIP-3 assets only support isolated margin
 }
 
 const ALLOWED_ASSETS: AssetConfig[] = [
-  { coin: "BTC",           displayName: "Bitcoin",     dex: "",    maxLeverage: 40, szDecimals: 5, pricePrecision: 1, category: "crypto",    minNotional: 10 },
-  { coin: "ETH",           displayName: "Ethereum",    dex: "",    maxLeverage: 25, szDecimals: 4, pricePrecision: 2, category: "crypto",    minNotional: 10 },
-  { coin: "SOL",           displayName: "Solana",      dex: "",    maxLeverage: 20, szDecimals: 2, pricePrecision: 3, category: "crypto",    minNotional: 10 },
-  { coin: "xyz:GOLD",      displayName: "Gold",        dex: "xyz", maxLeverage: 25, szDecimals: 4, pricePrecision: 2, category: "commodity", minNotional: 10 },
-  { coin: "xyz:SILVER",    displayName: "Silver",      dex: "xyz", maxLeverage: 25, szDecimals: 2, pricePrecision: 3, category: "commodity", minNotional: 10 },
-  { coin: "xyz:CL",        displayName: "Oil (WTI)",   dex: "xyz", maxLeverage: 20, szDecimals: 3, pricePrecision: 3, category: "commodity", minNotional: 10 },
-  { coin: "xyz:BRENTOIL",  displayName: "Oil (Brent)", dex: "xyz", maxLeverage: 20, szDecimals: 2, pricePrecision: 3, category: "commodity", minNotional: 10, isolatedOnly: true },
-  { coin: "xyz:SP500",     displayName: "S&P 500",     dex: "xyz", maxLeverage: 50, szDecimals: 3, pricePrecision: 2, category: "index",     minNotional: 10 },
-  { coin: "xyz:EUR",       displayName: "EUR/USD",     dex: "xyz", maxLeverage: 50, szDecimals: 1, pricePrecision: 5, category: "forex",     minNotional: 10 },
+  { coin: "BTC",           displayName: "Bitcoin",     dex: "",    maxLeverage: 40, szDecimals: 5, category: "crypto",    minNotional: 10 },
+  { coin: "ETH",           displayName: "Ethereum",    dex: "",    maxLeverage: 25, szDecimals: 4, category: "crypto",    minNotional: 10 },
+  { coin: "SOL",           displayName: "Solana",      dex: "",    maxLeverage: 20, szDecimals: 2, category: "crypto",    minNotional: 10 },
+  { coin: "xyz:GOLD",      displayName: "Gold",        dex: "xyz", maxLeverage: 25, szDecimals: 4, category: "commodity", minNotional: 10 },
+  { coin: "xyz:SILVER",    displayName: "Silver",      dex: "xyz", maxLeverage: 25, szDecimals: 2, category: "commodity", minNotional: 10 },
+  { coin: "xyz:CL",        displayName: "Oil (WTI)",   dex: "xyz", maxLeverage: 20, szDecimals: 3, category: "commodity", minNotional: 10 },
+  { coin: "xyz:BRENTOIL",  displayName: "Oil (Brent)", dex: "xyz", maxLeverage: 20, szDecimals: 2, category: "commodity", minNotional: 10, isolatedOnly: true },
+  { coin: "xyz:SP500",     displayName: "S&P 500",     dex: "xyz", maxLeverage: 50, szDecimals: 3, category: "index",     minNotional: 10 },
+  { coin: "xyz:EUR",       displayName: "EUR/USD",     dex: "xyz", maxLeverage: 50, szDecimals: 1, category: "forex",     minNotional: 10 },
 ];
+
+// ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
+// Follows Hyperliquid tick/lot size rules:
+// - Price: max 5 significant figures, max (6 - szDecimals) decimal places
+// - Size: truncate to szDecimals decimal places
+// Matches the @nktkas/hyperliquid SDK's formatPrice/formatSize logic.
+
+function formatHLPrice(price: number, szDecimals: number): string {
+  if (Number.isInteger(price)) return price.toString();
+  const maxDecimals = Math.max(6 - szDecimals, 0);
+  // First apply decimal limit
+  let s = truncateToDecimals(price, maxDecimals);
+  // Then apply 5 significant figures limit
+  s = truncateToSigFigs(s, 5);
+  return s;
+}
+
+function formatHLSize(size: number, szDecimals: number): string {
+  return truncateToDecimals(size, szDecimals);
+}
+
+function truncateToDecimals(value: number, decimals: number): string {
+  // Use string-based truncation to avoid floating-point multiplication errors
+  // (e.g., 0.00014 * 100000 = 13.999... instead of 14)
+  let s = value.toFixed(decimals + 4); // extra precision to avoid rounding artifacts
+  const dotIdx = s.indexOf('.');
+  if (dotIdx === -1 || decimals === 0) {
+    // No decimals needed — return integer part only
+    return dotIdx === -1 ? s : s.substring(0, dotIdx);
+  }
+  // Truncate to exactly 'decimals' places after the dot
+  s = s.substring(0, dotIdx + 1 + decimals);
+  // Strip trailing zeros
+  s = s.replace(/0+$/, '').replace(/\.$/, '');
+  return s || '0';
+}
+
+function truncateToSigFigs(s: string, sigFigs: number): string {
+  // String-based significant figure truncation to match Hyperliquid rules.
+  // Counts significant digits and truncates (floors) at the limit.
+  const num = parseFloat(s);
+  if (num === 0 || isNaN(num)) return "0";
+  if (Number.isInteger(num)) return num.toString();
+  
+  const isNeg = s.startsWith('-');
+  const abs = isNeg ? s.slice(1) : s;
+  const [intPart, decPart = ''] = abs.split('.');
+  const combined = intPart + decPart; // all digits together
+  
+  // Count significant figures
+  let sigCount = 0;
+  let started = false;
+  let cutIdx = -1;
+  for (let i = 0; i < combined.length; i++) {
+    if (combined[i] !== '0') started = true;
+    if (started) {
+      sigCount++;
+      if (sigCount === sigFigs) {
+        cutIdx = i;
+        break;
+      }
+    }
+  }
+  
+  if (cutIdx === -1) return s; // fewer sig figs than limit, return as-is
+  
+  // Rebuild the number truncated at cutIdx
+  const intLen = intPart.length;
+  if (cutIdx < intLen) {
+    // Truncation is in the integer part — zero out remaining digits
+    const kept = intPart.substring(0, cutIdx + 1);
+    const zeroed = '0'.repeat(intLen - cutIdx - 1);
+    return (isNeg ? '-' : '') + kept + zeroed;
+  } else {
+    // Truncation is in the decimal part
+    const decIdx = cutIdx - intLen;
+    let result = intPart + '.' + decPart.substring(0, decIdx + 1);
+    // Strip trailing zeros
+    result = result.replace(/0+$/, '').replace(/\.$/, '');
+    return (isNeg ? '-' : '') + result;
+  }
+}
+
+/** Format price for display (human-readable) */
+function displayPrice(price: number, szDecimals: number): string {
+  return formatHLPrice(price, szDecimals);
+}
 
 // ============ AUM-ADAPTIVE SIZING (max leverage always) ============
 
@@ -82,7 +168,7 @@ function calculateAdaptivePosition(params: {
   
   const notionalSize = capitalForTrade * leverage;
   const assetSize = notionalSize / price;
-  const roundedSize = parseFloat(assetSize.toFixed(asset.szDecimals));
+  const roundedSize = parseFloat(formatHLSize(assetSize, asset.szDecimals));
   
   // Validate minimum notional
   const actualNotional = roundedSize * price;
@@ -482,8 +568,9 @@ class TradingEngine {
 
       for (const asset of ALLOWED_ASSETS) {
         const ctx = assetCtxMap[asset.coin];
-        if (!ctx?.midPx) continue;
+        if (!ctx?.midPx || ctx.midPx === "None") continue;
         const price = parseFloat(ctx.midPx);
+        if (isNaN(price) || price <= 0) continue;
         const volume24h = parseFloat(ctx.dayNtlVlm || "0");
         const funding = parseFloat(ctx.funding || "0");
         const openInterest = parseFloat(ctx.openInterest || "0");
@@ -677,7 +764,7 @@ class TradingEngine {
               // Use aggressive slippage (1%) for IOC to ensure fills
               const slippageMult = side === "long" ? 1.01 : 0.99;
               const orderPrice = sig.price * slippageMult;
-              const roundedSize = parseFloat(assetSize.toFixed(sig.asset.szDecimals));
+              const roundedSize = parseFloat(formatHLSize(assetSize, sig.asset.szDecimals));
               if (roundedSize <= 0) {
                 reasoning.push(`SKIP: Rounded size is 0 (too small for szDecimals=${sig.asset.szDecimals})`);
                 logDecision({
@@ -688,7 +775,7 @@ class TradingEngine {
               }
               const orderResult = await executor.placeOrder({
                 coin: sig.asset.coin, isBuy: side === "long", sz: roundedSize,
-                limitPx: parseFloat(orderPrice.toFixed(sig.asset.pricePrecision)),
+                limitPx: parseFloat(formatHLPrice(orderPrice, sig.asset.szDecimals)),
                 orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
               });
               
@@ -720,7 +807,7 @@ class TradingEngine {
                 // IOC with no fill = order expired
                 reasoning.push(`IOC NOT FILLED — order expired (response: ${JSON.stringify(status || orderResult).slice(0, 200)})`);
                 log(`IOC not filled for ${sig.asset.coin}: ${JSON.stringify(status || orderResult).slice(0, 200)}`, "engine");
-                storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: ${sig.asset.displayName} ${side} sz=${roundedSize} @ $${orderPrice.toFixed(sig.asset.pricePrecision)}`, timestamp: new Date().toISOString() });
+                storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: ${sig.asset.displayName} ${side} sz=${roundedSize} @ $${displayPrice(orderPrice, sig.asset.szDecimals)}`, timestamp: new Date().toISOString() });
                 logDecision({
                   coin: sig.asset.coin, action: "skip", side, price: sig.price,
                   confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity,
@@ -766,7 +853,7 @@ class TradingEngine {
 
           storage.createLog({
             type: "trade_open",
-            message: `${side.toUpperCase()} ${sig.asset.displayName} @ $${sig.price.toFixed(sig.asset.pricePrecision)} | ${leverage}x MAX | C:${sig.confluence.score} | $${capitalForTrade.toFixed(0)} capital`,
+            message: `${side.toUpperCase()} ${sig.asset.displayName} @ $${displayPrice(sig.price, sig.asset.szDecimals)} | ${leverage}x MAX | C:${sig.confluence.score} | $${capitalForTrade.toFixed(0)} capital`,
             data: JSON.stringify(trade),
             timestamp: new Date().toISOString(),
           });
@@ -797,7 +884,7 @@ class TradingEngine {
       const universe = xyzData[0]?.universe || [];
       const ctxs = xyzData[1] || [];
       for (let i = 0; i < universe.length; i++) {
-        if (ctxs[i]?.midPx) mids[universe[i].name] = ctxs[i].midPx;
+        if (ctxs[i]?.midPx && ctxs[i].midPx !== "None") mids[universe[i].name] = ctxs[i].midPx;
       }
     }
     const currentEquity = equity || this.lastKnownEquity || 0;
@@ -806,7 +893,7 @@ class TradingEngine {
       const currentPrice = parseFloat(mids[trade.coin] || "0");
       if (currentPrice === 0) continue;
       const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
-      const pp = ac?.pricePrecision || 2;
+      const szd = ac?.szDecimals ?? 2;
 
       const pnlPct = trade.side === "long"
         ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100
@@ -846,15 +933,15 @@ class TradingEngine {
           const lockedProfit = lockPct * trade.leverage;
           storage.updateTrade(trade.id, { stopLoss: newSL, tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
           if (lockedProfit > 0.5) { // Only log significant ratchets
-            storage.createLog({ type: "trade_sl_ratchet", message: `SL RATCHET: ${trade.coin} SL → $${newSL.toFixed(pp)} (locking ${lockedProfit.toFixed(1)}% profit)`, timestamp: new Date().toISOString() });
+            storage.createLog({ type: "trade_sl_ratchet", message: `SL RATCHET: ${trade.coin} SL → $${displayPrice(newSL, szd)} (locking ${lockedProfit.toFixed(1)}% profit)`, timestamp: new Date().toISOString() });
           }
         }
       }
 
       // SL check (now uses ratcheted SL)
       const activeSL = trade.stopLoss;
-      if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `SL @ $${currentPrice.toFixed(pp)}`; exitType = "sl"; }
-      if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `SL @ $${currentPrice.toFixed(pp)}`; exitType = "sl"; }
+      if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `SL @ $${displayPrice(currentPrice, szd)}`; exitType = "sl"; }
+      if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `SL @ $${displayPrice(currentPrice, szd)}`; exitType = "sl"; }
 
       // === QUICK PROFIT-TAKING ===
       // At high leverage, even small moves = big P&L.
@@ -876,10 +963,10 @@ class TradingEngine {
           storage.updateTrade(trade.id, { tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
           logDecision({
             tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-            reasoning: `TP1 hit @ $${currentPrice.toFixed(pp)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+            reasoning: `TP1 hit @ $${displayPrice(currentPrice, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
             equity: currentEquity, leverage: trade.leverage,
           });
-          storage.createLog({ type: "trade_tp1", message: `TP1 HIT: ${trade.coin} @ $${currentPrice.toFixed(pp)}`, timestamp: new Date().toISOString() });
+          storage.createLog({ type: "trade_tp1", message: `TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)}`, timestamp: new Date().toISOString() });
           continue;
         }
       }
@@ -888,7 +975,7 @@ class TradingEngine {
       if (!shouldClose) {
         const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
                        (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
-        if (tp2Hit) { shouldClose = true; closeReason = `TP2 @ $${currentPrice.toFixed(pp)} (+$${pnlUsd.toFixed(2)})`; exitType = "tp2"; }
+        if (tp2Hit) { shouldClose = true; closeReason = `TP2 @ $${displayPrice(currentPrice, szd)} (+$${pnlUsd.toFixed(2)})`; exitType = "tp2"; }
       }
 
       // Trailing stop (backup — SL ratcheting handles most of this now)
@@ -933,7 +1020,7 @@ class TradingEngine {
               const slippage = trade.side === "long" ? 0.99 : 1.01; // 1% slippage for IOC close
               await executor.placeOrder({
                 coin: trade.coin, isBuy: trade.side === "short", sz,
-                limitPx: parseFloat((currentPrice * slippage).toFixed(pp)),
+                limitPx: parseFloat(formatHLPrice(currentPrice * slippage, szd)),
                 orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
               });
             }
@@ -986,7 +1073,7 @@ class TradingEngine {
     if (xyzData && xyzData.length >= 2) {
       const universe = xyzData[0]?.universe || [];
       const ctxs = xyzData[1] || [];
-      for (let i = 0; i < universe.length; i++) { if (ctxs[i]?.midPx) mids[universe[i].name] = ctxs[i].midPx; }
+      for (let i = 0; i < universe.length; i++) { if (ctxs[i]?.midPx && ctxs[i].midPx !== "None") mids[universe[i].name] = ctxs[i].midPx; }
     }
     const currentPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
     const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
@@ -1001,7 +1088,7 @@ class TradingEngine {
           const slippage = trade.side === "long" ? 0.99 : 1.01; // 1% slippage for IOC close
           await executor.placeOrder({
             coin: trade.coin, isBuy: trade.side === "short", sz,
-            limitPx: parseFloat((currentPrice * slippage).toFixed(ac?.pricePrecision || 2)),
+            limitPx: parseFloat(formatHLPrice(currentPrice * slippage, ac?.szDecimals ?? 2)),
             orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
           });
         }

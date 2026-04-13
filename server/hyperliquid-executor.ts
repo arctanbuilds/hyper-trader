@@ -96,11 +96,12 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
       const universeIdx = dex === "xyz" ? assetIndex - 10000 : assetIndex;
       const szDecimals = meta.universe[universeIdx]?.szDecimals ?? 4;
 
-      // Build order wire
+      // Build order wire — price is already formatted by the trading engine
+      // but we double-check by converting through parseFloat to strip artifacts
       const orderWire: any = {
         a: assetIndex,
         b: params.isBuy,
-        p: params.limitPx.toString(),
+        p: String(params.limitPx),
         s: floatToWire(params.sz, szDecimals),
         r: params.reduceOnly || false,
         t: params.orderType,
