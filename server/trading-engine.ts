@@ -181,8 +181,28 @@ async function fetchMetaAndAssetCtxs(dex: string = ""): Promise<any> {
 
 async function fetchUserState(address: string): Promise<any> {
   try {
-    const res = await fetch(HL_INFO_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "clearinghouseState", user: address }) });
-    return await res.json();
+    // Query both perps and spot clearinghouse — unified account mode reports balance in spot
+    const [perpsRes, spotRes] = await Promise.all([
+      fetch(HL_INFO_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "clearinghouseState", user: address }) }),
+      fetch(HL_INFO_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "spotClearinghouseState", user: address }) }),
+    ]);
+    const perpsData: any = await perpsRes.json();
+    const spotData: any = await spotRes.json();
+    
+    const perpsEquity = parseFloat(perpsData?.marginSummary?.accountValue || "0");
+    const spotBalances = spotData?.balances || [];
+    const usdcBalance = spotBalances.find((b: any) => b.coin === "USDC");
+    const spotEquity = parseFloat(usdcBalance?.total || "0");
+    
+    // For unified accounts, inject spot balance into marginSummary
+    if (spotEquity > perpsEquity) {
+      perpsData.marginSummary = {
+        ...perpsData.marginSummary,
+        accountValue: spotEquity.toString(),
+        totalRawUsd: spotEquity.toString(),
+      };
+    }
+    return perpsData;
   } catch (e) { log(`UserState error: ${e}`, "engine"); return null; }
 }
 
