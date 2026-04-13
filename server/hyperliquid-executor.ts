@@ -6,6 +6,7 @@
  */
 
 import { ethers } from "ethers";
+import msgpack from "msgpack-lite";
 
 const HL_EXCHANGE_URL = "https://api.hyperliquid.xyz/exchange";
 const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
@@ -105,15 +106,23 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
   }
 
   async function signL1Action(action: any, nonce: number): Promise<{ action: any; nonce: number; signature: any; vaultAddress?: null }> {
-    // Compute the connection ID (hash of action)
-    const actionHash = ethers.utils.keccak256(
-      ethers.utils.toUtf8Bytes(JSON.stringify(action) + String(nonce))
-    );
+    // === CORRECT SIGNING: msgpack serialization ===
+    // 1. Encode action with msgpack (NOT JSON.stringify)
+    const actionBytes = msgpack.encode(action);
+    
+    // 2. Append vault address (20 zero bytes = no vault) and nonce (8-byte big-endian hex)
+    const vaultBytes = Buffer.alloc(20); // no vault
+    const nonceHex = nonce.toString(16).padStart(16, '0');
+    const nonceBytes = Buffer.from(nonceHex, 'hex');
+    
+    // 3. Concatenate and keccak256 hash → connectionId
+    const data = Buffer.concat([actionBytes, vaultBytes, nonceBytes]);
+    const connectionId = ethers.utils.keccak256(data);
 
-    // Sign as phantom agent
+    // 4. Sign phantom agent with source="a" (mainnet)
     const agentMessage = {
-      source: walletAddress.toLowerCase() === agentWallet.address.toLowerCase() ? "a" : "b",
-      connectionId: actionHash,
+      source: "a",  // always "a" for mainnet, "b" for testnet
+      connectionId,
     };
 
     const signature = await agentWallet._signTypedData(
@@ -133,12 +142,20 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
   }
 
   async function sendRequest(payload: any): Promise<any> {
+    const bodyStr = JSON.stringify(payload);
+    console.log(`[HL] Sending to exchange: action.type=${payload.action?.type}, nonce=${payload.nonce}`);
     const res = await fetch(HL_EXCHANGE_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: bodyStr,
     });
-    return await res.json();
+    const result = await res.json();
+    if (result.status !== "ok") {
+      console.error(`[HL] Exchange error:`, JSON.stringify(result));
+    } else {
+      console.log(`[HL] Exchange OK:`, JSON.stringify(result.response?.data?.statuses || result.response || result).substring(0, 200));
+    }
+    return result;
   }
 
   return {
@@ -159,15 +176,19 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
       const universeIdx = dex === "xyz" ? assetIndex - 10000 : assetIndex;
       const szDecimals = meta.universe[universeIdx]?.szDecimals ?? 4;
 
-      const orderWire = {
+      // Build order wire — field order matters for msgpack!
+      // Only include 'c' (cloid) if explicitly provided
+      const orderWire: any = {
         a: assetIndex,
         b: params.isBuy,
         p: params.limitPx.toString(),
         s: floatToWire(params.sz, szDecimals),
         r: params.reduceOnly || false,
         t: orderTypeToWire(params.orderType),
-        c: params.cloid || undefined,
       };
+      if (params.cloid) {
+        orderWire.c = params.cloid;
+      }
 
       const action = {
         type: "order",

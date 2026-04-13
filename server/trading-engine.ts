@@ -819,34 +819,78 @@ class TradingEngine {
       let closeReason = "";
       let exitType = "";
 
-      // SL
-      if (trade.side === "long" && currentPrice <= (trade.stopLoss || 0)) { shouldClose = true; closeReason = `SL @ $${currentPrice.toFixed(pp)}`; exitType = "sl"; }
-      if (trade.side === "short" && currentPrice >= (trade.stopLoss || Infinity)) { shouldClose = true; closeReason = `SL @ $${currentPrice.toFixed(pp)}`; exitType = "sl"; }
+      // === PROGRESSIVE SL RATCHETING ===
+      // Move SL into profit zone as price moves in our direction.
+      // The SL follows price at a fixed distance once we're profitable.
+      // This ensures we ALWAYS lock in profit when price moves our way,
+      // even if the trend reverses later.
+      const rawPnlPct = pnlPct; // un-leveraged move %
+      const slRatchetThreshold = 0.08; // Start ratcheting once price moves 0.08% in our favor (un-leveraged)
+      const slRatchetDistance = 0.06; // Keep SL 0.06% behind the best price (un-leveraged)
 
-      // TP1
+      if (rawPnlPct > slRatchetThreshold) {
+        // Calculate what the new SL should be based on the peak favorable move
+        const peakRawPnl = currentPeak / trade.leverage; // convert leveraged peak back to raw %
+        const lockPct = Math.max(0, peakRawPnl - slRatchetDistance); // lock all but the trailing distance
+        let newSL: number;
+        if (trade.side === "long") {
+          newSL = trade.entryPrice * (1 + lockPct / 100);
+        } else {
+          newSL = trade.entryPrice * (1 - lockPct / 100);
+        }
+        // Only ratchet forward (into more profit), never backward
+        const currentSL = trade.stopLoss || (trade.side === "long" ? 0 : Infinity);
+        const shouldUpdate = trade.side === "long" ? newSL > currentSL : newSL < currentSL;
+        if (shouldUpdate) {
+          const lockedProfit = lockPct * trade.leverage;
+          storage.updateTrade(trade.id, { stopLoss: newSL, tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
+          if (lockedProfit > 0.5) { // Only log significant ratchets
+            storage.createLog({ type: "trade_sl_ratchet", message: `SL RATCHET: ${trade.coin} SL → $${newSL.toFixed(pp)} (locking ${lockedProfit.toFixed(1)}% profit)`, timestamp: new Date().toISOString() });
+          }
+        }
+      }
+
+      // SL check (now uses ratcheted SL)
+      const activeSL = trade.stopLoss;
+      if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `SL @ $${currentPrice.toFixed(pp)}`; exitType = "sl"; }
+      if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `SL @ $${currentPrice.toFixed(pp)}`; exitType = "sl"; }
+
+      // === QUICK PROFIT-TAKING ===
+      // At high leverage, even small moves = big P&L.
+      // Close early when leveraged P&L reaches a solid threshold.
+      // Better to bank many small wins than hold for uncertain larger ones.
+      const quickProfitThreshold = 3.0; // Close at 3%+ leveraged P&L (e.g. 0.075% move at 40x)
+      if (!shouldClose && leveragedPnl >= quickProfitThreshold) {
+        shouldClose = true;
+        closeReason = `QUICK PROFIT: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`;
+        exitType = "quick_profit";
+      }
+
+      // TP1 — partial profit recognition (still useful for tracking)
       if (!trade.tp1Hit && !shouldClose) {
         const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                        (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
         if (tp1Hit) {
-          storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: trade.entryPrice, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
+          // SL ratcheting already handles the SL move, just mark tp1 hit
+          storage.updateTrade(trade.id, { tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
           logDecision({
             tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-            reasoning: `TP1 hit @ $${currentPrice.toFixed(pp)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | SL moved to breakeven $${trade.entryPrice.toFixed(pp)}`,
+            reasoning: `TP1 hit @ $${currentPrice.toFixed(pp)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
             equity: currentEquity, leverage: trade.leverage,
           });
-          storage.createLog({ type: "trade_tp1", message: `TP1 HIT: ${trade.coin} @ $${currentPrice.toFixed(pp)} | SL → breakeven`, timestamp: new Date().toISOString() });
+          storage.createLog({ type: "trade_tp1", message: `TP1 HIT: ${trade.coin} @ $${currentPrice.toFixed(pp)}`, timestamp: new Date().toISOString() });
           continue;
         }
       }
 
-      // TP2
+      // TP2 — full close
       if (!shouldClose) {
         const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
                        (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
         if (tp2Hit) { shouldClose = true; closeReason = `TP2 @ $${currentPrice.toFixed(pp)} (+$${pnlUsd.toFixed(2)})`; exitType = "tp2"; }
       }
 
-      // Trailing stop
+      // Trailing stop (backup — SL ratcheting handles most of this now)
       if (config.useTrailingStop && trade.tp1Hit && !shouldClose) {
         const trailingPct = config.trailingStopPct || 0.3;
         const drawdown = currentPeak - leveragedPnl;
