@@ -55,16 +55,32 @@ interface HyperliquidExecutor {
 export function createExecutor(apiSecret: string, walletAddress: string): HyperliquidExecutor {
   const agentWallet = new ethers.Wallet(apiSecret);
 
+  // Cache asset indices to avoid repeated lookups
+  const assetIndexCache: Record<string, { index: number; dex: string }> = {};
+
   async function getAssetIndex(coin: string): Promise<number> {
+    if (assetIndexCache[coin]) return assetIndexCache[coin].index;
+
+    // Determine which dex to query
+    const dex = coin.startsWith("xyz:") ? "xyz" : "";
+    const lookupName = coin.startsWith("xyz:") ? coin.slice(4) : coin; // strip "xyz:" prefix
+
+    const body: any = { type: "meta" };
+    if (dex) body.dex = dex;
     const res = await fetch(HL_INFO_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "meta" }),
+      body: JSON.stringify(body),
     });
     const meta: any = await res.json();
-    const idx = meta.universe.findIndex((a: any) => a.name === coin);
-    if (idx === -1) throw new Error(`Asset ${coin} not found on Hyperliquid`);
-    return idx;
+    const universe = meta?.universe || [];
+    const idx = universe.findIndex((a: any) => a.name === lookupName);
+    if (idx === -1) throw new Error(`Asset ${coin} (lookup: ${lookupName}, dex: ${dex || "main"}) not found on Hyperliquid`);
+    
+    // HIP-3 assets have indices offset by 10000
+    const actualIndex = dex === "xyz" ? 10000 + idx : idx;
+    assetIndexCache[coin] = { index: actualIndex, dex };
+    return actualIndex;
   }
 
   function floatToWire(x: number, szDecimals: number): string {
@@ -128,14 +144,19 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
     async placeOrder(params: OrderParams) {
       const assetIndex = await getAssetIndex(params.coin);
       
-      // Get size decimals from meta
+      // Get size decimals from correct dex meta
+      const dex = params.coin.startsWith("xyz:") ? "xyz" : "";
+      const metaBody: any = { type: "meta" };
+      if (dex) metaBody.dex = dex;
       const metaRes = await fetch(HL_INFO_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type: "meta" }),
+        body: JSON.stringify(metaBody),
       });
       const meta: any = await metaRes.json();
-      const szDecimals = meta.universe[assetIndex].szDecimals;
+      // For HIP-3, index in universe is assetIndex - 10000
+      const universeIdx = dex === "xyz" ? assetIndex - 10000 : assetIndex;
+      const szDecimals = meta.universe[universeIdx]?.szDecimals ?? 4;
 
       const orderWire = {
         a: assetIndex,
