@@ -2,7 +2,7 @@ import { db, initDatabase } from "./db";
 import { eq, desc, and, gte, isNull, isNotNull } from "drizzle-orm";
 import {
   botConfig, trades, pnlSnapshots, activityLog, marketScans,
-  tradeDecisions, learningInsights,
+  tradeDecisions, learningInsights, learningReviews,
   type BotConfig, type InsertBotConfig,
   type Trade, type InsertTrade,
   type PnlSnapshot, type InsertPnlSnapshot,
@@ -10,6 +10,7 @@ import {
   type MarketScan, type InsertMarketScan,
   type TradeDecision, type InsertTradeDecision,
   type LearningInsight, type InsertLearningInsight,
+  type LearningReview, type InsertLearningReview,
 } from "@shared/schema";
 
 export interface IStorage {
@@ -54,6 +55,11 @@ export interface IStorage {
   getActiveInsights(): Promise<LearningInsight[]>;
   getAllInsights(): Promise<LearningInsight[]>;
   getInsightByRule(rule: string): Promise<LearningInsight | undefined>;
+  
+  // Learning Reviews (24h cycle)
+  createReview(review: InsertLearningReview): Promise<LearningReview>;
+  getRecentReviews(limit?: number): Promise<LearningReview[]>;
+  getLastReviewTime(): Promise<string | null>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -248,6 +254,24 @@ export class DatabaseStorage implements IStorage {
     const rows = await db.select().from(learningInsights)
       .where(eq(learningInsights.rule, rule));
     return rows[0];
+  }
+
+  // ============ LEARNING REVIEWS ============
+
+  async createReview(review: InsertLearningReview): Promise<LearningReview> {
+    const rows = await db.insert(learningReviews).values(review).returning();
+    return rows[0];
+  }
+
+  async getRecentReviews(limit: number = 10): Promise<LearningReview[]> {
+    return db.select().from(learningReviews)
+      .orderBy(desc(learningReviews.id)).limit(limit);
+  }
+
+  async getLastReviewTime(): Promise<string | null> {
+    const rows = await db.select().from(learningReviews)
+      .orderBy(desc(learningReviews.id)).limit(1);
+    return rows.length > 0 ? rows[0].timestamp : null;
   }
 }
 

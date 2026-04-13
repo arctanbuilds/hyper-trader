@@ -95,10 +95,18 @@ export default function Trades() {
             trades.map((trade: any) => (
               <TableRow key={trade.id} data-testid={`row-trade-${trade.id}`}>
                 <TableCell className="font-medium text-xs">
-                  {getAssetLabel(trade.coin)}
-                  {trade.setupType && (
-                    <span className="text-[9px] text-muted-foreground block">{trade.setupType}</span>
-                  )}
+                  <div className="flex items-center gap-1">
+                    {getAssetLabel(trade.coin)}
+                    {trade.strategy === "extreme_rsi" ? (
+                      <Badge variant="outline" className="text-[8px] px-1 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">
+                        E.RSI
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline" className="text-[8px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
+                        CONF
+                      </Badge>
+                    )}
+                  </div>
                 </TableCell>
                 <TableCell>
                   <Badge

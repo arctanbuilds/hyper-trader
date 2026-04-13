@@ -79,6 +79,7 @@ export async function initDatabase() {
         reason TEXT DEFAULT '',
         close_reason TEXT DEFAULT '',
         setup_type TEXT DEFAULT '',
+        strategy TEXT DEFAULT 'confluence',
         opened_at TEXT NOT NULL,
         closed_at TEXT
       );
@@ -138,6 +139,7 @@ export async function initDatabase() {
         confluence_details TEXT,
         risk_reward_ratio DOUBLE PRECISION,
         reasoning TEXT NOT NULL,
+        strategy TEXT DEFAULT 'confluence',
         equity DOUBLE PRECISION,
         leverage INTEGER,
         position_size_usd DOUBLE PRECISION,
@@ -151,6 +153,20 @@ export async function initDatabase() {
         exit_type TEXT,
         was_good_decision BOOLEAN,
         review_notes TEXT,
+        timestamp TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS learning_reviews (
+        id SERIAL PRIMARY KEY,
+        review_type TEXT NOT NULL,
+        trades_analyzed INTEGER NOT NULL,
+        wins INTEGER NOT NULL,
+        losses INTEGER NOT NULL,
+        total_pnl_pct DOUBLE PRECISION NOT NULL,
+        insights_generated INTEGER NOT NULL,
+        insights_updated INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        mistakes_identified TEXT DEFAULT '',
+        improvements_applied TEXT DEFAULT '',
         timestamp TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS learning_insights (
@@ -170,6 +186,14 @@ export async function initDatabase() {
         updated_at TEXT NOT NULL
       );
     `);
+    // Add new columns to existing tables (safe — IF NOT EXISTS equivalent via catching errors)
+    const alterQueries = [
+      "ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'confluence'",
+      "ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'confluence'",
+    ];
+    for (const q of alterQueries) {
+      try { await client.query(q); } catch (e) { /* column may already exist */ }
+    }
     console.log("[DB] PostgreSQL tables initialized");
   } finally {
     client.release();

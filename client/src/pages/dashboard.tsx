@@ -189,6 +189,38 @@ export default function Dashboard() {
         </Card>
       </div>
 
+      {/* Strategy Stats */}
+      {status?.strategyStats && (
+        <div className="grid grid-cols-2 gap-4">
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-2 mb-1">
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">CONFLUENCE</Badge>
+                <span className="text-xs text-muted-foreground">Multi-TF RSI + EMA + Funding</span>
+              </div>
+              <div className="flex items-center gap-4 mt-2">
+                <span className="text-sm font-mono">{status.strategyStats.confluence.trades} trades</span>
+                <span className="text-sm font-mono">{status.strategyStats.confluence.winRate}% WR</span>
+                <span className="text-sm font-mono text-muted-foreground">{status.strategyStats.confluence.openPositions} open</span>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-2 mb-1">
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">EXTREME RSI</Badge>
+                <span className="text-xs text-muted-foreground">RSI &lt;10 Long / RSI &gt;80 Short</span>
+              </div>
+              <div className="flex items-center gap-4 mt-2">
+                <span className="text-sm font-mono">{status.strategyStats.extreme_rsi.trades} trades</span>
+                <span className="text-sm font-mono">{status.strategyStats.extreme_rsi.winRate}% WR</span>
+                <span className="text-sm font-mono text-muted-foreground">{status.strategyStats.extreme_rsi.openPositions} open</span>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
       {/* Charts Row */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* P&L Chart */}
@@ -258,10 +290,16 @@ export default function Dashboard() {
                       <div>
                         <span className="text-sm font-medium">{getAssetLabel(trade.coin)}</span>
                         <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
-                        {trade.confluenceScore != null && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0">
-                            C:{trade.confluenceScore}
+                        {trade.strategy === "extreme_rsi" ? (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">
+                            EXTREME RSI
                           </Badge>
+                        ) : (
+                          trade.confluenceScore != null && (
+                            <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
+                              C:{trade.confluenceScore}
+                            </Badge>
+                          )
                         )}
                       </div>
                     </div>
@@ -316,6 +354,8 @@ export default function Dashboard() {
                   log.type === "system" && "bg-muted-foreground",
                   log.type === "config_change" && "bg-purple-500",
                   log.type === "circuit_breaker" && "bg-orange-500",
+                  log.type === "learning" && "bg-cyan-500",
+                  log.type === "learning_24h" && "bg-cyan-400",
                 )} />
                 <div className="flex-1 min-w-0">
                   <p className="text-xs truncate">{log.message}</p>

@@ -1,4 +1,4 @@
-import { pgTable, text, integer, doublePrecision, serial, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, doublePrecision, serial, boolean, timestamp } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -77,6 +77,7 @@ export const trades = pgTable("trades", {
   reason: text("reason").default(""),
   closeReason: text("close_reason").default(""),
   setupType: text("setup_type").default(""), // which of the 7 setups
+  strategy: text("strategy").default("confluence"), // "confluence" or "extreme_rsi"
   openedAt: text("opened_at").notNull(),
   closedAt: text("closed_at"),
 });
@@ -126,6 +127,22 @@ export const marketScans = pgTable("market_scans", {
   timestamp: text("timestamp").notNull(),
 });
 
+// ============ LEARNING REVIEW LOG — 24h Deep Reviews ============
+export const learningReviews = pgTable("learning_reviews", {
+  id: serial("id").primaryKey(),
+  reviewType: text("review_type").notNull(), // "24h_cycle", "manual"
+  tradesAnalyzed: integer("trades_analyzed").notNull(),
+  wins: integer("wins").notNull(),
+  losses: integer("losses").notNull(),
+  totalPnlPct: doublePrecision("total_pnl_pct").notNull(),
+  insightsGenerated: integer("insights_generated").notNull(),
+  insightsUpdated: integer("insights_updated").notNull(),
+  summary: text("summary").notNull(), // Full text summary of learnings
+  mistakesIdentified: text("mistakes_identified").default(""),
+  improvementsApplied: text("improvements_applied").default(""),
+  timestamp: text("timestamp").notNull(),
+});
+
 // ============ TRADE DECISION LOG — The Learning Memory ============
 export const tradeDecisions = pgTable("trade_decisions", {
   id: serial("id").primaryKey(),
@@ -148,6 +165,7 @@ export const tradeDecisions = pgTable("trade_decisions", {
   confluenceDetails: text("confluence_details"),
   riskRewardRatio: doublePrecision("risk_reward_ratio"),
   reasoning: text("reasoning").notNull(),
+  strategy: text("strategy").default("confluence"), // "confluence" or "extreme_rsi"
   equity: doublePrecision("equity"),
   leverage: integer("leverage"),
   positionSizeUsd: doublePrecision("position_size_usd"),
@@ -190,6 +208,7 @@ export const insertActivityLogSchema = createInsertSchema(activityLog).omit({ id
 export const insertMarketScanSchema = createInsertSchema(marketScans).omit({ id: true });
 export const insertTradeDecisionSchema = createInsertSchema(tradeDecisions).omit({ id: true });
 export const insertLearningInsightSchema = createInsertSchema(learningInsights).omit({ id: true });
+export const insertLearningReviewSchema = createInsertSchema(learningReviews).omit({ id: true });
 
 // Types
 export type BotConfig = typeof botConfig.$inferSelect;
@@ -206,3 +225,5 @@ export type TradeDecision = typeof tradeDecisions.$inferSelect;
 export type InsertTradeDecision = z.infer<typeof insertTradeDecisionSchema>;
 export type LearningInsight = typeof learningInsights.$inferSelect;
 export type InsertLearningInsight = z.infer<typeof insertLearningInsightSchema>;
+export type LearningReview = typeof learningReviews.$inferSelect;
+export type InsertLearningReview = z.infer<typeof insertLearningReviewSchema>;

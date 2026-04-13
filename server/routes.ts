@@ -2,7 +2,7 @@ import type { Express } from "express";
 import { type Server } from "http";
 import { storage } from "./storage";
 import { tradingEngine } from "./trading-engine";
-import { getLearningStats, reviewClosedTrades, generateInsights } from "./learning-engine";
+import { getLearningStats, reviewClosedTrades, generateInsights, run24hReview } from "./learning-engine";
 import { insertBotConfigSchema } from "@shared/schema";
 import { WebSocketServer, WebSocket } from "ws";
 
@@ -226,6 +226,20 @@ export async function registerRoutes(
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
+  });
+
+  app.post("/api/learning/deep-review", async (_req, res) => {
+    try {
+      await run24hReview();
+      res.json({ success: true, message: "24-hour deep review completed" });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/learning/reviews", async (req, res) => {
+    const limit = parseInt(req.query.limit as string) || 10;
+    res.json(await storage.getRecentReviews(limit));
   });
 
   // ============ MARKET OVERVIEW ============
