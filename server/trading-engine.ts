@@ -8,7 +8,7 @@
  *    - SL: 0.25%, TP1: 0.35%, TP2: 0.7%
  *    - Progressive SL ratcheting + quick profit at 3%+ leveraged P&L
  * 
- * 2. EXTREME RSI STRATEGY (new):
+ * 2. EXTREME RSI STRATEGY (multi-TF):
  *    - RSI < 10 on ANY timeframe → LONG
  *    - RSI > 80 on ANY timeframe → SHORT (user said <80 but meant >80 for short)
  *    - TP1: 0.3% of position, TP2: 1% of position
@@ -425,27 +425,33 @@ function detectExtremeRSI(params: {
   const EXTREME_OVERSOLD = 10;  // RSI < 10 → LONG
   const EXTREME_OVERBOUGHT = 80; // RSI > 80 → SHORT
   
-  // Check for extreme oversold (LONG signal)
-  const extremeOversold = allRSIs.filter(r => r.rsi < EXTREME_OVERSOLD && r.rsi > 0);
-  if (extremeOversold.length > 0) {
-    // Pick the most extreme (lowest RSI)
-    const strongest = extremeOversold.sort((a, b) => a.rsi - b.rsi)[0];
-    // TP1: 0.3% from entry, TP2: 1% from entry
-    // SL: 0.25% from entry (same tight SL as confluence)
+  // At least 2 of 3 short timeframes (1m, 5m, 15m) must be extreme
+  const shortTFs = [
+    { tf: "1m", rsi: rsi1m },
+    { tf: "5m", rsi: rsi5m },
+    { tf: "15m", rsi: rsi15m },
+  ].filter(r => r.rsi > 0); // exclude missing data
+  
+  // Check for extreme oversold (LONG signal) — at least 2/3 must be < 10
+  const oversoldTFs = shortTFs.filter(r => r.rsi < EXTREME_OVERSOLD);
+  if (oversoldTFs.length >= 2) {
+    const avgRsi = oversoldTFs.reduce((s, r) => s + r.rsi, 0) / oversoldTFs.length;
+    const tfLabel = shortTFs.map(r => `${r.tf}(${r.rsi.toFixed(1)}${r.rsi < EXTREME_OVERSOLD ? '*' : ''})`).join('+');
     const sl = price * (1 - 0.0025);   // 0.25% below
     const tp1 = price * (1 + 0.003);   // 0.3% above
     const tp2 = price * (1 + 0.01);    // 1% above
-    return { triggered: true, signal: "long", triggerTF: strongest.tf, triggerRSI: strongest.rsi, allRSIs, suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2 };
+    return { triggered: true, signal: "long", triggerTF: tfLabel, triggerRSI: avgRsi, allRSIs, suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2 };
   }
   
-  // Check for extreme overbought (SHORT signal)
-  const extremeOverbought = allRSIs.filter(r => r.rsi > EXTREME_OVERBOUGHT);
-  if (extremeOverbought.length > 0) {
-    const strongest = extremeOverbought.sort((a, b) => b.rsi - a.rsi)[0];
+  // Check for extreme overbought (SHORT signal) — at least 2/3 must be > 80
+  const overboughtTFs = shortTFs.filter(r => r.rsi > EXTREME_OVERBOUGHT);
+  if (overboughtTFs.length >= 2) {
+    const avgRsi = overboughtTFs.reduce((s, r) => s + r.rsi, 0) / overboughtTFs.length;
+    const tfLabel = shortTFs.map(r => `${r.tf}(${r.rsi.toFixed(1)}${r.rsi > EXTREME_OVERBOUGHT ? '*' : ''})`).join('+');
     const sl = price * (1 + 0.0025);   // 0.25% above
     const tp1 = price * (1 - 0.003);   // 0.3% below
     const tp2 = price * (1 - 0.01);    // 1% below
-    return { triggered: true, signal: "short", triggerTF: strongest.tf, triggerRSI: strongest.rsi, allRSIs, suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2 };
+    return { triggered: true, signal: "short", triggerTF: tfLabel, triggerRSI: avgRsi, allRSIs, suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2 };
   }
   
   return { triggered: false, signal: "none", triggerTF: "", triggerRSI: 0, allRSIs, suggestedSL: 0, suggestedTP1: 0, suggestedTP2: 0 };
