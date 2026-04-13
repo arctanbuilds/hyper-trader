@@ -1,31 +1,14 @@
 /**
  * Hyperliquid Order Executor
  * 
- * Signs and submits real orders to Hyperliquid using EIP-712 typed data signing.
+ * Uses the @nktkas/hyperliquid SDK for proper L1 action signing.
  * API wallets (agent wallets) can only trade — they CANNOT withdraw funds.
  */
 
-import { ethers } from "ethers";
-import msgpack from "msgpack-lite";
+import { ExchangeClient, InfoClient, HttpTransport } from "@nktkas/hyperliquid";
+import { privateKeyToAccount } from "viem/accounts";
 
-const HL_EXCHANGE_URL = "https://api.hyperliquid.xyz/exchange";
 const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
-
-// EIP-712 domain for Hyperliquid L1 actions (agent-signed)
-const PHANTOM_AGENT_DOMAIN = {
-  name: "Exchange",
-  version: "1",
-  chainId: 1337,
-  verifyingContract: "0x0000000000000000000000000000000000000000",
-};
-
-// Type definitions for order signing
-const AGENT_TYPES = {
-  Agent: [
-    { name: "source", type: "string" },
-    { name: "connectionId", type: "bytes32" },
-  ],
-};
 
 interface OrderParams {
   coin: string;
@@ -48,13 +31,16 @@ interface HyperliquidExecutor {
 }
 
 /**
- * Create a Hyperliquid executor that signs and sends real orders.
+ * Create a Hyperliquid executor using the official SDK for signing.
  * 
  * @param apiSecret - The private key from the API wallet (NOT your main wallet key)
  * @param walletAddress - Your main account wallet address (the master account)
  */
 export function createExecutor(apiSecret: string, walletAddress: string): HyperliquidExecutor {
-  const agentWallet = new ethers.Wallet(apiSecret);
+  const agentAccount = privateKeyToAccount(apiSecret as `0x${string}`);
+  const transport = new HttpTransport();
+  const exchange = new ExchangeClient({ transport, wallet: agentAccount });
+  const info = new InfoClient({ transport });
 
   // Cache asset indices to avoid repeated lookups
   const assetIndexCache: Record<string, { index: number; dex: string }> = {};
@@ -62,10 +48,8 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
   async function getAssetIndex(coin: string): Promise<number> {
     if (assetIndexCache[coin]) return assetIndexCache[coin].index;
 
-    // Determine which dex to query
-    // HIP-3 assets use "xyz" dex and keep the full "xyz:NAME" format in the universe
     const dex = coin.startsWith("xyz:") ? "xyz" : "";
-    const lookupName = coin; // keep full name — xyz dex universe uses "xyz:NAME" format
+    const lookupName = coin;
 
     const body: any = { type: "meta" };
     if (dex) body.dex = dex;
@@ -75,9 +59,12 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
       body: JSON.stringify(body),
     });
     const meta: any = await res.json();
-    const universe = meta?.universe || [];
+    if (!meta || !meta.universe) {
+      throw new Error(`Failed to fetch meta for dex=${dex || "main"}: ${JSON.stringify(meta)?.slice(0, 200)}`);
+    }
+    const universe = meta.universe || [];
     const idx = universe.findIndex((a: any) => a.name === lookupName);
-    if (idx === -1) throw new Error(`Asset ${coin} (lookup: ${lookupName}, dex: ${dex || "main"}) not found on Hyperliquid`);
+    if (idx === -1) throw new Error(`Asset ${coin} (lookup: ${lookupName}, dex: ${dex || "main"}) not found in ${universe.length} assets`);
     
     // HIP-3 assets have indices offset by 10000
     const actualIndex = dex === "xyz" ? 10000 + idx : idx;
@@ -87,75 +74,6 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
 
   function floatToWire(x: number, szDecimals: number): string {
     return x.toFixed(szDecimals);
-  }
-
-  function orderTypeToWire(orderType: any): any {
-    if (orderType.limit) {
-      return { limit: { tif: orderType.limit.tif } };
-    }
-    if (orderType.trigger) {
-      return {
-        trigger: {
-          triggerPx: orderType.trigger.triggerPx,
-          isMarket: orderType.trigger.isMarket,
-          tpsl: orderType.trigger.tpsl,
-        },
-      };
-    }
-    return orderType;
-  }
-
-  async function signL1Action(action: any, nonce: number): Promise<{ action: any; nonce: number; signature: any; vaultAddress?: null }> {
-    // === CORRECT SIGNING: msgpack serialization ===
-    // 1. Encode action with msgpack (NOT JSON.stringify)
-    const actionBytes = msgpack.encode(action);
-    
-    // 2. Append vault address (20 zero bytes = no vault) and nonce (8-byte big-endian hex)
-    const vaultBytes = Buffer.alloc(20); // no vault
-    const nonceHex = nonce.toString(16).padStart(16, '0');
-    const nonceBytes = Buffer.from(nonceHex, 'hex');
-    
-    // 3. Concatenate and keccak256 hash → connectionId
-    const data = Buffer.concat([actionBytes, vaultBytes, nonceBytes]);
-    const connectionId = ethers.utils.keccak256(data);
-
-    // 4. Sign phantom agent with source="a" (mainnet)
-    const agentMessage = {
-      source: "a",  // always "a" for mainnet, "b" for testnet
-      connectionId,
-    };
-
-    const signature = await agentWallet._signTypedData(
-      PHANTOM_AGENT_DOMAIN,
-      AGENT_TYPES,
-      agentMessage
-    );
-
-    const { r, s, v } = ethers.utils.splitSignature(signature);
-
-    return {
-      action,
-      nonce,
-      signature: { r, s, v },
-      vaultAddress: null,
-    };
-  }
-
-  async function sendRequest(payload: any): Promise<any> {
-    const bodyStr = JSON.stringify(payload);
-    console.log(`[HL] Sending to exchange: action.type=${payload.action?.type}, nonce=${payload.nonce}`);
-    const res = await fetch(HL_EXCHANGE_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: bodyStr,
-    });
-    const result = await res.json();
-    if (result.status !== "ok") {
-      console.error(`[HL] Exchange error:`, JSON.stringify(result));
-    } else {
-      console.log(`[HL] Exchange OK:`, JSON.stringify(result.response?.data?.statuses || result.response || result).substring(0, 200));
-    }
-    return result;
   }
 
   return {
@@ -172,57 +90,64 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
         body: JSON.stringify(metaBody),
       });
       const meta: any = await metaRes.json();
-      // For HIP-3, index in universe is assetIndex - 10000
+      if (!meta || !meta.universe) {
+        throw new Error(`Failed to fetch meta for order: ${JSON.stringify(meta)?.slice(0, 200)}`);
+      }
       const universeIdx = dex === "xyz" ? assetIndex - 10000 : assetIndex;
       const szDecimals = meta.universe[universeIdx]?.szDecimals ?? 4;
 
-      // Build order wire — field order matters for msgpack!
-      // Only include 'c' (cloid) if explicitly provided
+      // Build order wire
       const orderWire: any = {
         a: assetIndex,
         b: params.isBuy,
         p: params.limitPx.toString(),
         s: floatToWire(params.sz, szDecimals),
         r: params.reduceOnly || false,
-        t: orderTypeToWire(params.orderType),
+        t: params.orderType,
       };
       if (params.cloid) {
         orderWire.c = params.cloid;
       }
 
-      const action = {
-        type: "order",
-        orders: [orderWire],
-        grouping: "na",
-      };
+      console.log(`[HL] Placing order: ${params.coin} ${params.isBuy ? "BUY" : "SELL"} sz=${orderWire.s} @ $${orderWire.p} asset=${assetIndex}`);
 
-      const nonce = Date.now();
-      const signed = await signL1Action(action, nonce);
-      return await sendRequest(signed);
+      try {
+        const result = await exchange.order({
+          orders: [orderWire],
+          grouping: "na",
+        });
+        
+        console.log(`[HL] Order result:`, JSON.stringify(result).substring(0, 300));
+        
+        // Normalize response to match our expected format
+        if (result?.status === "ok") {
+          return result;
+        }
+        // The SDK might throw on errors, but just in case:
+        return result;
+      } catch (err: any) {
+        console.error(`[HL] Order error:`, err.message?.substring(0, 300));
+        // Return error in the format our engine expects
+        return { status: "err", response: err.message || String(err) };
+      }
     },
 
     async cancelOrder(coin: string, oid: number) {
       const assetIndex = await getAssetIndex(coin);
-      const action = {
-        type: "cancel",
-        cancels: [{ a: assetIndex, o: oid }],
-      };
-      const nonce = Date.now();
-      const signed = await signL1Action(action, nonce);
-      return await sendRequest(signed);
+      try {
+        const result = await exchange.cancel({
+          cancels: [{ a: assetIndex, o: oid }],
+        });
+        return result;
+      } catch (err: any) {
+        return { status: "err", response: err.message || String(err) };
+      }
     },
 
     async cancelAllOrders() {
-      // First get all open orders
       const orders = await this.getOpenOrders();
       if (!orders || orders.length === 0) return { status: "ok", msg: "No orders to cancel" };
 
-      const cancels = orders.map((o: any) => ({
-        a: o.coin, // need asset index
-        o: o.oid,
-      }));
-
-      // Cancel one by one for simplicity
       const results = [];
       for (const order of orders) {
         const result = await this.cancelOrder(order.coin, order.oid);
@@ -233,15 +158,19 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
 
     async setLeverage(coin: string, leverage: number, isCross: boolean = true) {
       const assetIndex = await getAssetIndex(coin);
-      const action = {
-        type: "updateLeverage",
-        asset: assetIndex,
-        isCross,
-        leverage,
-      };
-      const nonce = Date.now();
-      const signed = await signL1Action(action, nonce);
-      return await sendRequest(signed);
+      console.log(`[HL] Setting leverage: ${coin} asset=${assetIndex} leverage=${leverage}x isCross=${isCross}`);
+      try {
+        const result = await exchange.updateLeverage({
+          asset: assetIndex,
+          isCross,
+          leverage,
+        });
+        console.log(`[HL] Leverage result:`, JSON.stringify(result));
+        return result;
+      } catch (err: any) {
+        console.error(`[HL] Leverage error:`, err.message?.substring(0, 200));
+        return { status: "err", response: err.message || String(err) };
+      }
     },
 
     async getPositions() {
@@ -294,15 +223,11 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
       const perpsData: any = await perpsRes.json();
       const spotData: any = await spotRes.json();
       
-      // Check perps balance first (standard mode)
       const perpsEquity = parseFloat(perpsData?.marginSummary?.accountValue || "0");
-      
-      // Check spot USDC balance (unified account mode)
       const spotBalances = spotData?.balances || [];
       const usdcBalance = spotBalances.find((b: any) => b.coin === "USDC");
       const spotEquity = parseFloat(usdcBalance?.total || "0");
       
-      // Use whichever is higher — unified mode shows balance in spot
       const equity = Math.max(perpsEquity, spotEquity);
       const availableBalance = perpsEquity > 0 
         ? parseFloat(perpsData?.marginSummary?.totalRawUsd || "0")
