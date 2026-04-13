@@ -146,12 +146,19 @@ function getLastEMA(closes: number[], period: number): number {
 // ============ HYPERLIQUID API ============
 const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
 
+const INTERVAL_MS: Record<string, number> = {
+  "1m": 60 * 1000,
+  "5m": 5 * 60 * 1000,
+  "15m": 15 * 60 * 1000,
+  "1h": 3600 * 1000,
+  "4h": 4 * 3600 * 1000,
+  "1d": 24 * 3600 * 1000,
+};
+
 async function fetchCandles(coin: string, interval: string = "1h", limit: number = 100): Promise<number[]> {
   try {
     const endTime = Date.now();
-    let ms = 3600 * 1000;
-    if (interval === "4h") ms = 4 * 3600 * 1000;
-    else if (interval === "1d") ms = 24 * 3600 * 1000;
+    const ms = INTERVAL_MS[interval] || 3600 * 1000;
     const res = await fetch(HL_INFO_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -160,7 +167,7 @@ async function fetchCandles(coin: string, interval: string = "1h", limit: number
     const candles: any[] = await res.json() as any;
     if (!Array.isArray(candles)) return [];
     return candles.map((c: any) => parseFloat(c.c));
-  } catch (e) { log(`Candle error ${coin}: ${e}`, "engine"); return []; }
+  } catch (e) { log(`Candle error ${coin}/${interval}: ${e}`, "engine"); return []; }
 }
 
 async function fetchAllMids(): Promise<Record<string, string>> {
@@ -231,12 +238,13 @@ interface ConfluenceResult {
 }
 
 function calculateConfluence(params: {
-  price: number; rsi1h: number; rsi4h: number; rsi1d: number;
+  price: number;
+  rsi1m: number; rsi5m: number; rsi15m: number; rsi1h: number; rsi4h: number; rsi1d: number;
   ema10: number; ema21: number; ema50: number;
   fundingRate: number; change24h: number; volume24h: number;
   config: any; category: string;
 }): ConfluenceResult {
-  const { price, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, fundingRate, change24h, volume24h, config } = params;
+  const { price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, fundingRate, change24h, volume24h, config } = params;
   let score = 0;
   const details: string[] = [];
   let signal: "long" | "short" | "neutral" = "neutral";
@@ -246,15 +254,37 @@ function calculateConfluence(params: {
   const slPct = config.stopLossPct || 0.35;
   const tp1Pct = config.takeProfitPct || 0.5;
   const tp2Pct = config.takeProfit2Pct || 1.0;
-  
-  if (rsi1h <= oversold) { signal = "long"; details.push(`1H RSI oversold: ${rsi1h.toFixed(1)}`); }
-  else if (rsi1h >= overbought) { signal = "short"; details.push(`1H RSI overbought: ${rsi1h.toFixed(1)}`); }
-  
-  if (signal === "neutral") {
-    return { score: 0, details: ["No RSI signal"], signal: "neutral", suggestedEntry: price, suggestedSL: price, suggestedTP1: price, suggestedTP2: price, riskRewardRatio: 0 };
+
+  // ========== SIGNAL TRIGGER: any of 1m/5m/15m/1h can trigger ==========
+  // Count how many lower TFs are oversold/overbought
+  const entryTFs = [
+    { tf: "1m", rsi: rsi1m },
+    { tf: "5m", rsi: rsi5m },
+    { tf: "15m", rsi: rsi15m },
+    { tf: "1h", rsi: rsi1h },
+  ];
+
+  const oversoldTFs = entryTFs.filter(t => t.rsi <= oversold);
+  const overboughtTFs = entryTFs.filter(t => t.rsi >= overbought);
+
+  if (oversoldTFs.length > 0) {
+    signal = "long";
+    const tfStr = oversoldTFs.map(t => `${t.tf}:${t.rsi.toFixed(1)}`).join(", ");
+    details.push(`RSI oversold on ${oversoldTFs.length} TF(s): ${tfStr}`);
+    // Bonus: multiple lower TFs aligned = stronger signal
+    if (oversoldTFs.length >= 2) { score++; details.push(`Multi-TF oversold alignment (${oversoldTFs.length}/4)`); }
+  } else if (overboughtTFs.length > 0) {
+    signal = "short";
+    const tfStr = overboughtTFs.map(t => `${t.tf}:${t.rsi.toFixed(1)}`).join(", ");
+    details.push(`RSI overbought on ${overboughtTFs.length} TF(s): ${tfStr}`);
+    if (overboughtTFs.length >= 2) { score++; details.push(`Multi-TF overbought alignment (${overboughtTFs.length}/4)`); }
   }
   
-  // Multi-TF RSI alignment
+  if (signal === "neutral") {
+    return { score: 0, details: ["No RSI signal on any timeframe"], signal: "neutral", suggestedEntry: price, suggestedSL: price, suggestedTP1: price, suggestedTP2: price, riskRewardRatio: 0 };
+  }
+  
+  // ========== HIGHER TF CONFIRMATION: 4h + 1d ==========
   if (signal === "long") {
     if (rsi4h < 40) { score++; details.push(`4H RSI confirms: ${rsi4h.toFixed(1)}`); }
     if (rsi1d < 45) { score++; details.push(`1D RSI supports: ${rsi1d.toFixed(1)}`); }
@@ -448,22 +478,32 @@ class TradingEngine {
 
         if (volume24h < (config.minVolume24h || 1e6)) continue;
 
-        const [c1h, c4h, c1d] = await Promise.all([
+        // Fetch all 6 timeframes: 1m, 5m, 15m for entry signals + 1h, 4h, 1d for confirmation
+        const [c1m, c5m, c15m, c1h, c4h, c1d] = await Promise.all([
+          fetchCandles(asset.coin, "1m", 60),
+          fetchCandles(asset.coin, "5m", 60),
+          fetchCandles(asset.coin, "15m", 60),
           fetchCandles(asset.coin, "1h", 60),
           fetchCandles(asset.coin, "4h", 60),
           fetchCandles(asset.coin, "1d", 30),
         ]);
-        if (c1h.length < 20) continue;
+        // Need at least some candle data to compute RSI
+        if (c1m.length < 15 && c5m.length < 15 && c15m.length < 15 && c1h.length < 15) continue;
 
-        const rsi1h = calculateRSI(c1h);
+        const rsi1m = c1m.length >= 15 ? calculateRSI(c1m) : 50;
+        const rsi5m = c5m.length >= 15 ? calculateRSI(c5m) : 50;
+        const rsi15m = c15m.length >= 15 ? calculateRSI(c15m) : 50;
+        const rsi1h = c1h.length >= 15 ? calculateRSI(c1h) : 50;
         const rsi4h = c4h.length >= 15 ? calculateRSI(c4h) : 50;
         const rsi1d = c1d.length >= 15 ? calculateRSI(c1d) : 50;
-        const ema10 = getLastEMA(c1h, 10);
-        const ema21 = getLastEMA(c1h, 21);
-        const ema50 = c1h.length >= 50 ? getLastEMA(c1h, 50) : ema21;
+        // EMAs from 15m candles for tighter entry, fallback to 1h
+        const emaSource = c15m.length >= 50 ? c15m : c1h;
+        const ema10 = getLastEMA(emaSource, 10);
+        const ema21 = getLastEMA(emaSource, 21);
+        const ema50 = emaSource.length >= 50 ? getLastEMA(emaSource, 50) : ema21;
 
         const confluence = calculateConfluence({
-          price, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
+          price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
           fundingRate: funding, change24h, volume24h, config, category: asset.category,
         });
 
