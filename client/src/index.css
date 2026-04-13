@@ -1,0 +1,154 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* TRADING TERMINAL - Dark-first theme */
+:root {
+  --button-outline: rgba(0, 0, 0, 0.1);
+  --badge-outline: rgba(0, 0, 0, 0.05);
+  --opaque-button-border-intensity: -8;
+  --elevate-1: rgba(0, 0, 0, 0.03);
+  --elevate-2: rgba(0, 0, 0, 0.08);
+  --background: 220 15% 96%;
+  --foreground: 220 20% 10%;
+  --border: 220 10% 88%;
+  --card: 220 15% 98%;
+  --card-foreground: 220 20% 10%;
+  --card-border: 220 10% 90%;
+  --sidebar: 220 20% 12%;
+  --sidebar-foreground: 220 10% 90%;
+  --sidebar-border: 220 15% 18%;
+  --sidebar-primary: 142 70% 45%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 220 15% 18%;
+  --sidebar-accent-foreground: 220 10% 85%;
+  --sidebar-ring: 142 70% 45%;
+  --popover: 220 15% 95%;
+  --popover-foreground: 220 20% 10%;
+  --popover-border: 220 10% 88%;
+  --primary: 142 70% 45%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 220 10% 90%;
+  --secondary-foreground: 220 20% 10%;
+  --muted: 220 10% 92%;
+  --muted-foreground: 220 10% 40%;
+  --accent: 220 14% 90%;
+  --accent-foreground: 220 20% 10%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+  --input: 220 10% 75%;
+  --ring: 142 70% 45%;
+  --chart-1: 142 70% 45%;
+  --chart-2: 0 72% 51%;
+  --chart-3: 38 92% 50%;
+  --chart-4: 199 89% 48%;
+  --chart-5: 262 83% 58%;
+  --font-sans: 'Inter', 'SF Pro Display', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  --radius: 0.5rem;
+  --shadow-2xs: 0px 2px 0px 0px hsl(0 0% 0% / 0);
+  --shadow-xs: 0px 2px 0px 0px hsl(0 0% 0% / 0);
+  --shadow-sm: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 1px 2px -1px hsl(0 0% 0% / 0);
+  --shadow: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 1px 2px -1px hsl(0 0% 0% / 0);
+  --shadow-md: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 2px 4px -1px hsl(0 0% 0% / 0);
+  --shadow-lg: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 4px 6px -1px hsl(0 0% 0% / 0);
+  --shadow-xl: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 8px 10px -1px hsl(0 0% 0% / 0);
+  --shadow-2xl: 0px 2px 0px 0px hsl(0 0% 0% / 0);
+  --tracking-normal: 0em;
+  --spacing: 0.25rem;
+
+  --sidebar-primary-border: hsl(var(--sidebar-primary));
+  --sidebar-accent-border: hsl(var(--sidebar-accent));
+  --primary-border: hsl(var(--primary));
+  --secondary-border: hsl(var(--secondary));
+  --muted-border: hsl(var(--muted));
+  --accent-border: hsl(var(--accent));
+  --destructive-border: hsl(var(--destructive));
+}
+
+.dark {
+  --button-outline: rgba(255, 255, 255, 0.1);
+  --badge-outline: rgba(255, 255, 255, 0.05);
+  --opaque-button-border-intensity: 9;
+  --elevate-1: rgba(255, 255, 255, 0.04);
+  --elevate-2: rgba(255, 255, 255, 0.09);
+  --background: 225 20% 6%;
+  --foreground: 210 20% 92%;
+  --border: 220 15% 15%;
+  --card: 225 18% 8%;
+  --card-foreground: 210 20% 92%;
+  --card-border: 220 15% 12%;
+  --sidebar: 225 22% 7%;
+  --sidebar-foreground: 210 15% 85%;
+  --sidebar-border: 220 15% 12%;
+  --sidebar-primary: 142 70% 45%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 220 15% 14%;
+  --sidebar-accent-foreground: 210 15% 85%;
+  --sidebar-ring: 142 70% 45%;
+  --popover: 225 18% 10%;
+  --popover-foreground: 210 20% 92%;
+  --popover-border: 220 15% 15%;
+  --primary: 142 70% 45%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 220 15% 15%;
+  --secondary-foreground: 210 20% 92%;
+  --muted: 220 15% 14%;
+  --muted-foreground: 220 10% 55%;
+  --accent: 220 12% 14%;
+  --accent-foreground: 210 20% 92%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+  --input: 220 15% 22%;
+  --ring: 142 70% 45%;
+  --chart-1: 142 70% 55%;
+  --chart-2: 0 72% 60%;
+  --chart-3: 38 92% 60%;
+  --chart-4: 199 89% 58%;
+  --chart-5: 262 83% 68%;
+  --shadow-2xs: 0px 2px 0px 0px hsl(0 0% 0% / 0);
+  --shadow-xs: 0px 2px 0px 0px hsl(0 0% 0% / 0);
+  --shadow-sm: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 1px 2px -1px hsl(0 0% 0% / 0);
+  --shadow: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 1px 2px -1px hsl(0 0% 0% / 0);
+  --shadow-md: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 2px 4px -1px hsl(0 0% 0% / 0);
+  --shadow-lg: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 4px 6px -1px hsl(0 0% 0% / 0);
+  --shadow-xl: 0px 2px 0px 0px hsl(0 0% 0% / 0), 0px 8px 10px -1px hsl(0 0% 0% / 0);
+  --shadow-2xl: 0px 2px 0px 0px hsl(0 0% 0% / 0);
+
+  --sidebar-primary-border: hsl(var(--sidebar-primary));
+  --sidebar-accent-border: hsl(var(--sidebar-accent));
+  --primary-border: hsl(var(--primary));
+  --secondary-border: hsl(var(--secondary));
+  --muted-border: hsl(var(--muted));
+  --accent-border: hsl(var(--accent));
+  --destructive-border: hsl(var(--destructive));
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+  }
+}
+
+/* Trading-specific utility classes */
+@layer utilities {
+  .text-profit {
+    @apply text-emerald-500;
+  }
+  .text-loss {
+    @apply text-red-500;
+  }
+  .bg-profit {
+    @apply bg-emerald-500/10;
+  }
+  .bg-loss {
+    @apply bg-red-500/10;
+  }
+  .font-mono {
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  }
+}

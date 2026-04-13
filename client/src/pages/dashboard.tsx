@@ -1,0 +1,287 @@
+import { useQuery, useMutation } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  TrendingUp, TrendingDown, DollarSign, Target,
+  BarChart3, Activity, RefreshCw, ArrowUpRight, ArrowDownRight, Wallet,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import {
+  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  AreaChart, Area, CartesianGrid,
+} from "recharts";
+
+export default function Dashboard() {
+  const { data: status, isLoading: statusLoading } = useQuery({
+    queryKey: ["/api/status"],
+    refetchInterval: 5000,
+  });
+
+  const { data: openTrades = [] } = useQuery({
+    queryKey: ["/api/trades", "open"],
+    queryFn: () => apiRequest("GET", "/api/trades?status=open").then(r => r.json()),
+    refetchInterval: 10000,
+  });
+
+  const { data: pnlData = [] } = useQuery({
+    queryKey: ["/api/pnl"],
+    queryFn: () => apiRequest("GET", "/api/pnl").then(r => r.json()),
+    refetchInterval: 30000,
+  });
+
+  const { data: account } = useQuery({
+    queryKey: ["/api/account"],
+    queryFn: () => apiRequest("GET", "/api/account").then(r => r.json()),
+    refetchInterval: 30000,
+  });
+
+  const { data: logs = [] } = useQuery({
+    queryKey: ["/api/logs"],
+    queryFn: () => apiRequest("GET", "/api/logs?limit=10").then(r => r.json()),
+    refetchInterval: 10000,
+  });
+
+  const triggerScan = useMutation({
+    mutationFn: () => apiRequest("POST", "/api/bot/scan"),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/scans"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/trades"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/status"] });
+    },
+  });
+
+  const combinedPnl = parseFloat(status?.combinedPnl || "0");
+  const accountBalance = account?.marginSummary?.accountValue
+    ? parseFloat(account.marginSummary.accountValue)
+    : 0;
+
+  const pnlChartData = [...(pnlData || [])].reverse().slice(-50).map((p: any) => ({
+    time: new Date(p.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    pnl: p.totalPnlPct,
+    equity: p.totalEquity,
+  }));
+
+  return (
+    <div className="p-6 space-y-6 max-w-[1400px]">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
+          <p className="text-sm text-muted-foreground">Real-time trading overview</p>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => triggerScan.mutate()}
+          disabled={triggerScan.isPending}
+          data-testid="button-trigger-scan"
+        >
+          <RefreshCw className={cn("w-3.5 h-3.5 mr-1.5", triggerScan.isPending && "animate-spin")} />
+          {triggerScan.isPending ? "Scanning..." : "Force Scan"}
+        </Button>
+      </div>
+
+      {/* KPI Cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-muted-foreground font-medium">Account Balance</span>
+              <Wallet className="w-4 h-4 text-muted-foreground" />
+            </div>
+            <div className="text-lg font-semibold font-mono" data-testid="text-balance">
+              ${accountBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </div>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              {account?.connected ? "Connected" : "Not connected"}
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-muted-foreground font-medium">Total P&L</span>
+              {combinedPnl >= 0 ? (
+                <TrendingUp className="w-4 h-4 text-emerald-500" />
+              ) : (
+                <TrendingDown className="w-4 h-4 text-red-500" />
+              )}
+            </div>
+            <div className={cn(
+              "text-lg font-semibold font-mono",
+              combinedPnl >= 0 ? "text-emerald-500" : "text-red-500"
+            )} data-testid="text-total-pnl">
+              {combinedPnl >= 0 ? "+" : ""}{combinedPnl.toFixed(2)}%
+            </div>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Target: +50%/week
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-muted-foreground font-medium">Open Positions</span>
+              <Activity className="w-4 h-4 text-muted-foreground" />
+            </div>
+            <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
+              {status?.openPositions || 0}
+            </div>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              Open P&L: {parseFloat(status?.openPnl || "0") >= 0 ? "+" : ""}{status?.openPnl || "0.00"}%
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-muted-foreground font-medium">Win Rate</span>
+              <Target className="w-4 h-4 text-muted-foreground" />
+            </div>
+            <div className="text-lg font-semibold font-mono" data-testid="text-win-rate">
+              {status?.winRate || "0.0"}%
+            </div>
+            <p className="text-[10px] text-muted-foreground mt-1">
+              {status?.closedTrades || 0} closed trades
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Charts Row */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* P&L Chart */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {pnlChartData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={200}>
+                <AreaChart data={pnlChartData}>
+                  <defs>
+                    <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="hsl(142, 70%, 45%)" stopOpacity={0.3} />
+                      <stop offset="95%" stopColor="hsl(142, 70%, 45%)" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
+                  <XAxis dataKey="time" tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)" />
+                  <YAxis tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)" />
+                  <Tooltip
+                    contentStyle={{
+                      background: "hsl(225, 18%, 10%)",
+                      border: "1px solid hsl(220, 15%, 15%)",
+                      borderRadius: "6px",
+                      fontSize: "12px",
+                    }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="pnl"
+                    stroke="hsl(142, 70%, 45%)"
+                    fill="url(#pnlGrad)"
+                    strokeWidth={2}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
+                No data yet — start the bot to begin trading
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Open Positions */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">Open Positions</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {openTrades.length > 0 ? (
+              <div className="space-y-2">
+                {openTrades.map((trade: any) => (
+                  <div
+                    key={trade.id}
+                    className="flex items-center justify-between p-2.5 rounded-md bg-muted/50 border border-border"
+                    data-testid={`card-position-${trade.id}`}
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <Badge
+                        variant={trade.side === "long" ? "default" : "destructive"}
+                        className="text-[10px] px-1.5 py-0 uppercase"
+                      >
+                        {trade.side}
+                      </Badge>
+                      <div>
+                        <span className="text-sm font-medium">{trade.coin}</span>
+                        <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className={cn(
+                        "text-sm font-mono font-medium",
+                        (trade.pnl || 0) >= 0 ? "text-emerald-500" : "text-red-500"
+                      )}>
+                        {(trade.pnl || 0) >= 0 ? "+" : ""}{(trade.pnl || 0).toFixed(2)}%
+                      </div>
+                      <div className="text-[10px] text-muted-foreground font-mono">
+                        ${trade.entryPrice?.toFixed(2)}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
+                No open positions
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Recent Activity */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm font-medium">Recent Activity</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-1.5">
+            {(logs as any[]).slice(0, 8).map((log: any) => (
+              <div
+                key={log.id}
+                className="flex items-start gap-2.5 py-1.5 border-b border-border/50 last:border-0"
+              >
+                <div className={cn(
+                  "w-1.5 h-1.5 rounded-full mt-1.5 shrink-0",
+                  log.type === "trade_open" && "bg-emerald-500",
+                  log.type === "trade_close" && "bg-blue-500",
+                  log.type === "error" && "bg-red-500",
+                  log.type === "scan" && "bg-yellow-500",
+                  log.type === "system" && "bg-muted-foreground",
+                  log.type === "config_change" && "bg-purple-500",
+                )} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs truncate">{log.message}</p>
+                  <p className="text-[10px] text-muted-foreground">
+                    {new Date(log.timestamp).toLocaleString()}
+                  </p>
+                </div>
+              </div>
+            ))}
+            {logs.length === 0 && (
+              <p className="text-sm text-muted-foreground text-center py-4">No activity yet</p>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
