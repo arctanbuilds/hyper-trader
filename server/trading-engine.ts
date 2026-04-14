@@ -1,20 +1,27 @@
 /**
- * HyperTrader — Elite Trading Engine v8 (RSI + BB + Volume + ADX + S/R Levels)
+ * HyperTrader — Elite Trading Engine v9 (RSI + BB + Volume + ADX + S/R + Trendline Breakout/Retest)
  *
- * SINGLE STRATEGY — EXTREME RSI + BOLLINGER BAND REVERSION:
- *   - Confluence strategy DISABLED based on 12-month BTC backtest analysis
- *   - Mean reversion via extreme RSI outperformed trend-following in 2025-2026
- *   - Enhanced with Bollinger Bands, Volume Exhaustion, ADX Regime, and S/R Levels
+ * THREE INDEPENDENT STRATEGY GROUPS:
  *
- * TWO ENTRY TRIGGERS:
+ * GROUP 1 — MEAN REVERSION (RSI + BB):
  *   Trigger A — EXTREME RSI (multi-TF):
  *     - RSI < 10 on 2+ of (1m, 5m, 15m) → LONG
  *     - RSI > 80 on 2+ of (1m, 5m, 15m) → SHORT
  *     - BB/volume/ADX are bonus confirmations (increase confidence)
- *   Trigger B — BOLLINGER BAND REVERSION (NEW):
+ *   Trigger B — BOLLINGER BAND REVERSION:
  *     - Price touches 2-3 SD Bollinger Band on 5m OR 15m
  *     - RSI on same TF confirms: < 30 for long, > 70 for short
  *     - Volume exhaustion + ADX < 25 preferred but not required
+ *
+ * GROUP 2 — BREAKOUT/RETEST (fully separate, runs in parallel):
+ *   - Detect descending/ascending trendlines from swing highs/lows
+ *   - Breakout: candle closes beyond trendline
+ *   - Retest: price returns to broken trendline with rejection
+ *   - Descending TL broken upward → retest → LONG
+ *   - Ascending TL broken downward → retest → SHORT
+ *   - TP1: 0.3%, TP2: 0.7%, SL: 0.25%, SL→BE after TP1
+ *
+ * GROUP 3 — CONFLUENCE (disabled, dashboard display only)
  *
  * ADX REGIME ADAPTATION:
  *   - ADX < 25 (ranging): standard TP targets
@@ -53,7 +60,7 @@ const ALLOWED_ASSETS: AssetConfig[] = [
 ];
 
 // ============ STRATEGY TYPES ============
-type StrategyType = "confluence" | "extreme_rsi" | "bb_rsi_reversion";
+type StrategyType = "confluence" | "extreme_rsi" | "bb_rsi_reversion" | "breakout_retest";
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -496,6 +503,265 @@ function detectSupportResistance(
     supportDistance,
     resistanceDistance,
   };
+}
+
+// ============ TRENDLINE BREAKOUT / RETEST DETECTION ============
+
+interface Trendline {
+  type: "descending" | "ascending";
+  startIdx: number;
+  endIdx: number;
+  startPrice: number;
+  endPrice: number;
+  slope: number;         // price change per bar
+  touches: number;       // how many swing points touch the line
+  strength: number;      // 1-5
+}
+
+interface BreakoutRetestResult {
+  triggered: boolean;
+  signal: "long" | "short" | "none";
+  trendlineType: "descending" | "ascending" | "none";
+  trendlineValueAtBreak: number;  // trendline price at breakout bar
+  trendlineValueNow: number;      // trendline price at current bar
+  retestPrice: number;
+  barsSinceBreakout: number;
+  trendlineTouches: number;
+  trendlineStrength: number;
+  rejectionConfirm: boolean;
+  confidenceScore: number;  // 1-5
+  triggerTF: string;
+  suggestedSL: number;
+  suggestedTP1: number;
+  suggestedTP2: number;
+}
+
+/** Get the trendline price at a given candle index using linear projection */
+function trendlineAt(tl: Trendline, idx: number): number {
+  return tl.startPrice + tl.slope * (idx - tl.startIdx);
+}
+
+/**
+ * Detect trendlines from OHLCV candles by connecting swing highs (descending)
+ * and swing lows (ascending). Returns strongest trendlines.
+ */
+function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Trendline[] {
+  if (candles.length < pivotWindow * 2 + 5) return [];
+
+  // Find swing highs and swing lows
+  const swingHighs: { idx: number; price: number }[] = [];
+  const swingLows: { idx: number; price: number }[] = [];
+
+  for (let i = pivotWindow; i < candles.length - pivotWindow; i++) {
+    let isHigh = true, isLow = true;
+    for (let j = 1; j <= pivotWindow; j++) {
+      if (candles[i - j].high >= candles[i].high || candles[i + j].high >= candles[i].high) isHigh = false;
+      if (candles[i - j].low <= candles[i].low || candles[i + j].low <= candles[i].low) isLow = false;
+    }
+    if (isHigh) swingHighs.push({ idx: i, price: candles[i].high });
+    if (isLow) swingLows.push({ idx: i, price: candles[i].low });
+  }
+
+  const trendlines: Trendline[] = [];
+  const tolerancePct = 0.002; // 0.2% tolerance for "touching" the trendline
+
+  // Build DESCENDING trendlines from swing highs (lower highs)
+  for (let a = 0; a < swingHighs.length - 1; a++) {
+    for (let b = a + 1; b < swingHighs.length; b++) {
+      const p1 = swingHighs[a], p2 = swingHighs[b];
+      if (p2.price >= p1.price) continue; // must be descending
+      if (p2.idx - p1.idx < 3) continue;  // minimum span
+
+      const slope = (p2.price - p1.price) / (p2.idx - p1.idx);
+      // Count how many swing highs touch this line
+      let touches = 2;
+      for (let c = 0; c < swingHighs.length; c++) {
+        if (c === a || c === b) continue;
+        const expected = p1.price + slope * (swingHighs[c].idx - p1.idx);
+        if (Math.abs(swingHighs[c].price - expected) / expected <= tolerancePct) touches++;
+      }
+
+      let strength = Math.min(touches, 3); // max 3 from touches
+      if (p2.idx - p1.idx >= 15) strength++; // long trendline bonus
+      if (touches >= 3) strength++; // multi-touch bonus
+      strength = Math.min(strength, 5);
+
+      trendlines.push({
+        type: "descending", startIdx: p1.idx, endIdx: p2.idx,
+        startPrice: p1.price, endPrice: p2.price, slope, touches, strength,
+      });
+    }
+  }
+
+  // Build ASCENDING trendlines from swing lows (higher lows)
+  for (let a = 0; a < swingLows.length - 1; a++) {
+    for (let b = a + 1; b < swingLows.length; b++) {
+      const p1 = swingLows[a], p2 = swingLows[b];
+      if (p2.price <= p1.price) continue; // must be ascending
+      if (p2.idx - p1.idx < 3) continue;
+
+      const slope = (p2.price - p1.price) / (p2.idx - p1.idx);
+      let touches = 2;
+      for (let c = 0; c < swingLows.length; c++) {
+        if (c === a || c === b) continue;
+        const expected = p1.price + slope * (swingLows[c].idx - p1.idx);
+        if (Math.abs(swingLows[c].price - expected) / expected <= tolerancePct) touches++;
+      }
+
+      let strength = Math.min(touches, 3);
+      if (p2.idx - p1.idx >= 15) strength++;
+      if (touches >= 3) strength++;
+      strength = Math.min(strength, 5);
+
+      trendlines.push({
+        type: "ascending", startIdx: p1.idx, endIdx: p2.idx,
+        startPrice: p1.price, endPrice: p2.price, slope, touches, strength,
+      });
+    }
+  }
+
+  // Sort by strength desc, keep top candidates
+  trendlines.sort((a, b) => b.strength - a.strength || b.touches - a.touches);
+  return trendlines.slice(0, 10);
+}
+
+/**
+ * Detect trendline breakout-and-retest patterns.
+ *
+ * Descending trendline broken to the UPSIDE → price retests from above → LONG
+ * Ascending trendline broken to the DOWNSIDE → price retests from below → SHORT
+ */
+function detectBreakoutRetest(
+  candles: OHLCVCandle[],
+  currentPrice: number,
+  tf: string,
+  retestTolerance: number = 0.003,  // 0.3% proximity to trendline = "retesting"
+  maxBreakoutAge: number = 20,
+): BreakoutRetestResult {
+  const noResult: BreakoutRetestResult = {
+    triggered: false, signal: "none", trendlineType: "none",
+    trendlineValueAtBreak: 0, trendlineValueNow: 0, retestPrice: currentPrice,
+    barsSinceBreakout: 0, trendlineTouches: 0, trendlineStrength: 0,
+    rejectionConfirm: false, confidenceScore: 0, triggerTF: tf,
+    suggestedSL: 0, suggestedTP1: 0, suggestedTP2: 0,
+  };
+
+  if (candles.length < 30) return noResult;
+
+  const trendlines = detectTrendlines(candles, 3);
+  if (trendlines.length === 0) return noResult;
+
+  const candidates: BreakoutRetestResult[] = [];
+  const lastIdx = candles.length - 1;
+
+  for (const tl of trendlines) {
+    // Project trendline value across all bars after the trendline's end
+    // Look for breakout: a candle that closes on the other side of the trendline
+
+    let breakoutIdx = -1;
+    const scanStart = Math.max(tl.endIdx + 1, lastIdx - maxBreakoutAge - 10);
+
+    for (let i = scanStart; i <= lastIdx; i++) {
+      const tlValue = trendlineAt(tl, i);
+      const c = candles[i];
+      const prev = i > 0 ? candles[i - 1] : c;
+      const prevTlValue = trendlineAt(tl, i - 1);
+
+      if (tl.type === "descending") {
+        // Breakout: previous close was below trendline, current close is above
+        if (prev.close <= prevTlValue && c.close > tlValue) {
+          breakoutIdx = i;
+        }
+      } else {
+        // Ascending breakout (bearish): previous close was above, current close is below
+        if (prev.close >= prevTlValue && c.close < tlValue) {
+          breakoutIdx = i;
+        }
+      }
+    }
+
+    if (breakoutIdx === -1) continue;
+
+    const barsSinceBreak = lastIdx - breakoutIdx;
+    if (barsSinceBreak < 2 || barsSinceBreak > maxBreakoutAge) continue;
+
+    // Current trendline value (projected to now)
+    const tlValueNow = trendlineAt(tl, lastIdx);
+    const tlValueAtBreak = trendlineAt(tl, breakoutIdx);
+    const distToTL = Math.abs(currentPrice - tlValueNow) / tlValueNow;
+
+    // Is price close enough to the trendline to be "retesting"?
+    if (distToTL > retestTolerance) continue;
+
+    // Determine signal
+    let signal: "long" | "short" | "none" = "none";
+    if (tl.type === "descending" && currentPrice >= tlValueNow * (1 - retestTolerance)) {
+      // Broke above descending trendline, retesting from above = LONG
+      signal = "long";
+    } else if (tl.type === "ascending" && currentPrice <= tlValueNow * (1 + retestTolerance)) {
+      // Broke below ascending trendline, retesting from below = SHORT
+      signal = "short";
+    }
+
+    if (signal === "none") continue;
+
+    // Verify price actually moved away from the trendline after breakout
+    // (must have been clearly on the other side at some point)
+    let movedAway = false;
+    for (let i = breakoutIdx + 1; i <= lastIdx - 1; i++) {
+      const tlv = trendlineAt(tl, i);
+      if (signal === "long" && candles[i].close > tlv * (1 + retestTolerance)) movedAway = true;
+      if (signal === "short" && candles[i].close < tlv * (1 - retestTolerance)) movedAway = true;
+    }
+    if (!movedAway) continue;
+
+    // Check rejection candle: wick touching the trendline, body closing away from it
+    const lastCandle = candles[lastIdx];
+    let rejectionConfirm = false;
+    if (signal === "long") {
+      rejectionConfirm = lastCandle.low <= tlValueNow * (1 + retestTolerance * 0.5) && lastCandle.close > tlValueNow;
+    } else {
+      rejectionConfirm = lastCandle.high >= tlValueNow * (1 - retestTolerance * 0.5) && lastCandle.close < tlValueNow;
+    }
+
+    // Confidence scoring
+    let conf = 1;
+    if (tl.strength >= 3) conf++;
+    if (tl.touches >= 3) conf++;
+    if (rejectionConfirm) conf++;
+    if (barsSinceBreak <= 10) conf++; // fresh breakout
+    conf = Math.min(conf, 5);
+
+    // TP/SL — same rules: SL 0.25%, TP1 0.3%, TP2 0.7%
+    const slPct = 0.0025;
+    const tp1Pct = 0.003;
+    const tp2Pct = 0.007;
+
+    let sl: number, tp1: number, tp2: number;
+    if (signal === "long") {
+      sl = currentPrice * (1 - slPct);
+      tp1 = currentPrice * (1 + tp1Pct);
+      tp2 = currentPrice * (1 + tp2Pct);
+    } else {
+      sl = currentPrice * (1 + slPct);
+      tp1 = currentPrice * (1 - tp1Pct);
+      tp2 = currentPrice * (1 - tp2Pct);
+    }
+
+    candidates.push({
+      triggered: true, signal, trendlineType: tl.type,
+      trendlineValueAtBreak: tlValueAtBreak, trendlineValueNow: tlValueNow,
+      retestPrice: currentPrice, barsSinceBreakout: barsSinceBreak,
+      trendlineTouches: tl.touches, trendlineStrength: tl.strength,
+      rejectionConfirm, confidenceScore: conf, triggerTF: tf,
+      suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2,
+    });
+  }
+
+  if (candidates.length === 0) return noResult;
+
+  candidates.sort((a, b) => b.confidenceScore - a.confidenceScore || b.trendlineStrength - a.trendlineStrength);
+  return candidates[0];
 }
 
 // ============ HYPERLIQUID API ============
@@ -1135,6 +1401,13 @@ class TradingEngine {
         rsi1m: number; rsi5m: number; rsi15m: number;
       }> = [];
 
+      // Separate array for breakout/retest signals (completely independent)
+      const breakoutRetestSignals: Array<{
+        asset: AssetConfig; price: number; result: BreakoutRetestResult;
+        volume24h: number; change24h: number; fundingRate: number; openInterest: number;
+        rsi1h: number; rsi4h: number; rsi1d: number; ema10: number; ema21: number; ema50: number;
+      }> = [];
+
       for (const asset of ALLOWED_ASSETS) {
         const ctx = assetCtxMap[asset.coin];
         if (!ctx?.midPx || ctx.midPx === "None") continue;
@@ -1246,15 +1519,38 @@ class TradingEngine {
           });
         }
 
+        // --- BREAKOUT/RETEST DETECTION (completely separate from RSI/BB) ---
+        // Scan 5m and 15m for trendline breakout+retest patterns
+        const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", 0.003, 20);
+        const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", 0.004, 15);
+
+        // Pick the best signal (highest confidence), 15m preferred if equal
+        let bestBR: BreakoutRetestResult | null = null;
+        if (br15m.triggered && br5m.triggered) {
+          bestBR = br15m.confidenceScore >= br5m.confidenceScore ? br15m : br5m;
+        } else if (br15m.triggered) {
+          bestBR = br15m;
+        } else if (br5m.triggered) {
+          bestBR = br5m;
+        }
+
+        if (bestBR && bestBR.triggered && bestBR.confidenceScore >= 2) {
+          breakoutRetestSignals.push({
+            asset, price, result: bestBR, volume24h, change24h, fundingRate: funding, openInterest,
+            rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
+          });
+        }
+
         await new Promise(r => setTimeout(r, 150));
       }
 
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan: ${enhancedSignals.length} enhanced RSI/BB signals | ${sessionInfo.session} | AUM: $${equity.toLocaleString()}`,
+        message: `Scan: ${enhancedSignals.length} RSI/BB + ${breakoutRetestSignals.length} breakout/retest signals | ${sessionInfo.session} | AUM: $${equity.toLocaleString()}`,
         data: JSON.stringify([
           ...enhancedSignals.slice(0, 5).map(s => `[${s.enhanced.triggerType}] ${s.asset.coin} RSI:${s.enhanced.triggerRSI.toFixed(1)} ${s.enhanced.signal} @${s.enhanced.triggerTF} conf:${s.enhanced.confidenceScore}`),
+          ...breakoutRetestSignals.slice(0, 5).map(s => `[BREAKOUT_RETEST] ${s.asset.coin} ${s.result.signal} TL:${s.result.trendlineType} @${s.result.triggerTF} conf:${s.result.confidenceScore} rej:${s.result.rejectionConfirm}`),
         ]),
         timestamp: new Date().toISOString(),
       });
@@ -1413,6 +1709,138 @@ class TradingEngine {
       }
 
       // =============================================
+      // EXECUTE BREAKOUT/RETEST ENTRIES (fully separate)
+      // =============================================
+      const brSlotsAvailable = maxPos - openTrades.length - slotsUsed;
+      if (canOpenNew && brSlotsAvailable > 0 && breakoutRetestSignals.length > 0) {
+        let brSlotsUsed = 0;
+        // Sort by confidence descending
+        breakoutRetestSignals.sort((a, b) => b.result.confidenceScore - a.result.confidenceScore);
+
+        for (const brSig of breakoutRetestSignals.slice(0, brSlotsAvailable)) {
+          if (brSig.result.signal === "none") continue;
+          if (openByCoinStrategy.has(`${brSig.asset.coin}_breakout_retest`)) continue;
+
+          const side = brSig.result.signal as "long" | "short";
+          const reasoning: string[] = [];
+          reasoning.push(`[BREAKOUT_RETEST] Signal: ${side.toUpperCase()} ${brSig.asset.displayName}`);
+          reasoning.push(`TRENDLINE: ${brSig.result.trendlineType} | Touches: ${brSig.result.trendlineTouches} | Strength: ${brSig.result.trendlineStrength}`);
+          reasoning.push(`BREAKOUT: ${brSig.result.barsSinceBreakout} bars ago | TL@break: $${displayPrice(brSig.result.trendlineValueAtBreak, brSig.asset.szDecimals)} | TL@now: $${displayPrice(brSig.result.trendlineValueNow, brSig.asset.szDecimals)}`);
+          reasoning.push(`RETEST: price $${displayPrice(brSig.result.retestPrice, brSig.asset.szDecimals)} near trendline | Rejection candle: ${brSig.result.rejectionConfirm ? 'YES' : 'NO'}`);
+          reasoning.push(`Confidence: ${brSig.result.confidenceScore}/5 | TF: ${brSig.result.triggerTF}`);
+          reasoning.push(`TP1: $${displayPrice(brSig.result.suggestedTP1, brSig.asset.szDecimals)} | TP2: $${displayPrice(brSig.result.suggestedTP2, brSig.asset.szDecimals)}`);
+          reasoning.push(`SL: $${displayPrice(brSig.result.suggestedSL, brSig.asset.szDecimals)} → moves to BE after TP1`);
+          reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(brSig.fundingRate * 100).toFixed(4)}%`);
+
+          // Check learning insights
+          const insightCheck = await checkInsights({ coin: brSig.asset.coin, side, session: sessionInfo.session, confluenceScore: 7, dayOfWeek: now.getUTCDay() });
+          if (insightCheck.shouldBlock) {
+            reasoning.push(`BLOCKED BY LEARNING: ${insightCheck.blockReason}`);
+            await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
+            continue;
+          }
+
+          // Position sizing — same 25% AUM, max leverage
+          const pos = calculateAdaptivePosition({ equity, price: brSig.price, asset: brSig.asset, config });
+          if (!pos.canTrade) {
+            reasoning.push(`SKIP: ${pos.skipReason}`);
+            await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
+            continue;
+          }
+
+          const { leverage, capitalForTrade, assetSize, notionalSize } = pos;
+          const tradeAmountPct = (capitalForTrade / equity) * 100;
+          reasoning.push(`ENTRY: ${side.toUpperCase()} ${brSig.asset.displayName} | ${leverage}x (MAX) | $${capitalForTrade.toFixed(2)} capital ($${notionalSize.toFixed(0)} notional)`);
+
+          // Execute order
+          if (config.apiSecret && config.walletAddress) {
+            try {
+              const executor = createExecutor(config.apiSecret, config.walletAddress);
+              const isCross = !brSig.asset.isolatedOnly;
+              await executor.setLeverage(brSig.asset.coin, leverage, isCross);
+              const slippageMult = side === "long" ? 1.01 : 0.99;
+              const orderPrice = brSig.price * slippageMult;
+              const roundedSize = parseFloat(formatHLSize(assetSize, brSig.asset.szDecimals));
+              if (roundedSize <= 0) { reasoning.push(`SKIP: Rounded size is 0`); continue; }
+              const orderResult = await executor.placeOrder({
+                coin: brSig.asset.coin, isBuy: side === "long", sz: roundedSize,
+                limitPx: parseFloat(formatHLPrice(orderPrice, brSig.asset.szDecimals)),
+                orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
+              });
+
+              log(`[HL RAW] ${brSig.asset.coin} breakout_retest response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
+              const status = orderResult?.response?.data?.statuses?.[0];
+              const fillPx = status?.filled?.avgPx;
+              const totalSz = status?.filled?.totalSz;
+              const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
+
+              if (errorMsg) {
+                reasoning.push(`ORDER REJECTED: ${errorMsg}`);
+                await storage.createLog({ type: "order_error", message: `ORDER REJECTED: [BREAKOUT_RETEST] ${brSig.asset.displayName} — ${errorMsg}`, timestamp: new Date().toISOString() });
+                await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
+                continue;
+              }
+
+              if (fillPx && parseFloat(totalSz) > 0) {
+                reasoning.push(`FILLED: sz=${totalSz} @ $${fillPx}`);
+                brSig.price = parseFloat(fillPx);
+              } else {
+                reasoning.push(`IOC NOT FILLED`);
+                await storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: [BREAKOUT_RETEST] ${brSig.asset.displayName} ${side}`, timestamp: new Date().toISOString() });
+                await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
+                continue;
+              }
+            } catch (execErr) {
+              reasoning.push(`ORDER FAILED: ${execErr}`);
+              await storage.createLog({ type: "order_error", message: `ORDER FAILED: [BREAKOUT_RETEST] ${brSig.asset.displayName} — ${execErr}`, timestamp: new Date().toISOString() });
+              await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
+              continue;
+            }
+          }
+
+          const trade = await storage.createTrade({
+            coin: brSig.asset.coin, side, entryPrice: brSig.price, size: tradeAmountPct, leverage,
+            rsiAtEntry: brSig.rsi1h, rsi4h: brSig.rsi4h, rsi1d: brSig.rsi1d,
+            ema10: brSig.ema10, ema21: brSig.ema21, ema50: brSig.ema50,
+            stopLoss: brSig.result.suggestedSL,
+            takeProfit1: brSig.result.suggestedTP1,
+            takeProfit2: brSig.result.suggestedTP2,
+            tp1Hit: false,
+            confluenceScore: 0,
+            confluenceDetails: `BREAKOUT_RETEST: ${brSig.result.trendlineType} TL | ${brSig.result.trendlineTouches} touches | str:${brSig.result.trendlineStrength} | rej:${brSig.result.rejectionConfirm} | ${brSig.result.barsSinceBreakout} bars | conf:${brSig.result.confidenceScore}/5`,
+            riskRewardRatio: 0,
+            status: "open",
+            reason: `[BREAKOUT_RETEST] ${side.toUpperCase()} | ${brSig.result.trendlineType} TL retest | ${brSig.result.triggerTF} | Conf:${brSig.result.confidenceScore}/5 | ${leverage}x MAX | $${capitalForTrade.toFixed(0)}`,
+            setupType: "breakout_retest",
+            strategy: "breakout_retest",
+            openedAt: new Date().toISOString(),
+          });
+
+          await logDecision({
+            tradeId: trade.id, coin: brSig.asset.coin, action: "entry", side, price: brSig.price,
+            rsi1h: brSig.rsi1h, rsi4h: brSig.rsi4h, rsi1d: brSig.rsi1d,
+            ema10: brSig.ema10, ema21: brSig.ema21, ema50: brSig.ema50,
+            volume24h: brSig.volume24h, change24h: brSig.change24h,
+            fundingRate: brSig.fundingRate, openInterest: brSig.openInterest,
+            reasoning: reasoning.join(" | "), equity, leverage, positionSizeUsd: capitalForTrade,
+            strategy: "breakout_retest",
+          });
+
+          await storage.createLog({
+            type: "trade_open",
+            message: `[BREAKOUT_RETEST] ${side.toUpperCase()} ${brSig.asset.displayName} @ $${displayPrice(brSig.price, brSig.asset.szDecimals)} | ${leverage}x | ${brSig.result.trendlineType} TL | ${brSig.result.triggerTF} | Conf:${brSig.result.confidenceScore}/5 | $${capitalForTrade.toFixed(0)}`,
+            data: JSON.stringify(trade),
+            timestamp: new Date().toISOString(),
+          });
+
+          openByCoinStrategy.add(`${brSig.asset.coin}_breakout_retest`);
+          brSlotsUsed++;
+          slotsUsed++;
+          this.dailyTradeCount++;
+        }
+      }
+
+      // =============================================
       // CHECK EXITS — all strategies, isolated logic
       // =============================================
       await this.checkExits(equity);
@@ -1508,6 +1936,44 @@ class TradingEngine {
           const activeSL = trade.stopLoss;
           if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `[${stratLabel}] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
           if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `[${stratLabel}] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
+        }
+
+      } else if (strategy === "breakout_retest") {
+        // ---- BREAKOUT/RETEST EXIT RULES (fully separate) ----
+        // Same structure: TP1 0.3% → SL to BE, TP2 0.7% → full close, SL 0.25%
+
+        // TP1 check — move SL to breakeven
+        if (!trade.tp1Hit) {
+          const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
+                         (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
+          if (tp1Hit) {
+            const breakEvenSL = trade.entryPrice;
+            await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
+            await logDecision({
+              tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
+              reasoning: `[BREAKOUT_RETEST] TP1 hit @ $${displayPrice(currentPrice, szd)} | SL moved to BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+              equity: currentEquity, leverage: trade.leverage, strategy: "breakout_retest",
+            });
+            await storage.createLog({
+              type: "trade_tp1",
+              message: `[BREAKOUT_RETEST] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | SL → BREAKEVEN`,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+
+        // TP2 check — full close
+        if (!shouldClose) {
+          const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
+                         (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
+          if (tp2Hit) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] TP2 @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`; exitType = "tp2"; }
+        }
+
+        // SL check (breakeven after TP1, or original SL before TP1)
+        if (!shouldClose) {
+          const activeSL = trade.stopLoss;
+          if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
+          if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
         }
 
       } else {
@@ -1791,9 +2257,11 @@ class TradingEngine {
     const confluenceTrades = closedTrades.filter(t => (t.strategy || "confluence") === "confluence");
     const extremeTrades = closedTrades.filter(t => t.strategy === "extreme_rsi");
     const bbReversionTrades = closedTrades.filter(t => t.strategy === "bb_rsi_reversion");
+    const breakoutRetestTrades = closedTrades.filter(t => t.strategy === "breakout_retest");
     const confluenceWinRate = confluenceTrades.length > 0 ? (confluenceTrades.filter(t => (t.pnl || 0) > 0).length / confluenceTrades.length) * 100 : 0;
     const extremeWinRate = extremeTrades.length > 0 ? (extremeTrades.filter(t => (t.pnl || 0) > 0).length / extremeTrades.length) * 100 : 0;
     const bbReversionWinRate = bbReversionTrades.length > 0 ? (bbReversionTrades.filter(t => (t.pnl || 0) > 0).length / bbReversionTrades.length) * 100 : 0;
+    const breakoutRetestWinRate = breakoutRetestTrades.length > 0 ? (breakoutRetestTrades.filter(t => (t.pnl || 0) > 0).length / breakoutRetestTrades.length) * 100 : 0;
 
     // Per-strategy P&L: use pnl (leveraged %) * posWeight to get AUM %, then convert to USD
     const strategyPnlCalc = (trades: typeof closedTrades) => {
@@ -1804,9 +2272,11 @@ class TradingEngine {
     const confluenceStats = strategyPnlCalc(confluenceTrades);
     const extremeStats = strategyPnlCalc(extremeTrades);
     const bbReversionStats = strategyPnlCalc(bbReversionTrades);
+    const breakoutRetestStats = strategyPnlCalc(breakoutRetestTrades);
     const confluencePnlUsd = confluenceStats.pnlUsd;
     const extremePnlUsd = extremeStats.pnlUsd;
     const bbReversionPnlUsd = bbReversionStats.pnlUsd;
+    const breakoutRetestPnlUsd = breakoutRetestStats.pnlUsd;
 
     return {
       isRunning: config?.isRunning || false,
@@ -1840,6 +2310,7 @@ class TradingEngine {
         confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluencePnlUsd.toFixed(4), pnlOfAum: confluenceStats.pnlOfAumPct.toFixed(3), status: "disabled" },
         extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4), pnlOfAum: extremeStats.pnlOfAumPct.toFixed(3), status: "active" },
         bb_rsi_reversion: { trades: bbReversionTrades.length, winRate: bbReversionWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "bb_rsi_reversion").length, pnlUsd: bbReversionPnlUsd.toFixed(4), pnlOfAum: bbReversionStats.pnlOfAumPct.toFixed(3), status: "active" },
+        breakout_retest: { trades: breakoutRetestTrades.length, winRate: breakoutRetestWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "breakout_retest").length, pnlUsd: breakoutRetestPnlUsd.toFixed(4), pnlOfAum: breakoutRetestStats.pnlOfAumPct.toFixed(3), status: "active" },
       },
       // S/R levels per asset (from last scan)
       srLevels: Object.fromEntries(

@@ -211,20 +211,21 @@ export default function Dashboard() {
 
       {/* Strategy Stats */}
       {status?.strategyStats && (
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <Card>
             <CardContent className="p-4">
               <div className="flex items-center gap-2 mb-1">
                 <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">CONFLUENCE</Badge>
-                <span className="text-xs text-muted-foreground">Multi-TF RSI + EMA + Funding</span>
               </div>
-              <div className="flex items-center gap-4 mt-2">
-                <span className="text-sm font-mono">{status.strategyStats.confluence.trades} trades</span>
-                <span className="text-sm font-mono">{status.strategyStats.confluence.winRate}% WR</span>
-                <span className="text-sm font-mono text-muted-foreground">{status.strategyStats.confluence.openPositions} open</span>
-                <span className={cn("text-sm font-mono", parseFloat(status.strategyStats.confluence.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
+              <div className="space-y-1 mt-2">
+                <div className="flex justify-between text-xs font-mono">
+                  <span className="text-muted-foreground">{status.strategyStats.confluence.trades} trades</span>
+                  <span>{status.strategyStats.confluence.winRate}% WR</span>
+                </div>
+                <div className={cn("text-sm font-mono font-medium", parseFloat(status.strategyStats.confluence.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
                   {parseFloat(status.strategyStats.confluence.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.confluence.pnlUsd || "0").toFixed(2)} USDC
-                </span>
+                </div>
+                <div className="text-[10px] text-muted-foreground">disabled</div>
               </div>
             </CardContent>
           </Card>
@@ -232,15 +233,50 @@ export default function Dashboard() {
             <CardContent className="p-4">
               <div className="flex items-center gap-2 mb-1">
                 <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">EXTREME RSI</Badge>
-                <span className="text-xs text-muted-foreground">RSI &lt;10 Long / RSI &gt;80 Short</span>
               </div>
-              <div className="flex items-center gap-4 mt-2">
-                <span className="text-sm font-mono">{status.strategyStats.extreme_rsi.trades} trades</span>
-                <span className="text-sm font-mono">{status.strategyStats.extreme_rsi.winRate}% WR</span>
-                <span className="text-sm font-mono text-muted-foreground">{status.strategyStats.extreme_rsi.openPositions} open</span>
-                <span className={cn("text-sm font-mono", parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
+              <div className="space-y-1 mt-2">
+                <div className="flex justify-between text-xs font-mono">
+                  <span className="text-muted-foreground">{status.strategyStats.extreme_rsi.trades} trades</span>
+                  <span>{status.strategyStats.extreme_rsi.winRate}% WR</span>
+                </div>
+                <div className={cn("text-sm font-mono font-medium", parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
                   {parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0").toFixed(2)} USDC
-                </span>
+                </div>
+                <div className="text-[10px] text-muted-foreground">{status.strategyStats.extreme_rsi.openPositions} open</div>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-2 mb-1">
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-violet-500/10 text-violet-400 border-violet-500/30">BB REVERSION</Badge>
+              </div>
+              <div className="space-y-1 mt-2">
+                <div className="flex justify-between text-xs font-mono">
+                  <span className="text-muted-foreground">{status.strategyStats.bb_rsi_reversion?.trades || 0} trades</span>
+                  <span>{status.strategyStats.bb_rsi_reversion?.winRate || "0.0"}% WR</span>
+                </div>
+                <div className={cn("text-sm font-mono font-medium", parseFloat(status.strategyStats.bb_rsi_reversion?.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
+                  {parseFloat(status.strategyStats.bb_rsi_reversion?.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.bb_rsi_reversion?.pnlUsd || "0").toFixed(2)} USDC
+                </div>
+                <div className="text-[10px] text-muted-foreground">{status.strategyStats.bb_rsi_reversion?.openPositions || 0} open</div>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-2 mb-1">
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-cyan-500/10 text-cyan-400 border-cyan-500/30">BREAKOUT/RETEST</Badge>
+              </div>
+              <div className="space-y-1 mt-2">
+                <div className="flex justify-between text-xs font-mono">
+                  <span className="text-muted-foreground">{status.strategyStats.breakout_retest?.trades || 0} trades</span>
+                  <span>{status.strategyStats.breakout_retest?.winRate || "0.0"}% WR</span>
+                </div>
+                <div className={cn("text-sm font-mono font-medium", parseFloat(status.strategyStats.breakout_retest?.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
+                  {parseFloat(status.strategyStats.breakout_retest?.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.breakout_retest?.pnlUsd || "0").toFixed(2)} USDC
+                </div>
+                <div className="text-[10px] text-muted-foreground">{status.strategyStats.breakout_retest?.openPositions || 0} open</div>
               </div>
             </CardContent>
           </Card>
@@ -372,16 +408,25 @@ export default function Dashboard() {
                       <div>
                         <span className="text-sm font-medium">{getAssetLabel(trade.coin)}</span>
                         <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
-                        {trade.strategy === "extreme_rsi" ? (
+                        {trade.strategy === "extreme_rsi" && (
                           <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">
-                            EXTREME RSI
+                            RSI
                           </Badge>
-                        ) : (
-                          trade.confluenceScore != null && (
-                            <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
-                              C:{trade.confluenceScore}
-                            </Badge>
-                          )
+                        )}
+                        {trade.strategy === "bb_rsi_reversion" && (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-violet-500/10 text-violet-400 border-violet-500/30">
+                            BB
+                          </Badge>
+                        )}
+                        {trade.strategy === "breakout_retest" && (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-cyan-500/10 text-cyan-400 border-cyan-500/30">
+                            B/R
+                          </Badge>
+                        )}
+                        {(!trade.strategy || trade.strategy === "confluence") && trade.confluenceScore != null && (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
+                            C:{trade.confluenceScore}
+                          </Badge>
                         )}
                       </div>
                     </div>
