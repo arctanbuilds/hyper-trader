@@ -79,7 +79,7 @@ export default function Trades() {
             <TableHead className="text-xs">TP2</TableHead>
             <TableHead className="text-xs">C.Score</TableHead>
             <TableHead className="text-xs">R:R</TableHead>
-            <TableHead className="text-xs text-right">P&L %</TableHead>
+            <TableHead className="text-xs text-right">ROI/AUM</TableHead>
             <TableHead className="text-xs text-right">P&L USDC</TableHead>
             <TableHead className="text-xs">Reason</TableHead>
             {showClose && <TableHead className="text-xs w-10"></TableHead>}
@@ -194,9 +194,9 @@ export default function Trades() {
                 </TableCell>
                 <TableCell className={cn(
                   "font-mono text-xs font-medium text-right",
-                  (trade.pnl || 0) >= 0 ? "text-emerald-500" : "text-red-500"
+                  (trade.pnlOfAum || 0) >= 0 ? "text-emerald-500" : "text-red-500"
                 )}>
-                  {(trade.pnl || 0) >= 0 ? "+" : ""}{(trade.pnl || 0).toFixed(2)}%
+                  {(trade.pnlOfAum || 0) >= 0 ? "+" : ""}{(trade.pnlOfAum || 0).toFixed(3)}%
                 </TableCell>
                 <TableCell className={cn(
                   "font-mono text-xs font-medium text-right",

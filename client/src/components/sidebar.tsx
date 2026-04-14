@@ -96,7 +96,7 @@ export default function Sidebar() {
       {/* Quick Stats */}
       <div className="p-3 border-b border-sidebar-border space-y-1">
         <div className="flex justify-between text-xs">
-          <span className="text-muted-foreground">Total P&L</span>
+          <span className="text-muted-foreground">ROI / AUM</span>
           <span className={cn(
             "font-mono font-medium",
             parseFloat(status?.combinedPnl || "0") >= 0 ? "text-emerald-500" : "text-red-500"

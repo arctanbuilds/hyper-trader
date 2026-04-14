@@ -1211,12 +1211,13 @@ class TradingEngine {
       const szd = ac?.szDecimals ?? 2;
       const strategy: StrategyType = (trade.strategy as StrategyType) || "confluence";
 
-      const pnlPct = trade.side === "long"
+      const rawPnlPctMove = trade.side === "long"
         ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100
         : ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100;
-      const leveragedPnl = pnlPct * trade.leverage;
+      const leveragedPnl = rawPnlPctMove * trade.leverage;
       const tradeCapUsd = currentEquity * (trade.size / 100);
       const pnlUsd = tradeCapUsd * (leveragedPnl / 100);
+      // ROI as % of total AUM — this is what we display everywhere
       const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0;
       const currentPeak = Math.max(trade.peakPnlPct || 0, leveragedPnl);
 
@@ -1242,7 +1243,7 @@ class TradingEngine {
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
             const breakEvenSL = trade.entryPrice;
-            await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
+            await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
               reasoning: `[${stratLabel}] TP1 hit @ $${displayPrice(currentPrice, szd)} | SL moved to BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
@@ -1274,7 +1275,7 @@ class TradingEngine {
         // ---- CONFLUENCE EXIT RULES (legacy — for any remaining open confluence trades) ----
 
         // Progressive SL ratcheting
-        const rawPnlPct = pnlPct;
+        const rawPnlPct = rawPnlPctMove;
         const slRatchetThreshold = 0.08;
         const slRatchetDistance = 0.06;
 
@@ -1288,7 +1289,7 @@ class TradingEngine {
           const shouldUpdate = trade.side === "long" ? newSL > currentSL : newSL < currentSL;
           if (shouldUpdate) {
             const lockedProfit = lockPct * trade.leverage;
-            await storage.updateTrade(trade.id, { stopLoss: newSL, tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
+            await storage.updateTrade(trade.id, { stopLoss: newSL, tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
             if (lockedProfit > 0.5) {
               await storage.createLog({ type: "trade_sl_ratchet", message: `[CONFLUENCE] SL RATCHET: ${trade.coin} SL → $${displayPrice(newSL, szd)} (locking ${lockedProfit.toFixed(1)}% profit)`, timestamp: new Date().toISOString() });
             }
@@ -1313,7 +1314,7 @@ class TradingEngine {
           const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
-            await storage.updateTrade(trade.id, { tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
+            await storage.updateTrade(trade.id, { tp1Hit: true, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
               reasoning: `[CONFLUENCE] TP1 hit @ $${displayPrice(currentPrice, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
@@ -1381,7 +1382,7 @@ class TradingEngine {
         }
 
         await storage.updateTrade(trade.id, {
-          exitPrice: currentPrice, pnl: leveragedPnl, pnlPct: leveragedPnl, peakPnlPct: currentPeak,
+          exitPrice: currentPrice, pnl: leveragedPnl, pnlPct: pnlOfAum, peakPnlPct: currentPeak,
           status: "closed", closeReason, closedAt: new Date().toISOString(),
         });
 
@@ -1397,7 +1398,7 @@ class TradingEngine {
           timestamp: new Date().toISOString(),
         });
       } else {
-        await storage.updateTrade(trade.id, { pnl: leveragedPnl, pnlPct: leveragedPnl, peakPnlPct: currentPeak });
+        await storage.updateTrade(trade.id, { pnl: leveragedPnl, pnlPct: pnlOfAum, peakPnlPct: currentPeak });
       }
     }
   }
@@ -1449,23 +1450,26 @@ class TradingEngine {
         }
       } catch (e) { log(`Close error: ${e}`, "engine"); }
     }
-    const pnlPct = trade.side === "long"
+    const leveragedPnl = trade.side === "long"
       ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100 * trade.leverage
       : ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100 * trade.leverage;
     const eq = this.lastKnownEquity || 0;
-    const pnlUsd = (eq * (trade.size / 100)) * (pnlPct / 100);
+    const tradeCapUsd = eq * (trade.size / 100);
+    const pnlUsd = tradeCapUsd * (leveragedPnl / 100);
+    // ROI as % of total AUM
+    const pnlOfAum = eq > 0 ? (pnlUsd / eq) * 100 : 0;
 
     const updated = await storage.updateTrade(trade.id, {
-      exitPrice: currentPrice, pnl: pnlPct, pnlPct, status: "closed",
+      exitPrice: currentPrice, pnl: leveragedPnl, pnlPct: pnlOfAum, status: "closed",
       closeReason: "Manual close", closedAt: new Date().toISOString(),
     });
     await logDecision({
       tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
-      reasoning: `MANUAL CLOSE [${strategy.toUpperCase()}] | P&L: ${pnlPct.toFixed(2)}% ($${pnlUsd.toFixed(2)})`, equity: eq, leverage: trade.leverage, strategy,
+      reasoning: `MANUAL CLOSE [${strategy.toUpperCase()}] | P&L: ${leveragedPnl.toFixed(2)}% (pos) | ROI/AUM: ${pnlOfAum.toFixed(3)}% | $${pnlUsd.toFixed(2)}`, equity: eq, leverage: trade.leverage, strategy,
     });
     await storage.createLog({
       type: "trade_close",
-      message: `Manual close [${strategy.toUpperCase()}] ${trade.side.toUpperCase()} ${trade.coin} | ${pnlPct.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+      message: `Manual close [${strategy.toUpperCase()}] ${trade.side.toUpperCase()} ${trade.coin} | ROI: ${pnlOfAum.toFixed(3)}% ($${pnlUsd.toFixed(2)})`,
       timestamp: new Date().toISOString(),
     });
     return updated;
@@ -1513,10 +1517,13 @@ class TradingEngine {
     const drawdownUsd = this.dayStartEquity - currentEquity;
 
     // Per-trade dollar P&L for open positions
+    // pnl = leveraged position P&L %, pnlPct = ROI as % of AUM
     const openTradesWithUsd = openTrades.map(t => {
       const tradeCapUsd = currentEquity * ((t.size || 10) / 100);
       const pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
-      return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)) };
+      // Also compute pnlOfAum for display (in case pnlPct not yet updated on open trades)
+      const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0;
+      return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
 
     // Per-strategy stats
@@ -1527,19 +1534,18 @@ class TradingEngine {
     const extremeWinRate = extremeTrades.length > 0 ? (extremeTrades.filter(t => (t.pnl || 0) > 0).length / extremeTrades.length) * 100 : 0;
     const bbReversionWinRate = bbReversionTrades.length > 0 ? (bbReversionTrades.filter(t => (t.pnl || 0) > 0).length / bbReversionTrades.length) * 100 : 0;
 
-    // Per-strategy dollar P&L
-    const confluencePnlUsd = confluenceTrades.reduce((s, t) => {
-      const cap = startEq * ((t.size || 10) / 100);
-      return s + cap * ((t.pnl || 0) / 100);
-    }, 0);
-    const extremePnlUsd = extremeTrades.reduce((s, t) => {
-      const cap = startEq * ((t.size || 10) / 100);
-      return s + cap * ((t.pnl || 0) / 100);
-    }, 0);
-    const bbReversionPnlUsd = bbReversionTrades.reduce((s, t) => {
-      const cap = startEq * ((t.size || 10) / 100);
-      return s + cap * ((t.pnl || 0) / 100);
-    }, 0);
+    // Per-strategy P&L: use pnl (leveraged %) * posWeight to get AUM %, then convert to USD
+    const strategyPnlCalc = (trades: typeof closedTrades) => {
+      const pnlOfAumPct = trades.reduce((s, t) => s + ((t.pnl || 0) * ((t.size || 10) / 100)), 0);
+      const pnlUsd = startEq > 0 ? startEq * (pnlOfAumPct / 100) : 0;
+      return { pnlOfAumPct, pnlUsd };
+    };
+    const confluenceStats = strategyPnlCalc(confluenceTrades);
+    const extremeStats = strategyPnlCalc(extremeTrades);
+    const bbReversionStats = strategyPnlCalc(bbReversionTrades);
+    const confluencePnlUsd = confluenceStats.pnlUsd;
+    const extremePnlUsd = extremeStats.pnlUsd;
+    const bbReversionPnlUsd = bbReversionStats.pnlUsd;
 
     return {
       isRunning: config?.isRunning || false,
@@ -1568,9 +1574,9 @@ class TradingEngine {
       openTradesWithUsd,
       // Per-strategy breakdown
       strategyStats: {
-        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluencePnlUsd.toFixed(4), status: "disabled" },
-        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4), status: "active" },
-        bb_rsi_reversion: { trades: bbReversionTrades.length, winRate: bbReversionWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "bb_rsi_reversion").length, pnlUsd: bbReversionPnlUsd.toFixed(4), status: "active" },
+        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluencePnlUsd.toFixed(4), pnlOfAum: confluenceStats.pnlOfAumPct.toFixed(3), status: "disabled" },
+        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4), pnlOfAum: extremeStats.pnlOfAumPct.toFixed(3), status: "active" },
+        bb_rsi_reversion: { trades: bbReversionTrades.length, winRate: bbReversionWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "bb_rsi_reversion").length, pnlUsd: bbReversionPnlUsd.toFixed(4), pnlOfAum: bbReversionStats.pnlOfAumPct.toFixed(3), status: "active" },
       },
     };
   }

@@ -147,7 +147,7 @@ export default function Dashboard() {
         <Card>
           <CardContent className="p-4">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-muted-foreground font-medium">Total P&L</span>
+              <span className="text-xs text-muted-foreground font-medium">Total ROI / AUM</span>
               {combinedPnl >= 0 ? (
                 <TrendingUp className="w-4 h-4 text-emerald-500" />
               ) : (
@@ -332,9 +332,9 @@ export default function Dashboard() {
                     <div className="text-right">
                       <div className={cn(
                         "text-sm font-mono font-medium",
-                        (trade.pnl || 0) >= 0 ? "text-emerald-500" : "text-red-500"
+                        (trade.pnlOfAum || 0) >= 0 ? "text-emerald-500" : "text-red-500"
                       )}>
-                        {(trade.pnl || 0) >= 0 ? "+" : ""}{(trade.pnl || 0).toFixed(2)}%
+                        {(trade.pnlOfAum || 0) >= 0 ? "+" : ""}{(trade.pnlOfAum || 0).toFixed(3)}% AUM
                       </div>
                       <div className={cn(
                         "text-[10px] font-mono",

@@ -98,12 +98,14 @@ export async function registerRoutes(
       ? await storage.getOpenTrades()
       : await storage.getAllTrades(200);
 
-    // Enrich each trade with dollar P&L
+    // Enrich each trade with dollar P&L and ROI as % of AUM
     const equity = tradingEngine.getLastKnownEquity();
     const enriched = trades.map((t: any) => {
       const tradeCapUsd = equity * ((t.size || 10) / 100);
       const pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
-      return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)) };
+      // ROI as % of total AUM
+      const pnlOfAum = equity > 0 ? (pnlUsd / equity) * 100 : 0;
+      return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
     res.json(enriched);
   });
