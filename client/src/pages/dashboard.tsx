@@ -247,6 +247,62 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* S/R Levels */}
+      {status?.srLevels && Object.keys(status.srLevels).length > 0 && (
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <Shield className="w-4 h-4 text-muted-foreground" />
+              <span className="text-sm font-medium">Support / Resistance Levels</span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {Object.entries(status.srLevels).map(([coin, sr]: [string, any]) => (
+                <div key={coin} className="space-y-2">
+                  <span className="text-xs font-semibold text-muted-foreground uppercase">{getAssetLabel(coin)}</span>
+                  {sr.nearestSupport && (
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                        <span className="text-emerald-400">Support</span>
+                      </div>
+                      <span className="font-mono">
+                        ${sr.nearestSupport.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                        <span className="text-muted-foreground ml-1">str:{sr.nearestSupport.strength} t:{sr.nearestSupport.touches}</span>
+                        {sr.atSupport && <Badge className="ml-1 text-[8px] px-1 py-0 bg-emerald-500/20 text-emerald-400 border-0">AT</Badge>}
+                      </span>
+                    </div>
+                  )}
+                  {sr.nearestResistance && (
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
+                        <span className="text-red-400">Resistance</span>
+                      </div>
+                      <span className="font-mono">
+                        ${sr.nearestResistance.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                        <span className="text-muted-foreground ml-1">str:{sr.nearestResistance.strength} t:{sr.nearestResistance.touches}</span>
+                        {sr.atResistance && <Badge className="ml-1 text-[8px] px-1 py-0 bg-red-500/20 text-red-400 border-0">AT</Badge>}
+                      </span>
+                    </div>
+                  )}
+                  {sr.levels && sr.levels.length > 2 && (
+                    <div className="text-[10px] text-muted-foreground">
+                      {sr.levels.slice(0, 4).map((l: any, i: number) => (
+                        <span key={i} className="mr-2">
+                          <span className={l.type === "support" ? "text-emerald-400/60" : "text-red-400/60"}>{l.type === "support" ? "S" : "R"}</span>
+                          ${l.price.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                          <span className="text-muted-foreground/60">({l.strength})</span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Charts Row */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* P&L Chart */}

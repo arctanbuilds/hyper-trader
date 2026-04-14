@@ -1,10 +1,10 @@
 /**
- * HyperTrader — Elite Trading Engine v7 (RSI-Only + BB + Volume + ADX)
+ * HyperTrader — Elite Trading Engine v8 (RSI + BB + Volume + ADX + S/R Levels)
  *
  * SINGLE STRATEGY — EXTREME RSI + BOLLINGER BAND REVERSION:
  *   - Confluence strategy DISABLED based on 12-month BTC backtest analysis
  *   - Mean reversion via extreme RSI outperformed trend-following in 2025-2026
- *   - Enhanced with Bollinger Bands, Volume Exhaustion, and ADX Regime detection
+ *   - Enhanced with Bollinger Bands, Volume Exhaustion, ADX Regime, and S/R Levels
  *
  * TWO ENTRY TRIGGERS:
  *   Trigger A — EXTREME RSI (multi-TF):
@@ -342,6 +342,162 @@ function analyzeVolume(volumes: number[], lookback: number = 20): VolumeAnalysis
   return { isExhausting, volumeRatio, trend };
 }
 
+// ============ SUPPORT / RESISTANCE DETECTION ============
+
+interface SRLevel {
+  price: number;
+  type: "support" | "resistance";
+  touches: number;       // how many times price tested this zone
+  strength: number;      // 1-5 score (touches + recency + rejection strength)
+  lastTouchIdx: number;  // index of most recent touch (for recency)
+  zone: [number, number]; // [low, high] of the clustered zone
+}
+
+interface SRAnalysis {
+  levels: SRLevel[];
+  nearestSupport: SRLevel | null;
+  nearestResistance: SRLevel | null;
+  atSupport: boolean;      // price within 0.3% of a strong support
+  atResistance: boolean;   // price within 0.3% of a strong resistance
+  supportDistance: number; // % distance to nearest support (negative = below)
+  resistanceDistance: number; // % distance to nearest resistance (negative = above)
+}
+
+/**
+ * Detect horizontal S/R levels from OHLCV candle data.
+ * Uses swing high/low pivot detection, then clusters nearby pivots into zones.
+ * Scores each zone by touch count, recency, and rejection strength.
+ */
+function detectSupportResistance(
+  candles: OHLCVCandle[],
+  currentPrice: number,
+  pivotWindow: number = 5,
+  clusterPct: number = 0.003, // 0.3% price cluster tolerance
+): SRAnalysis {
+  const noResult: SRAnalysis = {
+    levels: [], nearestSupport: null, nearestResistance: null,
+    atSupport: false, atResistance: false, supportDistance: 0, resistanceDistance: 0,
+  };
+  if (candles.length < pivotWindow * 2 + 1) return noResult;
+
+  // Step 1: Find swing highs and swing lows (pivot points)
+  const pivots: { price: number; type: "high" | "low"; idx: number; rejectionSize: number }[] = [];
+
+  for (let i = pivotWindow; i < candles.length - pivotWindow; i++) {
+    const c = candles[i];
+    let isSwingHigh = true;
+    let isSwingLow = true;
+
+    for (let j = 1; j <= pivotWindow; j++) {
+      if (candles[i - j].high >= c.high || candles[i + j].high >= c.high) isSwingHigh = false;
+      if (candles[i - j].low <= c.low || candles[i + j].low <= c.low) isSwingLow = false;
+    }
+
+    if (isSwingHigh) {
+      // Rejection strength: how far price wicked above close
+      const rejectionSize = c.high > 0 ? ((c.high - Math.max(c.open, c.close)) / c.high) * 100 : 0;
+      pivots.push({ price: c.high, type: "high", idx: i, rejectionSize });
+    }
+    if (isSwingLow) {
+      const rejectionSize = c.low > 0 ? ((Math.min(c.open, c.close) - c.low) / c.low) * 100 : 0;
+      pivots.push({ price: c.low, type: "low", idx: i, rejectionSize });
+    }
+  }
+
+  if (pivots.length === 0) return noResult;
+
+  // Step 2: Cluster nearby pivots into zones
+  // Sort pivots by price
+  const sorted = [...pivots].sort((a, b) => a.price - b.price);
+  const clusters: { pivots: typeof pivots; avgPrice: number; zoneLow: number; zoneHigh: number }[] = [];
+
+  let currentCluster = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const pctDiff = Math.abs(sorted[i].price - currentCluster[0].price) / currentCluster[0].price;
+    if (pctDiff <= clusterPct) {
+      currentCluster.push(sorted[i]);
+    } else {
+      clusters.push({
+        pivots: currentCluster,
+        avgPrice: currentCluster.reduce((s, p) => s + p.price, 0) / currentCluster.length,
+        zoneLow: Math.min(...currentCluster.map(p => p.price)),
+        zoneHigh: Math.max(...currentCluster.map(p => p.price)),
+      });
+      currentCluster = [sorted[i]];
+    }
+  }
+  clusters.push({
+    pivots: currentCluster,
+    avgPrice: currentCluster.reduce((s, p) => s + p.price, 0) / currentCluster.length,
+    zoneLow: Math.min(...currentCluster.map(p => p.price)),
+    zoneHigh: Math.max(...currentCluster.map(p => p.price)),
+  });
+
+  // Step 3: Score each cluster
+  const totalCandles = candles.length;
+  const levels: SRLevel[] = clusters.map(cl => {
+    const touches = cl.pivots.length;
+    const lastTouchIdx = Math.max(...cl.pivots.map(p => p.idx));
+    const avgRejection = cl.pivots.reduce((s, p) => s + p.rejectionSize, 0) / touches;
+
+    // Recency bonus: levels tested more recently are stronger
+    const recencyScore = lastTouchIdx / totalCandles; // 0-1, higher = more recent
+
+    // Strength: touches (max 3pts) + recency (max 1pt) + rejection (max 1pt)
+    let strength = Math.min(touches, 3);
+    if (recencyScore > 0.7) strength += 1;
+    if (avgRejection > 0.1) strength += 1;
+    strength = Math.min(strength, 5);
+
+    // Determine type based on position relative to current price
+    const type: "support" | "resistance" = cl.avgPrice < currentPrice ? "support" : "resistance";
+
+    return {
+      price: cl.avgPrice,
+      type,
+      touches,
+      strength,
+      lastTouchIdx,
+      zone: [cl.zoneLow, cl.zoneHigh] as [number, number],
+    };
+  });
+
+  // Step 4: Find nearest support/resistance and proximity
+  const supports = levels.filter(l => l.type === "support").sort((a, b) => b.price - a.price); // closest first
+  const resistances = levels.filter(l => l.type === "resistance").sort((a, b) => a.price - b.price); // closest first
+
+  const nearestSupport = supports[0] || null;
+  const nearestResistance = resistances[0] || null;
+
+  const proximityThreshold = 0.003; // 0.3% = "at" a level
+  const atSupport = nearestSupport
+    ? Math.abs(currentPrice - nearestSupport.price) / currentPrice <= proximityThreshold && nearestSupport.strength >= 2
+    : false;
+  const atResistance = nearestResistance
+    ? Math.abs(currentPrice - nearestResistance.price) / currentPrice <= proximityThreshold && nearestResistance.strength >= 2
+    : false;
+
+  const supportDistance = nearestSupport
+    ? ((currentPrice - nearestSupport.price) / currentPrice) * 100
+    : 0;
+  const resistanceDistance = nearestResistance
+    ? ((nearestResistance.price - currentPrice) / currentPrice) * 100
+    : 0;
+
+  // Keep only the top levels by strength (max 8)
+  const topLevels = [...levels].sort((a, b) => b.strength - a.strength).slice(0, 8);
+
+  return {
+    levels: topLevels,
+    nearestSupport,
+    nearestResistance,
+    atSupport,
+    atResistance,
+    supportDistance,
+    resistanceDistance,
+  };
+}
+
 // ============ HYPERLIQUID API ============
 const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
 
@@ -568,6 +724,9 @@ interface EnhancedRsiResult {
   suggestedTP1: number;
   suggestedTP2: number;
   confidenceScore: number;
+  srAnalysis: SRAnalysis;
+  srConfirm: boolean;      // true if S/R supports the trade direction
+  srBlock: boolean;         // true if trading INTO a strong level (should skip)
 }
 
 function detectEnhancedRSI(params: {
@@ -578,8 +737,9 @@ function detectEnhancedRSI(params: {
   volume5m: VolumeAnalysis;
   volume15m: VolumeAnalysis;
   adxValue: number;
+  srAnalysis: SRAnalysis;
 }): EnhancedRsiResult {
-  const { price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d, bb5m, bb15m, volume5m, volume15m, adxValue } = params;
+  const { price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d, bb5m, bb15m, volume5m, volume15m, adxValue, srAnalysis } = params;
 
   const allRSIs = [
     { tf: "1m", rsi: rsi1m },
@@ -595,6 +755,7 @@ function detectEnhancedRSI(params: {
     triggered: false, signal: "none", triggerType: "none", triggerTF: "", triggerRSI: 0, allRSIs,
     bollingerConfirm: false, volumeExhaustion: false, adxRegime, adxValue,
     suggestedSL: 0, suggestedTP1: 0, suggestedTP2: 0, confidenceScore: 0,
+    srAnalysis, srConfirm: false, srBlock: false,
   };
 
   // ---- Trigger A: Extreme RSI (existing logic) ----
@@ -691,6 +852,30 @@ function detectEnhancedRSI(params: {
   // --- Volume exhaustion ---
   const volumeExhaustion = volume5m.isExhausting || volume15m.isExhausting;
 
+  // --- S/R analysis ---
+  let srConfirm = false;
+  let srBlock = false;
+
+  if (signal === "long") {
+    // LONG at support = strong confirmation (price likely to bounce)
+    if (srAnalysis.atSupport && srAnalysis.nearestSupport && srAnalysis.nearestSupport.strength >= 2) {
+      srConfirm = true;
+    }
+    // LONG into strong resistance very close above (< 0.3%) = blocked
+    if (srAnalysis.nearestResistance && srAnalysis.resistanceDistance < 0.3 && srAnalysis.nearestResistance.strength >= 3) {
+      srBlock = true;
+    }
+  } else {
+    // SHORT at resistance = strong confirmation (price likely to reject)
+    if (srAnalysis.atResistance && srAnalysis.nearestResistance && srAnalysis.nearestResistance.strength >= 2) {
+      srConfirm = true;
+    }
+    // SHORT into strong support very close below (< 0.3%) = blocked
+    if (srAnalysis.nearestSupport && srAnalysis.supportDistance < 0.3 && srAnalysis.nearestSupport.strength >= 3) {
+      srBlock = true;
+    }
+  }
+
   // --- Confidence scoring (1-5) ---
   let confidenceScore = 1; // base: trigger fired
   if (bollingerConfirm) confidenceScore++;
@@ -701,6 +886,8 @@ function detectEnhancedRSI(params: {
     ? allRSIs.filter(r => r.rsi > 0 && r.rsi < 40).length
     : allRSIs.filter(r => r.rsi > 0 && r.rsi > 60).length;
   if (agreeingTFs >= 3) confidenceScore++;
+  // S/R confirmation adds confidence
+  if (srConfirm) confidenceScore++;
 
   // --- TP/SL targets based on trigger type + ADX regime ---
   let tp1Pct: number;
@@ -738,6 +925,7 @@ function detectEnhancedRSI(params: {
     bollingerConfirm, volumeExhaustion, adxRegime, adxValue,
     suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2,
     confidenceScore,
+    srAnalysis, srConfirm, srBlock,
   };
 }
 
@@ -757,6 +945,7 @@ class TradingEngine {
   private lastLearningReview = 0; // timestamp of last 24h review
   private pnlResetTimestamp = ""; // only count trades opened after this for P&L display
   private pnlResetEquity = 0;     // AUM at time of reset — the baseline
+  private latestSRLevels: Record<string, SRAnalysis> = {}; // per-asset S/R levels from last scan
 
   private resetLossTrackers() {
     this.drawdownPaused = false;
@@ -959,18 +1148,20 @@ class TradingEngine {
 
         if (volume24h < (config.minVolume24h || 1e6)) continue;
 
-        // Fetch candles: regular closes for RSI on 1m, 1h, 4h, 1d; OHLCV for 5m and 15m (needed for BB, ADX, volume)
-        const [c1m, ohlcv5m, ohlcv15m, c1h, c4h, c1d] = await Promise.all([
+        // Fetch candles: OHLCV for 5m, 15m (BB/ADX/volume), 1h & 4h (S/R detection); closes for RSI
+        const [c1m, ohlcv5m, ohlcv15m, ohlcv1h, ohlcv4h, c1d] = await Promise.all([
           fetchCandles(asset.coin, "1m", 60),
           fetchCandlesOHLCV(asset.coin, "5m", 60),
           fetchCandlesOHLCV(asset.coin, "15m", 60),
-          fetchCandles(asset.coin, "1h", 60),
-          fetchCandles(asset.coin, "4h", 60),
+          fetchCandlesOHLCV(asset.coin, "1h", 100),   // 100 bars = ~4 days for S/R
+          fetchCandlesOHLCV(asset.coin, "4h", 100),   // 100 bars = ~17 days for S/R
           fetchCandles(asset.coin, "1d", 30),
         ]);
 
         const c5m = ohlcv5m.map(c => c.close);
         const c15m = ohlcv15m.map(c => c.close);
+        const c1h = ohlcv1h.map(c => c.close);
+        const c4h = ohlcv4h.map(c => c.close);
 
         if (c1m.length < 15 && c5m.length < 15 && c15m.length < 15 && c1h.length < 15) continue;
 
@@ -999,6 +1190,33 @@ class TradingEngine {
         const volume5m = analyzeVolume(volumes5m, 20);
         const volume15m = analyzeVolume(volumes15m, 20);
 
+        // S/R level detection: merge 1h and 4h OHLCV for multi-timeframe levels
+        // Use 1h as primary (more granular), 4h as secondary (stronger macro levels)
+        const sr1h = detectSupportResistance(ohlcv1h, price, 5, 0.003);
+        const sr4h = detectSupportResistance(ohlcv4h, price, 3, 0.005);
+        // Merge: prefer 4h levels (stronger macro zones), then fill with 1h
+        const mergedSRLevels = [...sr4h.levels, ...sr1h.levels]
+          .sort((a, b) => b.strength - a.strength)
+          .slice(0, 8);
+        // Rebuild analysis from merged levels
+        const srSupports = mergedSRLevels.filter(l => l.type === "support").sort((a, b) => b.price - a.price);
+        const srResistances = mergedSRLevels.filter(l => l.type === "resistance").sort((a, b) => a.price - b.price);
+        const srNearestSup = srSupports[0] || null;
+        const srNearestRes = srResistances[0] || null;
+        const srProximity = 0.003;
+        const srAnalysis: SRAnalysis = {
+          levels: mergedSRLevels,
+          nearestSupport: srNearestSup,
+          nearestResistance: srNearestRes,
+          atSupport: srNearestSup ? Math.abs(price - srNearestSup.price) / price <= srProximity && srNearestSup.strength >= 2 : false,
+          atResistance: srNearestRes ? Math.abs(price - srNearestRes.price) / price <= srProximity && srNearestRes.strength >= 2 : false,
+          supportDistance: srNearestSup ? ((price - srNearestSup.price) / price) * 100 : 0,
+          resistanceDistance: srNearestRes ? ((srNearestRes.price - price) / price) * 100 : 0,
+        };
+
+        // Store S/R for dashboard access
+        this.latestSRLevels[asset.coin] = srAnalysis;
+
         // Calculate confluence for dashboard display only (upsertMarketScan)
         const confluence = calculateConfluence({
           price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
@@ -1016,10 +1234,10 @@ class TradingEngine {
           timestamp: new Date().toISOString(),
         });
 
-        // --- ENHANCED RSI + BB DETECTION ---
+        // --- ENHANCED RSI + BB + S/R DETECTION ---
         const enhanced = detectEnhancedRSI({
           price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d,
-          bb5m, bb15m, volume5m, volume15m, adxValue,
+          bb5m, bb15m, volume5m, volume15m, adxValue, srAnalysis,
         });
         if (enhanced.triggered) {
           enhancedSignals.push({
@@ -1060,11 +1278,26 @@ class TradingEngine {
           reasoning.push(`TRIGGER: RSI ${sig.enhanced.triggerRSI.toFixed(1)} on ${sig.enhanced.triggerTF} (${side === "long" ? "oversold" : "overbought"})`);
           reasoning.push(`All RSIs: ${sig.enhanced.allRSIs.map(r => `${r.tf}:${r.rsi.toFixed(1)}`).join(", ")}`);
           reasoning.push(`BB confirm: ${sig.enhanced.bollingerConfirm} | Vol exhaust: ${sig.enhanced.volumeExhaustion} | ADX: ${sig.enhanced.adxValue.toFixed(1)} (${sig.enhanced.adxRegime})`);
-          reasoning.push(`Confidence: ${sig.enhanced.confidenceScore}/5`);
+          // S/R level info
+          const sr = sig.enhanced.srAnalysis;
+          const srInfo: string[] = [];
+          if (sr.nearestSupport) srInfo.push(`Sup: $${sr.nearestSupport.price.toFixed(2)}(str:${sr.nearestSupport.strength},t:${sr.nearestSupport.touches}) ${sr.supportDistance.toFixed(3)}% away`);
+          if (sr.nearestResistance) srInfo.push(`Res: $${sr.nearestResistance.price.toFixed(2)}(str:${sr.nearestResistance.strength},t:${sr.nearestResistance.touches}) ${sr.resistanceDistance.toFixed(3)}% away`);
+          if (sig.enhanced.srConfirm) srInfo.push(`S/R CONFIRMS ${side.toUpperCase()}`);
+          if (sig.enhanced.srBlock) srInfo.push(`S/R BLOCKS — trading INTO strong level`);
+          if (srInfo.length > 0) reasoning.push(`S/R: ${srInfo.join(" | ")}`);
+          reasoning.push(`Confidence: ${sig.enhanced.confidenceScore}/6`);
           reasoning.push(`Price: $${displayPrice(sig.price, sig.asset.szDecimals)}`);
           reasoning.push(`TP1: $${displayPrice(sig.enhanced.suggestedTP1, sig.asset.szDecimals)} | TP2: $${displayPrice(sig.enhanced.suggestedTP2, sig.asset.szDecimals)}`);
           reasoning.push(`SL: $${displayPrice(sig.enhanced.suggestedSL, sig.asset.szDecimals)} → moves to BE after TP1`);
           reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(sig.fundingRate * 100).toFixed(4)}%`);
+
+          // S/R block: skip if trading into a strong level
+          if (sig.enhanced.srBlock) {
+            reasoning.push(`BLOCKED BY S/R: ${side === "long" ? "Strong resistance" : "Strong support"} too close — likely reversal`);
+            await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
+            continue;
+          }
 
           // Check learning insights
           const insightCheck = await checkInsights({ coin: sig.asset.coin, side, session: sessionInfo.session, confluenceScore: 7, dayOfWeek: now.getUTCDay() });
@@ -1147,10 +1380,10 @@ class TradingEngine {
             takeProfit2: sig.enhanced.suggestedTP2,
             tp1Hit: false,
             confluenceScore: 0,
-            confluenceDetails: `${sig.enhanced.triggerType.toUpperCase()}: RSI ${sig.enhanced.triggerRSI.toFixed(1)} on ${sig.enhanced.triggerTF} | BB:${sig.enhanced.bollingerConfirm} Vol:${sig.enhanced.volumeExhaustion} ADX:${sig.enhanced.adxValue.toFixed(1)}(${sig.enhanced.adxRegime}) Conf:${sig.enhanced.confidenceScore}/5`,
+            confluenceDetails: `${sig.enhanced.triggerType.toUpperCase()}: RSI ${sig.enhanced.triggerRSI.toFixed(1)} on ${sig.enhanced.triggerTF} | BB:${sig.enhanced.bollingerConfirm} Vol:${sig.enhanced.volumeExhaustion} ADX:${sig.enhanced.adxValue.toFixed(1)}(${sig.enhanced.adxRegime}) S/R:${sig.enhanced.srConfirm ? 'CONFIRM' : 'none'} Conf:${sig.enhanced.confidenceScore}/6`,
             riskRewardRatio: 0,
             status: "open",
-            reason: `[${strategyKey.toUpperCase()}] ${side.toUpperCase()} | RSI ${sig.enhanced.triggerRSI.toFixed(1)} @${sig.enhanced.triggerTF} | ADX:${sig.enhanced.adxValue.toFixed(0)}(${sig.enhanced.adxRegime}) | Conf:${sig.enhanced.confidenceScore}/5 | ${leverage}x MAX | $${capitalForTrade.toFixed(0)}`,
+            reason: `[${strategyKey.toUpperCase()}] ${side.toUpperCase()} | RSI ${sig.enhanced.triggerRSI.toFixed(1)} @${sig.enhanced.triggerTF} | ADX:${sig.enhanced.adxValue.toFixed(0)}(${sig.enhanced.adxRegime}) | S/R:${sig.enhanced.srConfirm ? 'Y' : 'N'} | Conf:${sig.enhanced.confidenceScore}/6 | ${leverage}x MAX | $${capitalForTrade.toFixed(0)}`,
             setupType: strategyKey === "bb_rsi_reversion" ? "bb_rsi_reversion" : "extreme_rsi",
             strategy: strategyKey,
             openedAt: new Date().toISOString(),
@@ -1168,7 +1401,7 @@ class TradingEngine {
 
           await storage.createLog({
             type: "trade_open",
-            message: `[${strategyKey.toUpperCase()}] ${side.toUpperCase()} ${sig.asset.displayName} @ $${displayPrice(sig.price, sig.asset.szDecimals)} | ${leverage}x | RSI ${sig.enhanced.triggerRSI.toFixed(1)} @${sig.enhanced.triggerTF} | Conf:${sig.enhanced.confidenceScore}/5 | $${capitalForTrade.toFixed(0)}`,
+            message: `[${strategyKey.toUpperCase()}] ${side.toUpperCase()} ${sig.asset.displayName} @ $${displayPrice(sig.price, sig.asset.szDecimals)} | ${leverage}x | RSI ${sig.enhanced.triggerRSI.toFixed(1)} @${sig.enhanced.triggerTF} | S/R:${sig.enhanced.srConfirm ? 'CONFIRM' : '-'} | Conf:${sig.enhanced.confidenceScore}/6 | $${capitalForTrade.toFixed(0)}`,
             data: JSON.stringify(trade),
             timestamp: new Date().toISOString(),
           });
@@ -1608,6 +1841,19 @@ class TradingEngine {
         extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4), pnlOfAum: extremeStats.pnlOfAumPct.toFixed(3), status: "active" },
         bb_rsi_reversion: { trades: bbReversionTrades.length, winRate: bbReversionWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "bb_rsi_reversion").length, pnlUsd: bbReversionPnlUsd.toFixed(4), pnlOfAum: bbReversionStats.pnlOfAumPct.toFixed(3), status: "active" },
       },
+      // S/R levels per asset (from last scan)
+      srLevels: Object.fromEntries(
+        Object.entries(this.latestSRLevels).map(([coin, sr]) => [
+          coin,
+          {
+            nearestSupport: sr.nearestSupport ? { price: sr.nearestSupport.price, strength: sr.nearestSupport.strength, touches: sr.nearestSupport.touches } : null,
+            nearestResistance: sr.nearestResistance ? { price: sr.nearestResistance.price, strength: sr.nearestResistance.strength, touches: sr.nearestResistance.touches } : null,
+            atSupport: sr.atSupport,
+            atResistance: sr.atResistance,
+            levels: sr.levels.slice(0, 6).map(l => ({ price: l.price, type: l.type, strength: l.strength, touches: l.touches })),
+          },
+        ])
+      ),
     };
   }
 }
