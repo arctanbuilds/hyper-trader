@@ -190,14 +190,20 @@ export default function Dashboard() {
         <Card>
           <CardContent className="p-4">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-muted-foreground font-medium">Win Rate</span>
+              <span className="text-xs text-muted-foreground font-medium">Win Rate / Pace</span>
               <Target className="w-4 h-4 text-muted-foreground" />
             </div>
             <div className="text-lg font-semibold font-mono" data-testid="text-win-rate">
               {status?.winRate || "0.0"}%
             </div>
             <p className="text-[10px] text-muted-foreground mt-1">
-              {status?.closedTrades || 0} closed trades
+              {status?.closedTrades || 0} closed | Today: {status?.dailyTradeCount || 0}/{status?.dailyTradeTarget || 20}
+            </p>
+            <p className={cn(
+              "text-[10px] font-mono mt-0.5",
+              parseFloat(status?.drawdownPct || "0") > 30 ? "text-red-400" : parseFloat(status?.drawdownPct || "0") > 15 ? "text-amber-400" : "text-muted-foreground"
+            )}>
+              DD: {status?.drawdownPct || "0.00"}% ({fmtUsd(-(parseFloat(status?.drawdownUsd || "0")))}) {status?.drawdownPaused ? "⏸ PAUSED" : ""}
             </p>
           </CardContent>
         </Card>

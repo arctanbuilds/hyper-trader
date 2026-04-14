@@ -462,14 +462,13 @@ function detectExtremeRSI(params: {
 class TradingEngine {
   private scanTimer: NodeJS.Timeout | null = null;
   private isScanning = false;
-  private dailyLoss = 0;
-  private weeklyLoss = 0;
-  private dailyLossUsd = 0;
-  private weeklyLossUsd = 0;
-  private dailyLossReset = "";
-  private weeklyLossReset = "";
   private lastKnownEquity = 0;
   private startingEquity = 0;
+  private dayStartEquity = 0;       // equity at start of trading day
+  private dayStartDate = "";         // YYYY-MM-DD
+  private dailyTradeCount = 0;       // trades opened today
+  private dailyTradeDate = "";       // YYYY-MM-DD for trade counter
+  private drawdownPaused = false;    // true if 50% drawdown hit today
   private scanCount = 0;
   private lastLearningReview = 0; // timestamp of last 24h review
 
@@ -483,6 +482,8 @@ class TradingEngine {
       if (state?.marginSummary?.accountValue) {
         this.lastKnownEquity = parseFloat(state.marginSummary.accountValue);
         this.startingEquity = this.lastKnownEquity;
+        this.dayStartEquity = this.lastKnownEquity;
+        this.dayStartDate = new Date().toISOString().split("T")[0];
       }
     }
 
@@ -507,12 +508,21 @@ class TradingEngine {
     await storage.createLog({ type: "system", message: "Trading engine stopped", timestamp: new Date().toISOString() });
   }
 
-  private resetLossTrackers() {
+  private checkNewDay() {
     const today = new Date().toISOString().split("T")[0];
-    const ws = new Date(); ws.setDate(ws.getDate() - ws.getDay());
-    const week = ws.toISOString().split("T")[0];
-    if (this.dailyLossReset !== today) { this.dailyLoss = 0; this.dailyLossUsd = 0; this.dailyLossReset = today; }
-    if (this.weeklyLossReset !== week) { this.weeklyLoss = 0; this.weeklyLossUsd = 0; this.weeklyLossReset = week; }
+    if (this.dayStartDate !== today) {
+      // New trading day — reset drawdown baseline to current equity
+      this.dayStartEquity = this.lastKnownEquity;
+      this.dayStartDate = today;
+      this.drawdownPaused = false;
+      this.dailyTradeCount = 0;
+      this.dailyTradeDate = today;
+      log(`New trading day ${today} — AUM baseline: $${this.dayStartEquity.toFixed(2)}`, "engine");
+    }
+    if (this.dailyTradeDate !== today) {
+      this.dailyTradeCount = 0;
+      this.dailyTradeDate = today;
+    }
   }
 
   private async scheduleNextScan() {
@@ -545,7 +555,7 @@ class TradingEngine {
     try {
       const config = await storage.getConfig();
       if (!config?.isRunning) { this.isScanning = false; return; }
-      this.resetLossTrackers();
+      this.checkNewDay();
       const equity = await this.refreshEquity();
 
       if (equity <= 0) {
@@ -582,23 +592,30 @@ class TradingEngine {
         });
       }
 
-      // Circuit breakers
-      const maxDailyLoss = config.maxDailyLossPct || 0.75;
-      const maxWeeklyLoss = config.maxWeeklyLossPct || 1.5;
-      if (this.dailyLoss >= maxDailyLoss) {
-        await logDecision({ coin: "ALL", action: "circuit_breaker", price: 0, reasoning: `Daily loss ${this.dailyLoss.toFixed(2)}% >= ${maxDailyLoss}% limit ($${this.dailyLossUsd.toFixed(2)}) — all entries paused`, equity, strategy: "confluence" });
-        await storage.createLog({ type: "circuit_breaker", message: `Daily loss limit: ${this.dailyLoss.toFixed(2)}% ($${this.dailyLossUsd.toFixed(2)})`, timestamp: new Date().toISOString() });
-        this.isScanning = false; this.scheduleNextScan(); return;
+      // 50% DRAWDOWN CHECK — from day-start AUM
+      if (this.dayStartEquity > 0) {
+        const drawdownPct = ((this.dayStartEquity - equity) / this.dayStartEquity) * 100;
+        if (drawdownPct >= 50 && !this.drawdownPaused) {
+          this.drawdownPaused = true;
+          const msg = `50% DRAWDOWN HIT — Day start: $${this.dayStartEquity.toFixed(2)} → Current: $${equity.toFixed(2)} (${drawdownPct.toFixed(1)}% down). Pausing new entries for today. Triggering learning review.`;
+          await logDecision({ coin: "ALL", action: "drawdown_stop", price: 0, reasoning: msg, equity, strategy: "confluence" });
+          await storage.createLog({ type: "drawdown_stop", message: msg, timestamp: new Date().toISOString() });
+          log(msg, "engine");
+          // Trigger immediate deep learning review to analyze mistakes
+          try {
+            await run24hReview();
+            this.lastLearningReview = Date.now();
+            await storage.createLog({ type: "learning_24h", message: "DRAWDOWN REVIEW — emergency learning review triggered by 50% drawdown", timestamp: new Date().toISOString() });
+          } catch (e) { log(`Drawdown review error: ${e}`, "engine"); }
+        }
       }
-      if (this.weeklyLoss >= maxWeeklyLoss) {
-        await logDecision({ coin: "ALL", action: "circuit_breaker", price: 0, reasoning: `Weekly loss ${this.weeklyLoss.toFixed(2)}% >= ${maxWeeklyLoss}% limit — all entries paused`, equity, strategy: "confluence" });
-        this.isScanning = false; this.scheduleNextScan(); return;
-      }
+      // If drawdown paused, still check exits but skip new entries
+      const canOpenNew = !this.drawdownPaused;
 
       const sessionInfo = getSessionInfo();
       const useSessionFilter = config.useSessionFilter !== false;
       
-      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | DUAL STRATEGY`, "engine");
+      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | DUAL STRATEGY | Trades today: ${this.dailyTradeCount}/${TARGET_DAILY_TRADES}${this.drawdownPaused ? " | DRAWDOWN PAUSED" : ""}`, "engine");
 
       // Fetch market data
       const [mainData, xyzData] = await Promise.all([fetchMetaAndAssetCtxs(""), fetchMetaAndAssetCtxs("xyz")]);
@@ -715,14 +732,22 @@ class TradingEngine {
       });
 
       let slotsUsed = 0;
-      const minConfluence = config.minConfluenceScore || 3;
-      const minRR = config.minRiskRewardRatio || 0.8;
       const now = new Date();
+      const hourOfDay = now.getUTCHours() + now.getUTCMinutes() / 60;
+      const TARGET_DAILY_TRADES = 20;
+      const expectedByNow = Math.max(1, Math.floor((hourOfDay / 24) * TARGET_DAILY_TRADES));
+      const behindPace = this.dailyTradeCount < expectedByNow;
+      // Adaptive thresholds: loosen when behind pace on daily trade target
+      const minConfluence = behindPace ? Math.max(2, (config.minConfluenceScore || 3) - 1) : (config.minConfluenceScore || 3);
+      const minRR = behindPace ? Math.max(0.5, (config.minRiskRewardRatio || 0.8) - 0.2) : (config.minRiskRewardRatio || 0.8);
+      if (behindPace && this.scanCount % 20 === 0) {
+        log(`PACE: ${this.dailyTradeCount}/${TARGET_DAILY_TRADES} trades (expected ~${expectedByNow} by now) — lowered C:${minConfluence} R:R:${minRR.toFixed(1)}`, "engine");
+      }
 
       // =============================================
       // EXECUTE STRATEGY 1: CONFLUENCE ENTRIES
       // =============================================
-      if (slotsAvailable > slotsUsed && confluenceSignals.length > 0) {
+      if (canOpenNew && slotsAvailable > slotsUsed && confluenceSignals.length > 0) {
         for (const sig of confluenceSignals.slice(0, slotsAvailable - slotsUsed)) {
           if (openByCoinStrategy.has(`${sig.asset.coin}_confluence`)) continue;
 
@@ -871,13 +896,14 @@ class TradingEngine {
 
           openByCoinStrategy.add(`${sig.asset.coin}_confluence`);
           slotsUsed++;
+          this.dailyTradeCount++;
         }
       }
 
       // =============================================
       // EXECUTE STRATEGY 2: EXTREME RSI ENTRIES
       // =============================================
-      if (slotsAvailable > slotsUsed && extremeRsiSignals.length > 0) {
+      if (canOpenNew && slotsAvailable > slotsUsed && extremeRsiSignals.length > 0) {
         for (const sig of extremeRsiSignals.slice(0, slotsAvailable - slotsUsed)) {
           if (sig.extreme.signal === "none") continue;
           if (openByCoinStrategy.has(`${sig.asset.coin}_extreme_rsi`)) continue;
@@ -995,6 +1021,7 @@ class TradingEngine {
 
           openByCoinStrategy.add(`${sig.asset.coin}_extreme_rsi`);
           slotsUsed++;
+          this.dailyTradeCount++;
         }
       }
 
@@ -1041,6 +1068,7 @@ class TradingEngine {
       const leveragedPnl = pnlPct * trade.leverage;
       const tradeCapUsd = currentEquity * (trade.size / 100);
       const pnlUsd = tradeCapUsd * (leveragedPnl / 100);
+      const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0; // ROI as % of total AUM
       const currentPeak = Math.max(trade.peakPnlPct || 0, leveragedPnl);
 
       let shouldClose = false;
@@ -1185,10 +1213,6 @@ class TradingEngine {
       // ============================================================
 
       if (shouldClose) {
-        if (leveragedPnl < 0) {
-          this.dailyLoss += Math.abs(leveragedPnl); this.weeklyLoss += Math.abs(leveragedPnl);
-          this.dailyLossUsd += Math.abs(pnlUsd); this.weeklyLossUsd += Math.abs(pnlUsd);
-        }
 
         if (config.apiSecret && config.walletAddress) {
           try {
@@ -1214,13 +1238,13 @@ class TradingEngine {
 
         await logDecision({
           tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
-          reasoning: `EXIT: ${closeReason} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | Held: ${trade.openedAt ? Math.round((Date.now() - new Date(trade.openedAt).getTime()) / 60000) : 0}min | Peak: ${currentPeak.toFixed(2)}%`,
+          reasoning: `EXIT: ${closeReason} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | ROI/AUM: ${pnlOfAum.toFixed(3)}% | Held: ${trade.openedAt ? Math.round((Date.now() - new Date(trade.openedAt).getTime()) / 60000) : 0}min | Peak: ${currentPeak.toFixed(2)}%`,
           equity: currentEquity, leverage: trade.leverage, strategy,
         });
 
         await storage.createLog({
           type: "trade_close",
-          message: `CLOSED [${strategy.toUpperCase()}] ${trade.side.toUpperCase()} ${trade.coin} | ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | ${closeReason}`,
+          message: `CLOSED [${strategy.toUpperCase()}] ${trade.side.toUpperCase()} ${trade.coin} | ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | AUM: ${pnlOfAum.toFixed(3)}% | ${closeReason}`,
           timestamp: new Date().toISOString(),
         });
       } else {
@@ -1335,8 +1359,9 @@ class TradingEngine {
     const closedPnlUsd = startEq > 0 ? startEq * (closedPnlOfAum / 100) : 0;
     const openPnlUsd = currentEquity > 0 ? currentEquity * (openPnlOfAum / 100) : 0;
     const combinedPnlUsd = closedPnlUsd + openPnlUsd;
-    const dailyLossUsd = currentEquity > 0 ? currentEquity * (this.dailyLoss / 100) : 0;
-    const weeklyLossUsd = currentEquity > 0 ? currentEquity * (this.weeklyLoss / 100) : 0;
+    // Drawdown from day start
+    const drawdownPct = this.dayStartEquity > 0 ? ((this.dayStartEquity - currentEquity) / this.dayStartEquity) * 100 : 0;
+    const drawdownUsd = this.dayStartEquity - currentEquity;
 
     // Per-trade dollar P&L for open positions
     const openTradesWithUsd = openTrades.map(t => {
@@ -1375,10 +1400,12 @@ class TradingEngine {
       combinedPnlUsd: combinedPnlUsd.toFixed(4),
       session: si.session,
       sessionDescription: si.description,
-      dailyLoss: this.dailyLoss.toFixed(2),
-      dailyLossUsd: dailyLossUsd.toFixed(4),
-      weeklyLoss: this.weeklyLoss.toFixed(2),
-      weeklyLossUsd: weeklyLossUsd.toFixed(4),
+      drawdownPct: drawdownPct.toFixed(2),
+      drawdownUsd: drawdownUsd.toFixed(4),
+      drawdownPaused: this.drawdownPaused,
+      dayStartEquity: this.dayStartEquity.toFixed(2),
+      dailyTradeCount: this.dailyTradeCount,
+      dailyTradeTarget: 20,
       equity: currentEquity.toFixed(2),
       startingEquity: startEq.toFixed(2),
       learningStats: stats,
