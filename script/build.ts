@@ -58,7 +58,9 @@ async function buildAll() {
     alias: {
       "@shared": path.resolve("shared"),
     },
-    minify: false,
+    minifySyntax: true,
+    minifyWhitespace: true,
+    minifyIdentifiers: false,
     external: externals,
     logLevel: "info",
   });
