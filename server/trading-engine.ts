@@ -755,6 +755,8 @@ class TradingEngine {
   private drawdownPaused = false;    // true if 50% drawdown hit today
   private scanCount = 0;
   private lastLearningReview = 0; // timestamp of last 24h review
+  private pnlResetTimestamp = ""; // only count trades opened after this for P&L display
+  private pnlResetEquity = 0;     // AUM at time of reset — the baseline
 
   private resetLossTrackers() {
     this.drawdownPaused = false;
@@ -776,6 +778,10 @@ class TradingEngine {
         this.dayStartDate = new Date().toISOString().split("T")[0];
       }
     }
+
+    // Auto-reset P&L baseline to current AUM on every start
+    this.pnlResetTimestamp = new Date().toISOString();
+    this.pnlResetEquity = this.lastKnownEquity;
 
     // Restore last review time from DB
     const lastReviewTime = await storage.getLastReviewTime();
@@ -1481,20 +1487,41 @@ class TradingEngine {
     return this.lastKnownEquity;
   }
 
+  async resetPnlBaseline(): Promise<{ resetEquity: number; resetTimestamp: string }> {
+    const equity = await this.refreshEquity();
+    this.pnlResetTimestamp = new Date().toISOString();
+    this.pnlResetEquity = equity;
+    this.startingEquity = equity;
+    this.dayStartEquity = equity;
+    await storage.createLog({
+      type: "system",
+      message: `P&L RESET: New baseline AUM $${equity.toFixed(2)} at ${this.pnlResetTimestamp}`,
+      timestamp: this.pnlResetTimestamp,
+    });
+    log(`P&L baseline reset — new AUM: $${equity.toFixed(2)}`, "engine");
+    return { resetEquity: equity, resetTimestamp: this.pnlResetTimestamp };
+  }
+
   async getStatus() {
     const config = await storage.getConfig();
     const openTrades = await storage.getOpenTrades();
     const allTrades = await storage.getAllTrades();
-    const closedTrades = allTrades.filter(t => t.status === "closed");
-    const winTrades = closedTrades.filter(t => (t.pnl || 0) > 0);
-    const winRate = closedTrades.length > 0 ? (winTrades.length / closedTrades.length) * 100 : 0;
+    // Only count trades opened after the P&L reset for the main display
+    const resetTs = this.pnlResetTimestamp;
+    const activeTrades = resetTs
+      ? allTrades.filter(t => t.openedAt >= resetTs)
+      : allTrades;
+    const activeClosedTrades = activeTrades.filter(t => t.status === "closed");
+    const allClosedTrades = allTrades.filter(t => t.status === "closed"); // for all-time stats
+    const winTrades = activeClosedTrades.filter(t => (t.pnl || 0) > 0);
+    const winRate = activeClosedTrades.length > 0 ? (winTrades.length / activeClosedTrades.length) * 100 : 0;
     const si = getSessionInfo();
     const stats = await getLearningStats();
 
     const currentEquity = this.lastKnownEquity || 0;
-    const startEq = this.startingEquity || currentEquity;
+    const startEq = this.pnlResetEquity || this.startingEquity || currentEquity;
 
-    const closedPnlOfAum = closedTrades.reduce((s, t) => {
+    const closedPnlOfAum = activeClosedTrades.reduce((s, t) => {
       const leveragedPnl = t.pnl || 0;
       const posWeight = (t.size || 10) / 100;
       return s + (leveragedPnl * posWeight);
@@ -1526,7 +1553,8 @@ class TradingEngine {
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
 
-    // Per-strategy stats
+    // Per-strategy stats (using post-reset trades only)
+    const closedTrades = activeClosedTrades; // alias for strategy breakdown
     const confluenceTrades = closedTrades.filter(t => (t.strategy || "confluence") === "confluence");
     const extremeTrades = closedTrades.filter(t => t.strategy === "extreme_rsi");
     const bbReversionTrades = closedTrades.filter(t => t.strategy === "bb_rsi_reversion");
@@ -1550,7 +1578,8 @@ class TradingEngine {
     return {
       isRunning: config?.isRunning || false,
       openPositions: openTrades.length,
-      totalTrades: allTrades.length,
+      totalTrades: activeTrades.length,
+      totalTradesAllTime: allTrades.length,
       closedTrades: closedTrades.length,
       winRate: winRate.toFixed(1),
       totalPnl: closedPnlOfAum.toFixed(2),
@@ -1569,10 +1598,11 @@ class TradingEngine {
       dailyTradeTarget: 20,
       equity: currentEquity.toFixed(2),
       startingEquity: startEq.toFixed(2),
+      pnlResetTimestamp: this.pnlResetTimestamp || null,
       learningStats: stats,
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
-      // Per-strategy breakdown
+      // Per-strategy breakdown (post-reset only)
       strategyStats: {
         confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluencePnlUsd.toFixed(4), pnlOfAum: confluenceStats.pnlOfAumPct.toFixed(3), status: "disabled" },
         extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4), pnlOfAum: extremeStats.pnlOfAumPct.toFixed(3), status: "active" },

@@ -127,6 +127,17 @@ export async function registerRoutes(
     }
   });
 
+  // ============ P&L RESET ============
+  app.post("/api/pnl/reset", async (_req, res) => {
+    try {
+      const result = await tradingEngine.resetPnlBaseline();
+      broadcast({ type: "pnl_reset", data: result });
+      res.json({ success: true, ...result });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ============ P&L ============
   app.get("/api/pnl", async (req, res) => {
     const since = req.query.since as string | undefined;
