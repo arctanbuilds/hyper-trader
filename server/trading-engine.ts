@@ -541,6 +541,7 @@ class TradingEngine {
         if (val > 0) {
           this.lastKnownEquity = val;
           if (this.startingEquity === 0) this.startingEquity = val;
+          if (this.dayStartEquity === 0) this.dayStartEquity = val;
         }
       }
     } catch { /* use last known */ }
