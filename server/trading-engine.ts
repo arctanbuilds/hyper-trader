@@ -1033,8 +1033,9 @@ class TradingEngine {
       await this.takePnlSnapshot(equity);
 
     } catch (e) {
-      log(`Scan error: ${e}`, "engine");
-      await storage.createLog({ type: "error", message: `Scan error: ${e}`, timestamp: new Date().toISOString() }).catch(() => {});
+      const stack = e instanceof Error ? e.stack : String(e);
+      log(`Scan error: ${stack}`, "engine");
+      await storage.createLog({ type: "error", message: `Scan error: ${stack}`.slice(0, 500), timestamp: new Date().toISOString() }).catch(() => {});
     }
     this.isScanning = false;
     this.scheduleNextScan();
