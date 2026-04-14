@@ -1,32 +1,32 @@
 /**
- * HyperTrader — Elite Trading Engine v5 (Dual Strategy + 24h Learning)
- * 
- * TWO INDEPENDENT STRATEGIES running in parallel:
- * 
- * 1. CONFLUENCE STRATEGY (original):
- *    - Multi-TF RSI + EMA + funding + volume confluence scoring (3/7+ to enter)
- *    - SL: 0.25%, TP1: 0.35%, TP2: 0.7%
- *    - Progressive SL ratcheting + quick profit at 3%+ leveraged P&L
- * 
- * 2. EXTREME RSI STRATEGY (multi-TF):
- *    - RSI < 10 on ANY timeframe → LONG
- *    - RSI > 80 on ANY timeframe → SHORT (user said <80 but meant >80 for short)
- *    - TP1: 0.3% of position, TP2: 1% of position
- *    - After TP1 hit → move SL to breakeven (entry price)
- *    - No confluence required — extreme RSI is the only trigger
- * 
- * Both strategies:
- *   - Share the same position limit pool (maxPositions total)
- *   - Have independent entry logic — one doesn't block the other
- *   - Have independent exit logic — different TP/SL rules per strategy
- *   - Both log full reasoning to the learning engine
- *   - Learning engine reviews ALL trades from BOTH strategies
- * 
+ * HyperTrader — Elite Trading Engine v7 (RSI-Only + BB + Volume + ADX)
+ *
+ * SINGLE STRATEGY — EXTREME RSI + BOLLINGER BAND REVERSION:
+ *   - Confluence strategy DISABLED based on 12-month BTC backtest analysis
+ *   - Mean reversion via extreme RSI outperformed trend-following in 2025-2026
+ *   - Enhanced with Bollinger Bands, Volume Exhaustion, and ADX Regime detection
+ *
+ * TWO ENTRY TRIGGERS:
+ *   Trigger A — EXTREME RSI (multi-TF):
+ *     - RSI < 10 on 2+ of (1m, 5m, 15m) → LONG
+ *     - RSI > 80 on 2+ of (1m, 5m, 15m) → SHORT
+ *     - BB/volume/ADX are bonus confirmations (increase confidence)
+ *   Trigger B — BOLLINGER BAND REVERSION (NEW):
+ *     - Price touches 2-3 SD Bollinger Band on 5m OR 15m
+ *     - RSI on same TF confirms: < 30 for long, > 70 for short
+ *     - Volume exhaustion + ADX < 25 preferred but not required
+ *
+ * ADX REGIME ADAPTATION:
+ *   - ADX < 25 (ranging): standard TP targets
+ *   - ADX >= 25 (trending): widen TP by 50%, reduce position to 75%
+ *
  * 24h Learning Cycle:
  *   - Every 24 hours: deep review of all trades, pattern analysis,
  *     mistake identification, and insight generation
  *   - Continuous improvement stored in PostgreSQL forever
  */
+
+// minifyIdentifiers: false — keep readable names for debugging
 
 import { storage } from "./storage";
 import { log } from "./index";
@@ -53,7 +53,7 @@ const ALLOWED_ASSETS: AssetConfig[] = [
 ];
 
 // ============ STRATEGY TYPES ============
-type StrategyType = "confluence" | "extreme_rsi";
+type StrategyType = "confluence" | "extreme_rsi" | "bb_rsi_reversion";
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -84,12 +84,12 @@ function truncateToSigFigs(s: string, sigFigs: number): string {
   const num = parseFloat(s);
   if (num === 0 || isNaN(num)) return "0";
   if (Number.isInteger(num)) return num.toString();
-  
+
   const isNeg = s.startsWith('-');
   const abs = isNeg ? s.slice(1) : s;
   const [intPart, decPart = ''] = abs.split('.');
   const combined = intPart + decPart;
-  
+
   let sigCount = 0;
   let started = false;
   let cutIdx = -1;
@@ -100,9 +100,9 @@ function truncateToSigFigs(s: string, sigFigs: number): string {
       if (sigCount === sigFigs) { cutIdx = i; break; }
     }
   }
-  
+
   if (cutIdx === -1) return s;
-  
+
   const intLen = intPart.length;
   if (cutIdx < intLen) {
     const kept = intPart.substring(0, cutIdx + 1);
@@ -127,6 +127,7 @@ function calculateAdaptivePosition(params: {
   price: number;
   asset: AssetConfig;
   config: any;
+  sizeMultiplier?: number;
 }): {
   capitalForTrade: number;
   leverage: number;
@@ -135,25 +136,25 @@ function calculateAdaptivePosition(params: {
   canTrade: boolean;
   skipReason: string;
 } {
-  const { equity, price, asset, config } = params;
+  const { equity, price, asset, config, sizeMultiplier = 1.0 } = params;
   const leverage = asset.maxLeverage;
-  
+
   const baseTradeAmountPct = config.tradeAmountPct || 10;
-  let capitalForTrade = equity * (baseTradeAmountPct / 100);
-  
+  let capitalForTrade = equity * (baseTradeAmountPct / 100) * sizeMultiplier;
+
   const minCapital = Math.max(5, asset.minNotional / leverage);
   if (capitalForTrade < minCapital) {
     capitalForTrade = Math.min(minCapital, equity * 0.5);
   }
-  
+
   if (capitalForTrade > equity * 0.5) {
     capitalForTrade = equity * 0.5;
   }
-  
+
   const notionalSize = capitalForTrade * leverage;
   const assetSize = notionalSize / price;
   const roundedSize = parseFloat(formatHLSize(assetSize, asset.szDecimals));
-  
+
   const actualNotional = roundedSize * price;
   if (actualNotional < asset.minNotional) {
     return {
@@ -162,7 +163,7 @@ function calculateAdaptivePosition(params: {
       skipReason: `Notional $${actualNotional.toFixed(2)} below min $${asset.minNotional}`,
     };
   }
-  
+
   return {
     capitalForTrade, leverage, notionalSize, assetSize: roundedSize,
     canTrade: true, skipReason: "",
@@ -213,6 +214,134 @@ function getLastEMA(closes: number[], period: number): number {
   return ema.length > 0 ? ema[ema.length - 1] : closes[closes.length - 1];
 }
 
+// ============ BOLLINGER BANDS ============
+
+interface BollingerBands {
+  upper: number;
+  middle: number; // SMA
+  lower: number;
+  bandwidth: number; // (upper - lower) / middle
+  percentB: number;  // (price - lower) / (upper - lower)
+  stdDev: number;
+}
+
+function calculateBollingerBands(closes: number[], period: number = 20, multiplier: number = 2): BollingerBands {
+  if (closes.length < period) {
+    const last = closes[closes.length - 1] || 0;
+    return { upper: last, middle: last, lower: last, bandwidth: 0, percentB: 0.5, stdDev: 0 };
+  }
+
+  // Use the last `period` closes for SMA and StdDev
+  const slice = closes.slice(closes.length - period);
+  const sma = slice.reduce((s, v) => s + v, 0) / period;
+
+  const variance = slice.reduce((s, v) => s + (v - sma) ** 2, 0) / period;
+  const stdDev = Math.sqrt(variance);
+
+  const upper = sma + multiplier * stdDev;
+  const lower = sma - multiplier * stdDev;
+  const currentPrice = closes[closes.length - 1];
+  const bandwidth = sma > 0 ? (upper - lower) / sma : 0;
+  const range = upper - lower;
+  const percentB = range > 0 ? (currentPrice - lower) / range : 0.5;
+
+  return { upper, middle: sma, lower, bandwidth, percentB, stdDev };
+}
+
+// ============ ADX CALCULATION ============
+
+function calculateADX(candles: { high: number; low: number; close: number }[], period: number = 14): number {
+  if (candles.length < period * 2 + 1) return 25; // default neutral
+
+  const trueRanges: number[] = [];
+  const plusDMs: number[] = [];
+  const minusDMs: number[] = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
+    const prevClose = candles[i - 1].close;
+    const prevHigh = candles[i - 1].high;
+    const prevLow = candles[i - 1].low;
+
+    // True Range
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    trueRanges.push(tr);
+
+    // Directional Movement
+    const upMove = high - prevHigh;
+    const downMove = prevLow - low;
+    plusDMs.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDMs.push(downMove > upMove && downMove > 0 ? downMove : 0);
+  }
+
+  if (trueRanges.length < period) return 25;
+
+  // Initial smoothed values (Wilder's smoothing)
+  let smoothedTR = trueRanges.slice(0, period).reduce((s, v) => s + v, 0);
+  let smoothedPlusDM = plusDMs.slice(0, period).reduce((s, v) => s + v, 0);
+  let smoothedMinusDM = minusDMs.slice(0, period).reduce((s, v) => s + v, 0);
+
+  const dxValues: number[] = [];
+
+  for (let i = period; i < trueRanges.length; i++) {
+    if (i > period) {
+      smoothedTR = smoothedTR - smoothedTR / period + trueRanges[i];
+      smoothedPlusDM = smoothedPlusDM - smoothedPlusDM / period + plusDMs[i];
+      smoothedMinusDM = smoothedMinusDM - smoothedMinusDM / period + minusDMs[i];
+    }
+
+    const plusDI = smoothedTR > 0 ? (smoothedPlusDM / smoothedTR) * 100 : 0;
+    const minusDI = smoothedTR > 0 ? (smoothedMinusDM / smoothedTR) * 100 : 0;
+    const diSum = plusDI + minusDI;
+    const dx = diSum > 0 ? (Math.abs(plusDI - minusDI) / diSum) * 100 : 0;
+    dxValues.push(dx);
+  }
+
+  if (dxValues.length < period) return 25;
+
+  // Smooth ADX
+  let adx = dxValues.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < dxValues.length; i++) {
+    adx = (adx * (period - 1) + dxValues[i]) / period;
+  }
+
+  return adx;
+}
+
+// ============ VOLUME EXHAUSTION DETECTION ============
+
+interface VolumeAnalysis {
+  isExhausting: boolean;     // Volume declining over recent bars
+  volumeRatio: number;       // Current volume vs 20-period average
+  trend: "increasing" | "decreasing" | "stable";
+}
+
+function analyzeVolume(volumes: number[], lookback: number = 20): VolumeAnalysis {
+  if (volumes.length < lookback) {
+    return { isExhausting: false, volumeRatio: 1.0, trend: "stable" };
+  }
+
+  const recentSlice = volumes.slice(volumes.length - lookback);
+  const avgVolume = recentSlice.reduce((s, v) => s + v, 0) / lookback;
+
+  // Recent 5-bar average
+  const recent5 = volumes.slice(volumes.length - 5);
+  const recent5Avg = recent5.reduce((s, v) => s + v, 0) / recent5.length;
+
+  const volumeRatio = avgVolume > 0 ? recent5Avg / avgVolume : 1.0;
+
+  // Volume declining = exhaustion move (< 70% of average)
+  const isExhausting = volumeRatio < 0.7;
+
+  let trend: "increasing" | "decreasing" | "stable";
+  if (volumeRatio > 1.3) trend = "increasing";
+  else if (volumeRatio < 0.7) trend = "decreasing";
+  else trend = "stable";
+
+  return { isExhausting, volumeRatio, trend };
+}
+
 // ============ HYPERLIQUID API ============
 const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
 
@@ -240,6 +369,35 @@ async function fetchCandles(coin: string, interval: string = "1h", limit: number
   } catch (e) { log(`Candle error ${coin}/${interval}: ${e}`, "engine"); return []; }
 }
 
+interface OHLCVCandle {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+async function fetchCandlesOHLCV(coin: string, interval: string = "1h", limit: number = 100): Promise<OHLCVCandle[]> {
+  try {
+    const endTime = Date.now();
+    const ms = INTERVAL_MS[interval] || 3600 * 1000;
+    const res = await fetch(HL_INFO_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "candleSnapshot", req: { coin, interval, startTime: endTime - limit * ms, endTime } }),
+    });
+    const candles: any[] = await res.json() as any;
+    if (!Array.isArray(candles)) return [];
+    return candles.map((c: any) => ({
+      open: parseFloat(c.o),
+      high: parseFloat(c.h),
+      low: parseFloat(c.l),
+      close: parseFloat(c.c),
+      volume: parseFloat(c.v),
+    }));
+  } catch (e) { log(`OHLCV error ${coin}/${interval}: ${e}`, "engine"); return []; }
+}
+
 async function fetchAllMids(): Promise<Record<string, string>> {
   try {
     const res = await fetch(HL_INFO_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "allMids" }) });
@@ -264,12 +422,12 @@ async function fetchUserState(address: string): Promise<any> {
     ]);
     const perpsData: any = await perpsRes.json();
     const spotData: any = await spotRes.json();
-    
+
     const perpsEquity = parseFloat(perpsData?.marginSummary?.accountValue || "0");
     const spotBalances = spotData?.balances || [];
     const usdcBalance = spotBalances.find((b: any) => b.coin === "USDC");
     const spotEquity = parseFloat(usdcBalance?.total || "0");
-    
+
     if (spotEquity > perpsEquity) {
       perpsData.marginSummary = {
         ...perpsData.marginSummary,
@@ -292,7 +450,7 @@ function getSessionInfo(): { session: string; isHighVolume: boolean; description
   return { session: "afterhours", isHighVolume: false, description: "After Hours" };
 }
 
-// ============ CONFLUENCE SCORING (Strategy 1) ============
+// ============ CONFLUENCE SCORING (Dashboard Display Only — No Trade Execution) ============
 
 interface ConfluenceResult {
   score: number;
@@ -316,7 +474,7 @@ function calculateConfluence(params: {
   let score = 0;
   const details: string[] = [];
   let signal: "long" | "short" | "neutral" = "neutral";
-  
+
   const oversold = config.rsiOversoldThreshold || 35;
   const overbought = config.rsiOverboughtThreshold || 65;
   const slPct = config.stopLossPct || 0.25;
@@ -356,11 +514,11 @@ function calculateConfluence(params: {
     const tfStr = softOverboughtTFs.map(t => `${t.tf}:${t.rsi.toFixed(1)}`).join(", ");
     details.push(`Soft overbought convergence (${softOverboughtTFs.length} TFs leaning high): ${tfStr}`);
   }
-  
+
   if (signal === "neutral") {
     return { score: 0, details: ["No RSI signal on any timeframe"], signal: "neutral", suggestedEntry: price, suggestedSL: price, suggestedTP1: price, suggestedTP2: price, riskRewardRatio: 0 };
   }
-  
+
   if (signal === "long") {
     if (rsi4h < 45) { score++; details.push(`4H RSI confirms: ${rsi4h.toFixed(1)}`); }
     if (rsi1d < 50) { score++; details.push(`1D RSI supports: ${rsi1d.toFixed(1)}`); }
@@ -368,50 +526,61 @@ function calculateConfluence(params: {
     if (rsi4h > 55) { score++; details.push(`4H RSI confirms: ${rsi4h.toFixed(1)}`); }
     if (rsi1d > 50) { score++; details.push(`1D RSI supports: ${rsi1d.toFixed(1)}`); }
   }
-  
+
   if (signal === "long" && price < ema21) { score++; details.push("Price below EMA21 (discount)"); }
   else if (signal === "short" && price > ema21) { score++; details.push("Price above EMA21 (premium)"); }
-  
+
   if (signal === "long" && fundingRate < -0.0001) { score++; details.push(`Negative funding: ${(fundingRate * 100).toFixed(4)}%`); }
   else if (signal === "short" && fundingRate > 0.0001) { score++; details.push(`Positive funding: ${(fundingRate * 100).toFixed(4)}%`); }
   if (signal === "long" && fundingRate > 0.0005) { score--; details.push("WARNING: funding opposes long"); }
   else if (signal === "short" && fundingRate < -0.0005) { score--; details.push("WARNING: funding opposes short"); }
-  
+
   if (signal === "long" && change24h < -3) { score++; details.push(`24h drop ${change24h.toFixed(1)}%`); }
   else if (signal === "short" && change24h > 3) { score++; details.push(`24h pump ${change24h.toFixed(1)}%`); }
   if (signal === "long" && change24h < -15) { score--; details.push("WARNING: freefall"); }
   else if (signal === "short" && change24h > 15) { score--; details.push("WARNING: parabolic"); }
-  
+
   if (volume24h > (config.minVolume24h || 1e6) * 2) { score++; details.push(`High volume: $${(volume24h / 1e6).toFixed(1)}M`); }
-  
+
   const slDist = price * (slPct / 100);
   const sl = signal === "long" ? price - slDist : price + slDist;
   const tp1 = signal === "long" ? price + price * (tp1Pct / 100) : price - price * (tp1Pct / 100);
   const tp2 = signal === "long" ? price + price * (tp2Pct / 100) : price - price * (tp2Pct / 100);
   const rr = slDist > 0 ? Math.abs(tp1 - price) / slDist : 0;
-  
+
   return { score, details, signal, suggestedEntry: price, suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2, riskRewardRatio: rr };
 }
 
-// ============ EXTREME RSI DETECTION (Strategy 2) ============
+// ============ ENHANCED EXTREME RSI DETECTION (with BB + Volume + ADX) ============
 
-interface ExtremeRsiResult {
+interface EnhancedRsiResult {
   triggered: boolean;
   signal: "long" | "short" | "none";
+  triggerType: "extreme_rsi" | "bb_rsi_reversion" | "none";
   triggerTF: string;
   triggerRSI: number;
   allRSIs: { tf: string; rsi: number }[];
+  bollingerConfirm: boolean;
+  volumeExhaustion: boolean;
+  adxRegime: "ranging" | "trending";
+  adxValue: number;
   suggestedSL: number;
   suggestedTP1: number;
   suggestedTP2: number;
+  confidenceScore: number;
 }
 
-function detectExtremeRSI(params: {
+function detectEnhancedRSI(params: {
   price: number;
   rsi1m: number; rsi5m: number; rsi15m: number; rsi1h: number; rsi4h: number; rsi1d: number;
-}): ExtremeRsiResult {
-  const { price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d } = params;
-  
+  bb5m: BollingerBands;
+  bb15m: BollingerBands;
+  volume5m: VolumeAnalysis;
+  volume15m: VolumeAnalysis;
+  adxValue: number;
+}): EnhancedRsiResult {
+  const { price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d, bb5m, bb15m, volume5m, volume15m, adxValue } = params;
+
   const allRSIs = [
     { tf: "1m", rsi: rsi1m },
     { tf: "5m", rsi: rsi5m },
@@ -420,41 +589,156 @@ function detectExtremeRSI(params: {
     { tf: "4h", rsi: rsi4h },
     { tf: "1d", rsi: rsi1d },
   ];
-  
-  // Extreme RSI thresholds — these are HARD, no confluence needed
-  const EXTREME_OVERSOLD = 10;  // RSI < 10 → LONG
-  const EXTREME_OVERBOUGHT = 80; // RSI > 80 → SHORT
-  
-  // At least 2 of 3 short timeframes (1m, 5m, 15m) must be extreme
+
+  const adxRegime: "ranging" | "trending" = adxValue < 25 ? "ranging" : "trending";
+  const noResult: EnhancedRsiResult = {
+    triggered: false, signal: "none", triggerType: "none", triggerTF: "", triggerRSI: 0, allRSIs,
+    bollingerConfirm: false, volumeExhaustion: false, adxRegime, adxValue,
+    suggestedSL: 0, suggestedTP1: 0, suggestedTP2: 0, confidenceScore: 0,
+  };
+
+  // ---- Trigger A: Extreme RSI (existing logic) ----
+  const EXTREME_OVERSOLD = 10;
+  const EXTREME_OVERBOUGHT = 80;
+
   const shortTFs = [
     { tf: "1m", rsi: rsi1m },
     { tf: "5m", rsi: rsi5m },
     { tf: "15m", rsi: rsi15m },
-  ].filter(r => r.rsi > 0); // exclude missing data
-  
-  // Check for extreme oversold (LONG signal) — at least 2/3 must be < 10
+  ].filter(r => r.rsi > 0);
+
   const oversoldTFs = shortTFs.filter(r => r.rsi < EXTREME_OVERSOLD);
-  if (oversoldTFs.length >= 2) {
-    const avgRsi = oversoldTFs.reduce((s, r) => s + r.rsi, 0) / oversoldTFs.length;
-    const tfLabel = shortTFs.map(r => `${r.tf}(${r.rsi.toFixed(1)}${r.rsi < EXTREME_OVERSOLD ? '*' : ''})`).join('+');
-    const sl = price * (1 - 0.0025);   // 0.25% below
-    const tp1 = price * (1 + 0.003);   // 0.3% above
-    const tp2 = price * (1 + 0.01);    // 1% above
-    return { triggered: true, signal: "long", triggerTF: tfLabel, triggerRSI: avgRsi, allRSIs, suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2 };
-  }
-  
-  // Check for extreme overbought (SHORT signal) — at least 2/3 must be > 80
   const overboughtTFs = shortTFs.filter(r => r.rsi > EXTREME_OVERBOUGHT);
-  if (overboughtTFs.length >= 2) {
-    const avgRsi = overboughtTFs.reduce((s, r) => s + r.rsi, 0) / overboughtTFs.length;
-    const tfLabel = shortTFs.map(r => `${r.tf}(${r.rsi.toFixed(1)}${r.rsi > EXTREME_OVERBOUGHT ? '*' : ''})`).join('+');
-    const sl = price * (1 + 0.0025);   // 0.25% above
-    const tp1 = price * (1 - 0.003);   // 0.3% below
-    const tp2 = price * (1 - 0.01);    // 1% below
-    return { triggered: true, signal: "short", triggerTF: tfLabel, triggerRSI: avgRsi, allRSIs, suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2 };
+
+  let triggerASignal: "long" | "short" | "none" = "none";
+  let triggerATF = "";
+  let triggerARSI = 0;
+
+  if (oversoldTFs.length >= 2) {
+    triggerASignal = "long";
+    triggerARSI = oversoldTFs.reduce((s, r) => s + r.rsi, 0) / oversoldTFs.length;
+    triggerATF = shortTFs.map(r => `${r.tf}(${r.rsi.toFixed(1)}${r.rsi < EXTREME_OVERSOLD ? '*' : ''})`).join('+');
+  } else if (overboughtTFs.length >= 2) {
+    triggerASignal = "short";
+    triggerARSI = overboughtTFs.reduce((s, r) => s + r.rsi, 0) / overboughtTFs.length;
+    triggerATF = shortTFs.map(r => `${r.tf}(${r.rsi.toFixed(1)}${r.rsi > EXTREME_OVERBOUGHT ? '*' : ''})`).join('+');
   }
-  
-  return { triggered: false, signal: "none", triggerTF: "", triggerRSI: 0, allRSIs, suggestedSL: 0, suggestedTP1: 0, suggestedTP2: 0 };
+
+  // ---- Trigger B: Bollinger Band Reversion (NEW) ----
+  let triggerBSignal: "long" | "short" | "none" = "none";
+  let triggerBTF = "";
+  let triggerBRSI = 0;
+
+  // Check 5m: price at lower BB + RSI < 30 → long; price at upper BB + RSI > 70 → short
+  const bb5mStdDist = bb5m.stdDev > 0 ? Math.abs(price - bb5m.middle) / bb5m.stdDev : 0;
+  const bb15mStdDist = bb15m.stdDev > 0 ? Math.abs(price - bb15m.middle) / bb15m.stdDev : 0;
+
+  // 5m BB check
+  if (triggerBSignal === "none" && bb5mStdDist >= 2) {
+    if (price <= bb5m.lower && rsi5m < 30) {
+      triggerBSignal = "long";
+      triggerBTF = `5m(BB_lower,RSI:${rsi5m.toFixed(1)},${bb5mStdDist.toFixed(1)}SD)`;
+      triggerBRSI = rsi5m;
+    } else if (price >= bb5m.upper && rsi5m > 70) {
+      triggerBSignal = "short";
+      triggerBTF = `5m(BB_upper,RSI:${rsi5m.toFixed(1)},${bb5mStdDist.toFixed(1)}SD)`;
+      triggerBRSI = rsi5m;
+    }
+  }
+
+  // 15m BB check
+  if (triggerBSignal === "none" && bb15mStdDist >= 2) {
+    if (price <= bb15m.lower && rsi15m < 30) {
+      triggerBSignal = "long";
+      triggerBTF = `15m(BB_lower,RSI:${rsi15m.toFixed(1)},${bb15mStdDist.toFixed(1)}SD)`;
+      triggerBRSI = rsi15m;
+    } else if (price >= bb15m.upper && rsi15m > 70) {
+      triggerBSignal = "short";
+      triggerBTF = `15m(BB_upper,RSI:${rsi15m.toFixed(1)},${bb15mStdDist.toFixed(1)}SD)`;
+      triggerBRSI = rsi15m;
+    }
+  }
+
+  // Pick the trigger — Trigger A takes priority if both fire
+  let signal: "long" | "short" | "none" = "none";
+  let triggerType: "extreme_rsi" | "bb_rsi_reversion" | "none" = "none";
+  let triggerTF = "";
+  let triggerRSI = 0;
+
+  if (triggerASignal !== "none") {
+    signal = triggerASignal;
+    triggerType = "extreme_rsi";
+    triggerTF = triggerATF;
+    triggerRSI = triggerARSI;
+  } else if (triggerBSignal !== "none") {
+    signal = triggerBSignal;
+    triggerType = "bb_rsi_reversion";
+    triggerTF = triggerBTF;
+    triggerRSI = triggerBRSI;
+  }
+
+  if (signal === "none") return noResult;
+
+  // --- Bollinger confirmation: is price at 2+ SD band in signal direction? ---
+  let bollingerConfirm = false;
+  if (signal === "long") {
+    // Price at/below lower 2SD band on either 5m or 15m
+    bollingerConfirm = (bb5mStdDist >= 2 && price <= bb5m.lower) || (bb15mStdDist >= 2 && price <= bb15m.lower);
+  } else {
+    bollingerConfirm = (bb5mStdDist >= 2 && price >= bb5m.upper) || (bb15mStdDist >= 2 && price >= bb15m.upper);
+  }
+
+  // --- Volume exhaustion ---
+  const volumeExhaustion = volume5m.isExhausting || volume15m.isExhausting;
+
+  // --- Confidence scoring (1-5) ---
+  let confidenceScore = 1; // base: trigger fired
+  if (bollingerConfirm) confidenceScore++;
+  if (volumeExhaustion) confidenceScore++;
+  if (adxValue < 25) confidenceScore++;
+  // 3+ timeframes agree on RSI direction
+  const agreeingTFs = signal === "long"
+    ? allRSIs.filter(r => r.rsi > 0 && r.rsi < 40).length
+    : allRSIs.filter(r => r.rsi > 0 && r.rsi > 60).length;
+  if (agreeingTFs >= 3) confidenceScore++;
+
+  // --- TP/SL targets based on trigger type + ADX regime ---
+  let tp1Pct: number;
+  let tp2Pct: number;
+  const slPct = 0.0025; // 0.25% SL for both triggers
+
+  if (triggerType === "extreme_rsi") {
+    tp1Pct = 0.003;  // 0.3%
+    tp2Pct = 0.01;   // 1%
+  } else {
+    // bb_rsi_reversion: tighter targets
+    tp1Pct = 0.002;  // 0.2%
+    tp2Pct = 0.005;  // 0.5%
+  }
+
+  // ADX >= 25 (trending): widen TP targets by 50%
+  if (adxRegime === "trending") {
+    tp1Pct *= 1.5;
+    tp2Pct *= 1.5;
+  }
+
+  let sl: number, tp1: number, tp2: number;
+  if (signal === "long") {
+    sl = price * (1 - slPct);
+    tp1 = price * (1 + tp1Pct);
+    tp2 = price * (1 + tp2Pct);
+  } else {
+    sl = price * (1 + slPct);
+    tp1 = price * (1 - tp1Pct);
+    tp2 = price * (1 - tp2Pct);
+  }
+
+  return {
+    triggered: true, signal, triggerType, triggerTF, triggerRSI, allRSIs,
+    bollingerConfirm, volumeExhaustion, adxRegime, adxValue,
+    suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2,
+    confidenceScore,
+  };
 }
 
 // ============ TRADING ENGINE ============
@@ -472,11 +756,17 @@ class TradingEngine {
   private scanCount = 0;
   private lastLearningReview = 0; // timestamp of last 24h review
 
+  private resetLossTrackers() {
+    this.drawdownPaused = false;
+    this.dailyTradeCount = 0;
+    this.dailyTradeDate = new Date().toISOString().split("T")[0];
+  }
+
   async start() {
     const config = await storage.getConfig();
     if (!config) return;
     this.resetLossTrackers();
-    
+
     if (config.walletAddress) {
       const state = await fetchUserState(config.walletAddress);
       if (state?.marginSummary?.accountValue) {
@@ -496,10 +786,10 @@ class TradingEngine {
     const insights = await storage.getActiveInsights();
     await storage.createLog({
       type: "system",
-      message: `Engine v5 started | DUAL STRATEGY | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights`,
+      message: `Engine v7 started | RSI-ONLY + BB + VOLUME + ADX | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v5 started — DUAL STRATEGY — AUM: $${this.lastKnownEquity.toFixed(2)} | ${insights.length} learned insights`, "engine");
+    log(`Engine v7 started — RSI-ONLY + BB + VOLUME + ADX — AUM: $${this.lastKnownEquity.toFixed(2)} | ${insights.length} learned insights`, "engine");
     this.scheduleNextScan();
   }
 
@@ -599,7 +889,7 @@ class TradingEngine {
         if (drawdownPct >= 50 && !this.drawdownPaused) {
           this.drawdownPaused = true;
           const msg = `50% DRAWDOWN HIT — Day start: $${this.dayStartEquity.toFixed(2)} → Current: $${equity.toFixed(2)} (${drawdownPct.toFixed(1)}% down). Pausing new entries for today. Triggering learning review.`;
-          await logDecision({ coin: "ALL", action: "drawdown_stop", price: 0, reasoning: msg, equity, strategy: "confluence" });
+          await logDecision({ coin: "ALL", action: "circuit_breaker", price: 0, reasoning: msg, equity, strategy: "extreme_rsi" });
           await storage.createLog({ type: "drawdown_stop", message: msg, timestamp: new Date().toISOString() });
           log(msg, "engine");
           // Trigger immediate deep learning review to analyze mistakes
@@ -615,8 +905,8 @@ class TradingEngine {
 
       const sessionInfo = getSessionInfo();
       const useSessionFilter = config.useSessionFilter !== false;
-      
-      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | DUAL STRATEGY | Trades today: ${this.dailyTradeCount}/20${this.drawdownPaused ? " | DRAWDOWN PAUSED" : ""}`, "engine");
+
+      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | RSI-ONLY MODE | Trades today: ${this.dailyTradeCount}/20${this.drawdownPaused ? " | DRAWDOWN PAUSED" : ""}`, "engine");
 
       // Fetch market data
       const [mainData, xyzData] = await Promise.all([fetchMetaAndAssetCtxs(""), fetchMetaAndAssetCtxs("xyz")]);
@@ -640,17 +930,11 @@ class TradingEngine {
       const slotsAvailable = maxPos - openTrades.length;
 
       // ======================================================================
-      // SCAN EACH ASSET — run BOTH strategies independently
+      // SCAN EACH ASSET — Enhanced RSI + BB + Volume + ADX
       // ======================================================================
 
-      const confluenceSignals: Array<{
-        asset: AssetConfig; price: number; confluence: ConfluenceResult;
-        volume24h: number; change24h: number; fundingRate: number; openInterest: number;
-        rsi1h: number; rsi4h: number; rsi1d: number; ema10: number; ema21: number; ema50: number;
-      }> = [];
-
-      const extremeRsiSignals: Array<{
-        asset: AssetConfig; price: number; extreme: ExtremeRsiResult;
+      const enhancedSignals: Array<{
+        asset: AssetConfig; price: number; enhanced: EnhancedRsiResult;
         volume24h: number; change24h: number; fundingRate: number; openInterest: number;
         rsi1h: number; rsi4h: number; rsi1d: number; ema10: number; ema21: number; ema50: number;
         rsi1m: number; rsi5m: number; rsi15m: number;
@@ -669,14 +953,19 @@ class TradingEngine {
 
         if (volume24h < (config.minVolume24h || 1e6)) continue;
 
-        const [c1m, c5m, c15m, c1h, c4h, c1d] = await Promise.all([
+        // Fetch candles: regular closes for RSI on 1m, 1h, 4h, 1d; OHLCV for 5m and 15m (needed for BB, ADX, volume)
+        const [c1m, ohlcv5m, ohlcv15m, c1h, c4h, c1d] = await Promise.all([
           fetchCandles(asset.coin, "1m", 60),
-          fetchCandles(asset.coin, "5m", 60),
-          fetchCandles(asset.coin, "15m", 60),
+          fetchCandlesOHLCV(asset.coin, "5m", 60),
+          fetchCandlesOHLCV(asset.coin, "15m", 60),
           fetchCandles(asset.coin, "1h", 60),
           fetchCandles(asset.coin, "4h", 60),
           fetchCandles(asset.coin, "1d", 30),
         ]);
+
+        const c5m = ohlcv5m.map(c => c.close);
+        const c15m = ohlcv15m.map(c => c.close);
+
         if (c1m.length < 15 && c5m.length < 15 && c15m.length < 15 && c1h.length < 15) continue;
 
         const rsi1m = c1m.length >= 15 ? calculateRSI(c1m) : 50;
@@ -690,7 +979,21 @@ class TradingEngine {
         const ema21 = getLastEMA(emaSource, 21);
         const ema50 = emaSource.length >= 50 ? getLastEMA(emaSource, 50) : ema21;
 
-        // --- STRATEGY 1: CONFLUENCE ---
+        // Calculate Bollinger Bands on 5m and 15m
+        const bb5m = calculateBollingerBands(c5m, 20, 2);
+        const bb15m = calculateBollingerBands(c15m, 20, 2);
+
+        // Calculate ADX on 15m (needs H/L/C)
+        const adxCandles15m = ohlcv15m.map(c => ({ high: c.high, low: c.low, close: c.close }));
+        const adxValue = calculateADX(adxCandles15m, 14);
+
+        // Volume analysis on 5m and 15m
+        const volumes5m = ohlcv5m.map(c => c.volume);
+        const volumes15m = ohlcv15m.map(c => c.volume);
+        const volume5m = analyzeVolume(volumes5m, 20);
+        const volume15m = analyzeVolume(volumes15m, 20);
+
+        // Calculate confluence for dashboard display only (upsertMarketScan)
         const confluence = calculateConfluence({
           price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
           fundingRate: funding, change24h, volume24h, config, category: asset.category,
@@ -707,237 +1010,81 @@ class TradingEngine {
           timestamp: new Date().toISOString(),
         });
 
-        if (confluence.signal !== "neutral" && confluence.score > 0) {
-          confluenceSignals.push({ asset, price, confluence, volume24h, change24h, fundingRate: funding, openInterest, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50 });
-        }
-
-        // --- STRATEGY 2: EXTREME RSI ---
-        const extreme = detectExtremeRSI({ price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d });
-        if (extreme.triggered) {
-          extremeRsiSignals.push({ asset, price, extreme, volume24h, change24h, fundingRate: funding, openInterest, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m });
+        // --- ENHANCED RSI + BB DETECTION ---
+        const enhanced = detectEnhancedRSI({
+          price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d,
+          bb5m, bb15m, volume5m, volume15m, adxValue,
+        });
+        if (enhanced.triggered) {
+          enhancedSignals.push({
+            asset, price, enhanced, volume24h, change24h, fundingRate: funding, openInterest,
+            rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
+          });
         }
 
         await new Promise(r => setTimeout(r, 150));
       }
 
       // Log scan summary
-      confluenceSignals.sort((a, b) => b.confluence.score - a.confluence.score);
       await storage.createLog({
         type: "scan",
-        message: `Scan: ${confluenceSignals.length} confluence + ${extremeRsiSignals.length} extreme_rsi signals | ${sessionInfo.session} | AUM: $${equity.toLocaleString()}`,
+        message: `Scan: ${enhancedSignals.length} enhanced RSI/BB signals | ${sessionInfo.session} | AUM: $${equity.toLocaleString()}`,
         data: JSON.stringify([
-          ...confluenceSignals.slice(0, 3).map(s => `[C] ${s.asset.coin} C:${s.confluence.score} ${s.confluence.signal}`),
-          ...extremeRsiSignals.slice(0, 3).map(s => `[E] ${s.asset.coin} RSI:${s.extreme.triggerRSI.toFixed(1)} ${s.extreme.signal} @${s.extreme.triggerTF}`),
+          ...enhancedSignals.slice(0, 5).map(s => `[${s.enhanced.triggerType}] ${s.asset.coin} RSI:${s.enhanced.triggerRSI.toFixed(1)} ${s.enhanced.signal} @${s.enhanced.triggerTF} conf:${s.enhanced.confidenceScore}`),
         ]),
         timestamp: new Date().toISOString(),
       });
 
       let slotsUsed = 0;
       const now = new Date();
-      const hourOfDay = now.getUTCHours() + now.getUTCMinutes() / 60;
-      const TARGET_DAILY_TRADES = 20;
-      const expectedByNow = Math.max(1, Math.floor((hourOfDay / 24) * TARGET_DAILY_TRADES));
-      const behindPace = this.dailyTradeCount < expectedByNow;
-      // Adaptive thresholds: loosen when behind pace on daily trade target
-      const minConfluence = behindPace ? Math.max(2, (config.minConfluenceScore || 3) - 1) : (config.minConfluenceScore || 3);
-      const minRR = behindPace ? Math.max(0.5, (config.minRiskRewardRatio || 0.8) - 0.2) : (config.minRiskRewardRatio || 0.8);
-      if (behindPace && this.scanCount % 20 === 0) {
-        log(`PACE: ${this.dailyTradeCount}/${TARGET_DAILY_TRADES} trades (expected ~${expectedByNow} by now) — lowered C:${minConfluence} R:R:${minRR.toFixed(1)}`, "engine");
-      }
 
       // =============================================
-      // EXECUTE STRATEGY 1: CONFLUENCE ENTRIES
+      // EXECUTE ENHANCED RSI / BB REVERSION ENTRIES
       // =============================================
-      if (canOpenNew && slotsAvailable > slotsUsed && confluenceSignals.length > 0) {
-        for (const sig of confluenceSignals.slice(0, slotsAvailable - slotsUsed)) {
-          if (openByCoinStrategy.has(`${sig.asset.coin}_confluence`)) continue;
+      if (canOpenNew && slotsAvailable > slotsUsed && enhancedSignals.length > 0) {
+        for (const sig of enhancedSignals.slice(0, slotsAvailable - slotsUsed)) {
+          if (sig.enhanced.signal === "none") continue;
 
+          const strategyKey = sig.enhanced.triggerType === "bb_rsi_reversion" ? "bb_rsi_reversion" : "extreme_rsi";
+          if (openByCoinStrategy.has(`${sig.asset.coin}_${strategyKey}`)) continue;
+
+          const side = sig.enhanced.signal as "long" | "short";
           const reasoning: string[] = [];
-          reasoning.push(`[CONFLUENCE] Signal: ${sig.confluence.signal.toUpperCase()} ${sig.asset.displayName}`);
-          reasoning.push(`Confluence: ${sig.confluence.score}/7 (min: ${minConfluence})`);
-          reasoning.push(`R:R: ${sig.confluence.riskRewardRatio.toFixed(2)} (min: ${minRR})`);
-          reasoning.push(`RSI 1H:${sig.rsi1h.toFixed(1)} 4H:${sig.rsi4h.toFixed(1)} 1D:${sig.rsi1d.toFixed(1)}`);
-          reasoning.push(`EMA10:${sig.ema10.toFixed(2)} EMA21:${sig.ema21.toFixed(2)} EMA50:${sig.ema50.toFixed(2)}`);
+          reasoning.push(`[${sig.enhanced.triggerType.toUpperCase()}] Signal: ${side.toUpperCase()} ${sig.asset.displayName}`);
+          reasoning.push(`TRIGGER: RSI ${sig.enhanced.triggerRSI.toFixed(1)} on ${sig.enhanced.triggerTF} (${side === "long" ? "oversold" : "overbought"})`);
+          reasoning.push(`All RSIs: ${sig.enhanced.allRSIs.map(r => `${r.tf}:${r.rsi.toFixed(1)}`).join(", ")}`);
+          reasoning.push(`BB confirm: ${sig.enhanced.bollingerConfirm} | Vol exhaust: ${sig.enhanced.volumeExhaustion} | ADX: ${sig.enhanced.adxValue.toFixed(1)} (${sig.enhanced.adxRegime})`);
+          reasoning.push(`Confidence: ${sig.enhanced.confidenceScore}/5`);
+          reasoning.push(`Price: $${displayPrice(sig.price, sig.asset.szDecimals)}`);
+          reasoning.push(`TP1: $${displayPrice(sig.enhanced.suggestedTP1, sig.asset.szDecimals)} | TP2: $${displayPrice(sig.enhanced.suggestedTP2, sig.asset.szDecimals)}`);
+          reasoning.push(`SL: $${displayPrice(sig.enhanced.suggestedSL, sig.asset.szDecimals)} → moves to BE after TP1`);
           reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(sig.fundingRate * 100).toFixed(4)}%`);
-          reasoning.push(`24h: ${sig.change24h.toFixed(2)}% | Vol: $${(sig.volume24h / 1e6).toFixed(1)}M`);
-          reasoning.push(`Details: ${sig.confluence.details.join(", ")}`);
-
-          if (sig.confluence.score < minConfluence) {
-            reasoning.push(`SKIP: Confluence ${sig.confluence.score} < min ${minConfluence}`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price, rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d, ema10: sig.ema10, ema21: sig.ema21, ema50: sig.ema50, volume24h: sig.volume24h, change24h: sig.change24h, fundingRate: sig.fundingRate, openInterest: sig.openInterest, confluenceScore: sig.confluence.score, confluenceDetails: sig.confluence.details.join(" | "), riskRewardRatio: sig.confluence.riskRewardRatio, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-            continue;
-          }
-
-          if (sig.confluence.riskRewardRatio < minRR) {
-            reasoning.push(`SKIP: R:R ${sig.confluence.riskRewardRatio.toFixed(2)} < min ${minRR}`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price, rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d, confluenceScore: sig.confluence.score, riskRewardRatio: sig.confluence.riskRewardRatio, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-            continue;
-          }
-
-          if (useSessionFilter && !sessionInfo.isHighVolume && sig.asset.category !== "crypto") {
-            reasoning.push(`SKIP: ${sig.asset.category} asset in low-volume ${sessionInfo.session} session`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price, confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-            continue;
-          }
 
           // Check learning insights
-          const insightCheck = await checkInsights({ coin: sig.asset.coin, side: sig.confluence.signal, session: sessionInfo.session, confluenceScore: sig.confluence.score, dayOfWeek: now.getUTCDay() });
-          if (insightCheck.shouldBlock) {
-            reasoning.push(`BLOCKED BY LEARNING: ${insightCheck.blockReason}`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price, rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d, confluenceScore: sig.confluence.score, riskRewardRatio: sig.confluence.riskRewardRatio, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-            continue;
-          }
-
-          const adjustedConfluence = sig.confluence.score + insightCheck.confidenceAdjustment;
-          if (insightCheck.warnings.length > 0) reasoning.push(`LEARNED WARNINGS: ${insightCheck.warnings.join("; ")}`);
-          if (insightCheck.boosts.length > 0) reasoning.push(`LEARNED BOOSTS: ${insightCheck.boosts.join("; ")}`);
-          if (insightCheck.confidenceAdjustment !== 0) reasoning.push(`Confidence adjusted: ${sig.confluence.score} → ${adjustedConfluence}`);
-
-          if (adjustedConfluence < minConfluence) {
-            reasoning.push(`SKIP: Adjusted confluence ${adjustedConfluence} < min ${minConfluence}`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price, confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-            continue;
-          }
-
-          // Position sizing
-          const pos = calculateAdaptivePosition({ equity, price: sig.price, asset: sig.asset, config });
-          if (!pos.canTrade) {
-            reasoning.push(`SKIP: ${pos.skipReason}`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side: sig.confluence.signal, price: sig.price, confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-            continue;
-          }
-
-          const { leverage, capitalForTrade, assetSize, notionalSize } = pos;
-          const side = sig.confluence.signal;
-          const { suggestedSL, suggestedTP1, suggestedTP2 } = sig.confluence;
-          const tradeAmountPct = (capitalForTrade / equity) * 100;
-
-          reasoning.push(`ENTRY: ${side.toUpperCase()} ${sig.asset.displayName} | ${leverage}x (MAX) | $${capitalForTrade.toFixed(2)} capital ($${notionalSize.toFixed(0)} notional)`);
-
-          // Execute order
-          if (config.apiSecret && config.walletAddress) {
-            try {
-              const executor = createExecutor(config.apiSecret, config.walletAddress);
-              const isCross = !sig.asset.isolatedOnly;
-              await executor.setLeverage(sig.asset.coin, leverage, isCross);
-              const slippageMult = side === "long" ? 1.01 : 0.99;
-              const orderPrice = sig.price * slippageMult;
-              const roundedSize = parseFloat(formatHLSize(assetSize, sig.asset.szDecimals));
-              if (roundedSize <= 0) { reasoning.push(`SKIP: Rounded size is 0`); continue; }
-              const orderResult = await executor.placeOrder({
-                coin: sig.asset.coin, isBuy: side === "long", sz: roundedSize,
-                limitPx: parseFloat(formatHLPrice(orderPrice, sig.asset.szDecimals)),
-                orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
-              });
-              
-              log(`[HL RAW] ${sig.asset.coin} confluence response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
-              const status = orderResult?.response?.data?.statuses?.[0];
-              const fillPx = status?.filled?.avgPx;
-              const totalSz = status?.filled?.totalSz;
-              const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
-              
-              if (errorMsg) {
-                reasoning.push(`ORDER REJECTED: ${errorMsg}`);
-                await storage.createLog({ type: "order_error", message: `ORDER REJECTED: ${sig.asset.displayName} — ${errorMsg}`, timestamp: new Date().toISOString() });
-                await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-                continue;
-              }
-              
-              if (fillPx && parseFloat(totalSz) > 0) {
-                reasoning.push(`FILLED: sz=${totalSz} @ $${fillPx}`);
-                sig.price = parseFloat(fillPx);
-              } else if (status?.resting) {
-                reasoning.push(`Order resting (oid: ${status.resting.oid})`);
-              } else {
-                reasoning.push(`IOC NOT FILLED`);
-                await storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: [CONFLUENCE] ${sig.asset.displayName} ${side}`, timestamp: new Date().toISOString() });
-                await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-                continue;
-              }
-            } catch (execErr) {
-              reasoning.push(`ORDER FAILED: ${execErr}`);
-              await storage.createLog({ type: "order_error", message: `ORDER FAILED: [CONFLUENCE] ${sig.asset.displayName} — ${execErr}`, timestamp: new Date().toISOString() });
-              await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, confluenceScore: sig.confluence.score, reasoning: reasoning.join(" | "), equity, strategy: "confluence" });
-              continue;
-            }
-          }
-
-          const trade = await storage.createTrade({
-            coin: sig.asset.coin, side, entryPrice: sig.price, size: tradeAmountPct, leverage,
-            rsiAtEntry: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
-            ema10: sig.ema10, ema21: sig.ema21, ema50: sig.ema50,
-            stopLoss: suggestedSL, takeProfit1: suggestedTP1, takeProfit2: suggestedTP2, tp1Hit: false,
-            confluenceScore: sig.confluence.score, confluenceDetails: sig.confluence.details.join(" | "),
-            riskRewardRatio: sig.confluence.riskRewardRatio,
-            status: "open",
-            reason: `[CONFLUENCE] ${side.toUpperCase()} | C:${sig.confluence.score}/7 | R:R ${sig.confluence.riskRewardRatio.toFixed(1)}:1 | ${leverage}x MAX | $${capitalForTrade.toFixed(0)}`,
-            setupType: "rsi_reversion",
-            strategy: "confluence",
-            openedAt: new Date().toISOString(),
-          });
-
-          await logDecision({
-            tradeId: trade.id, coin: sig.asset.coin, action: "entry", side, price: sig.price,
-            rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
-            ema10: sig.ema10, ema21: sig.ema21, ema50: sig.ema50,
-            volume24h: sig.volume24h, change24h: sig.change24h,
-            fundingRate: sig.fundingRate, openInterest: sig.openInterest,
-            confluenceScore: sig.confluence.score, confluenceDetails: sig.confluence.details.join(" | "),
-            riskRewardRatio: sig.confluence.riskRewardRatio,
-            reasoning: reasoning.join(" | "), equity, leverage, positionSizeUsd: capitalForTrade,
-            strategy: "confluence",
-          });
-
-          await storage.createLog({
-            type: "trade_open",
-            message: `[CONFLUENCE] ${side.toUpperCase()} ${sig.asset.displayName} @ $${displayPrice(sig.price, sig.asset.szDecimals)} | ${leverage}x | C:${sig.confluence.score} | $${capitalForTrade.toFixed(0)}`,
-            data: JSON.stringify(trade),
-            timestamp: new Date().toISOString(),
-          });
-
-          openByCoinStrategy.add(`${sig.asset.coin}_confluence`);
-          slotsUsed++;
-          this.dailyTradeCount++;
-        }
-      }
-
-      // =============================================
-      // EXECUTE STRATEGY 2: EXTREME RSI ENTRIES
-      // =============================================
-      if (canOpenNew && slotsAvailable > slotsUsed && extremeRsiSignals.length > 0) {
-        for (const sig of extremeRsiSignals.slice(0, slotsAvailable - slotsUsed)) {
-          if (sig.extreme.signal === "none") continue;
-          if (openByCoinStrategy.has(`${sig.asset.coin}_extreme_rsi`)) continue;
-
-          const side = sig.extreme.signal as "long" | "short";
-          const reasoning: string[] = [];
-          reasoning.push(`[EXTREME_RSI] Signal: ${side.toUpperCase()} ${sig.asset.displayName}`);
-          reasoning.push(`TRIGGER: RSI ${sig.extreme.triggerRSI.toFixed(1)} on ${sig.extreme.triggerTF} (${side === "long" ? "<10 oversold" : ">80 overbought"})`);
-          reasoning.push(`All RSIs: ${sig.extreme.allRSIs.map(r => `${r.tf}:${r.rsi.toFixed(1)}`).join(", ")}`);
-          reasoning.push(`Price: $${displayPrice(sig.price, sig.asset.szDecimals)}`);
-          reasoning.push(`TP1: 0.3% ($${displayPrice(sig.extreme.suggestedTP1, sig.asset.szDecimals)}) | TP2: 1% ($${displayPrice(sig.extreme.suggestedTP2, sig.asset.szDecimals)})`);
-          reasoning.push(`SL: 0.25% ($${displayPrice(sig.extreme.suggestedSL, sig.asset.szDecimals)}) → moves to BE after TP1`);
-          reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(sig.fundingRate * 100).toFixed(4)}%`);
-
-          // Check learning insights for extreme_rsi
           const insightCheck = await checkInsights({ coin: sig.asset.coin, side, session: sessionInfo.session, confluenceScore: 7, dayOfWeek: now.getUTCDay() });
           if (insightCheck.shouldBlock) {
             reasoning.push(`BLOCKED BY LEARNING: ${insightCheck.blockReason}`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: "extreme_rsi" });
+            await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
             continue;
           }
 
+          // ADX regime: reduce position size to 75% when trending
+          const sizeMultiplier = sig.enhanced.adxRegime === "trending" ? 0.75 : 1.0;
+          if (sizeMultiplier < 1.0) {
+            reasoning.push(`ADX trending (${sig.enhanced.adxValue.toFixed(1)}) — position reduced to 75%`);
+          }
+
           // Position sizing
-          const pos = calculateAdaptivePosition({ equity, price: sig.price, asset: sig.asset, config });
+          const pos = calculateAdaptivePosition({ equity, price: sig.price, asset: sig.asset, config, sizeMultiplier });
           if (!pos.canTrade) {
             reasoning.push(`SKIP: ${pos.skipReason}`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: "extreme_rsi" });
+            await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
             continue;
           }
 
           const { leverage, capitalForTrade, assetSize, notionalSize } = pos;
           const tradeAmountPct = (capitalForTrade / equity) * 100;
-          reasoning.push(`ENTRY: ${side.toUpperCase()} ${sig.asset.displayName} | ${leverage}x (MAX) | $${capitalForTrade.toFixed(2)} capital ($${notionalSize.toFixed(0)} notional)`);
+          reasoning.push(`ENTRY: ${side.toUpperCase()} ${sig.asset.displayName} | ${leverage}x (MAX) | $${capitalForTrade.toFixed(2)} capital ($${notionalSize.toFixed(0)} notional) | sizeMult: ${sizeMultiplier}`);
 
           // Execute order
           if (config.apiSecret && config.walletAddress) {
@@ -955,7 +1102,7 @@ class TradingEngine {
                 orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
               });
 
-              log(`[HL RAW] ${sig.asset.coin} extreme_rsi response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
+              log(`[HL RAW] ${sig.asset.coin} ${strategyKey} response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
               const status = orderResult?.response?.data?.statuses?.[0];
               const fillPx = status?.filled?.avgPx;
               const totalSz = status?.filled?.totalSz;
@@ -963,8 +1110,8 @@ class TradingEngine {
 
               if (errorMsg) {
                 reasoning.push(`ORDER REJECTED: ${errorMsg}`);
-                await storage.createLog({ type: "order_error", message: `ORDER REJECTED: [EXTREME_RSI] ${sig.asset.displayName} — ${errorMsg}`, timestamp: new Date().toISOString() });
-                await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: "extreme_rsi" });
+                await storage.createLog({ type: "order_error", message: `ORDER REJECTED: [${strategyKey.toUpperCase()}] ${sig.asset.displayName} — ${errorMsg}`, timestamp: new Date().toISOString() });
+                await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
                 continue;
               }
 
@@ -973,33 +1120,33 @@ class TradingEngine {
                 sig.price = parseFloat(fillPx);
               } else {
                 reasoning.push(`IOC NOT FILLED`);
-                await storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: [EXTREME_RSI] ${sig.asset.displayName} ${side}`, timestamp: new Date().toISOString() });
-                await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: "extreme_rsi" });
+                await storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: [${strategyKey.toUpperCase()}] ${sig.asset.displayName} ${side}`, timestamp: new Date().toISOString() });
+                await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
                 continue;
               }
             } catch (execErr) {
               reasoning.push(`ORDER FAILED: ${execErr}`);
-              await storage.createLog({ type: "order_error", message: `ORDER FAILED: [EXTREME_RSI] ${sig.asset.displayName} — ${execErr}`, timestamp: new Date().toISOString() });
-              await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: "extreme_rsi" });
+              await storage.createLog({ type: "order_error", message: `ORDER FAILED: [${strategyKey.toUpperCase()}] ${sig.asset.displayName} — ${execErr}`, timestamp: new Date().toISOString() });
+              await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
               continue;
             }
           }
 
           const trade = await storage.createTrade({
             coin: sig.asset.coin, side, entryPrice: sig.price, size: tradeAmountPct, leverage,
-            rsiAtEntry: sig.extreme.triggerRSI, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
+            rsiAtEntry: sig.enhanced.triggerRSI, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
             ema10: sig.ema10, ema21: sig.ema21, ema50: sig.ema50,
-            stopLoss: sig.extreme.suggestedSL,
-            takeProfit1: sig.extreme.suggestedTP1,
-            takeProfit2: sig.extreme.suggestedTP2,
+            stopLoss: sig.enhanced.suggestedSL,
+            takeProfit1: sig.enhanced.suggestedTP1,
+            takeProfit2: sig.enhanced.suggestedTP2,
             tp1Hit: false,
-            confluenceScore: 0, // Not applicable for extreme RSI
-            confluenceDetails: `EXTREME RSI: ${sig.extreme.triggerRSI.toFixed(1)} on ${sig.extreme.triggerTF}`,
+            confluenceScore: 0,
+            confluenceDetails: `${sig.enhanced.triggerType.toUpperCase()}: RSI ${sig.enhanced.triggerRSI.toFixed(1)} on ${sig.enhanced.triggerTF} | BB:${sig.enhanced.bollingerConfirm} Vol:${sig.enhanced.volumeExhaustion} ADX:${sig.enhanced.adxValue.toFixed(1)}(${sig.enhanced.adxRegime}) Conf:${sig.enhanced.confidenceScore}/5`,
             riskRewardRatio: 0,
             status: "open",
-            reason: `[EXTREME_RSI] ${side.toUpperCase()} | RSI ${sig.extreme.triggerRSI.toFixed(1)} @${sig.extreme.triggerTF} | ${leverage}x MAX | $${capitalForTrade.toFixed(0)}`,
-            setupType: "extreme_rsi",
-            strategy: "extreme_rsi",
+            reason: `[${strategyKey.toUpperCase()}] ${side.toUpperCase()} | RSI ${sig.enhanced.triggerRSI.toFixed(1)} @${sig.enhanced.triggerTF} | ADX:${sig.enhanced.adxValue.toFixed(0)}(${sig.enhanced.adxRegime}) | Conf:${sig.enhanced.confidenceScore}/5 | ${leverage}x MAX | $${capitalForTrade.toFixed(0)}`,
+            setupType: strategyKey === "bb_rsi_reversion" ? "bb_rsi_reversion" : "extreme_rsi",
+            strategy: strategyKey,
             openedAt: new Date().toISOString(),
           });
 
@@ -1010,24 +1157,24 @@ class TradingEngine {
             volume24h: sig.volume24h, change24h: sig.change24h,
             fundingRate: sig.fundingRate, openInterest: sig.openInterest,
             reasoning: reasoning.join(" | "), equity, leverage, positionSizeUsd: capitalForTrade,
-            strategy: "extreme_rsi",
+            strategy: strategyKey,
           });
 
           await storage.createLog({
             type: "trade_open",
-            message: `[EXTREME_RSI] ${side.toUpperCase()} ${sig.asset.displayName} @ $${displayPrice(sig.price, sig.asset.szDecimals)} | ${leverage}x | RSI ${sig.extreme.triggerRSI.toFixed(1)} @${sig.extreme.triggerTF} | $${capitalForTrade.toFixed(0)}`,
+            message: `[${strategyKey.toUpperCase()}] ${side.toUpperCase()} ${sig.asset.displayName} @ $${displayPrice(sig.price, sig.asset.szDecimals)} | ${leverage}x | RSI ${sig.enhanced.triggerRSI.toFixed(1)} @${sig.enhanced.triggerTF} | Conf:${sig.enhanced.confidenceScore}/5 | $${capitalForTrade.toFixed(0)}`,
             data: JSON.stringify(trade),
             timestamp: new Date().toISOString(),
           });
 
-          openByCoinStrategy.add(`${sig.asset.coin}_extreme_rsi`);
+          openByCoinStrategy.add(`${sig.asset.coin}_${strategyKey}`);
           slotsUsed++;
           this.dailyTradeCount++;
         }
       }
 
       // =============================================
-      // CHECK EXITS — BOTH strategies, isolated logic
+      // CHECK EXITS — all strategies, isolated logic
       // =============================================
       await this.checkExits(equity);
       await this.takePnlSnapshot(equity);
@@ -1046,7 +1193,7 @@ class TradingEngine {
     if (!config) return;
     const openTrades = await storage.getOpenTrades();
     const mids = await fetchAllMids();
-    
+
     const xyzData = await fetchMetaAndAssetCtxs("xyz");
     if (xyzData && xyzData.length >= 2) {
       const universe = xyzData[0]?.universe || [];
@@ -1070,7 +1217,7 @@ class TradingEngine {
       const leveragedPnl = pnlPct * trade.leverage;
       const tradeCapUsd = currentEquity * (trade.size / 100);
       const pnlUsd = tradeCapUsd * (leveragedPnl / 100);
-      const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0; // ROI as % of total AUM
+      const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0;
       const currentPeak = Math.max(trade.peakPnlPct || 0, leveragedPnl);
 
       let shouldClose = false;
@@ -1081,51 +1228,51 @@ class TradingEngine {
       // STRATEGY-SPECIFIC EXIT LOGIC
       // ============================================================
 
-      if (strategy === "extreme_rsi") {
-        // ---- EXTREME RSI EXIT RULES ----
-        // TP1: 0.3% from entry → move SL to breakeven
-        // TP2: 1% from entry → full close
+      if (strategy === "extreme_rsi" || strategy === "bb_rsi_reversion") {
+        // ---- EXTREME RSI / BB REVERSION EXIT RULES ----
+        // TP1: hit → move SL to breakeven
+        // TP2: full close
         // SL: original 0.25% or breakeven (after TP1)
+
+        const stratLabel = strategy.toUpperCase();
 
         // TP1 check — move SL to breakeven
         if (!trade.tp1Hit) {
           const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
-            // Move SL to breakeven (entry price)
             const breakEvenSL = trade.entryPrice;
             await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: leveragedPnl });
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-              reasoning: `[EXTREME_RSI] TP1 hit @ $${displayPrice(currentPrice, szd)} (+0.3%) | SL moved to BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
-              equity: currentEquity, leverage: trade.leverage, strategy: "extreme_rsi",
+              reasoning: `[${stratLabel}] TP1 hit @ $${displayPrice(currentPrice, szd)} | SL moved to BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+              equity: currentEquity, leverage: trade.leverage, strategy,
             });
             await storage.createLog({
               type: "trade_tp1",
-              message: `[EXTREME_RSI] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | SL → BREAKEVEN`,
+              message: `[${stratLabel}] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | SL → BREAKEVEN`,
               timestamp: new Date().toISOString(),
             });
-            // Don't close yet — let it ride to TP2 with BE protection
           }
         }
 
-        // TP2 check — full close at 1%
+        // TP2 check — full close
         if (!shouldClose) {
           const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
-          if (tp2Hit) { shouldClose = true; closeReason = `[EXTREME_RSI] TP2 @ $${displayPrice(currentPrice, szd)} (+1%) | $${pnlUsd.toFixed(2)}`; exitType = "tp2"; }
+          if (tp2Hit) { shouldClose = true; closeReason = `[${stratLabel}] TP2 @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`; exitType = "tp2"; }
         }
 
         // SL check (breakeven after TP1, or original SL before TP1)
         if (!shouldClose) {
           const activeSL = trade.stopLoss;
-          if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `[EXTREME_RSI] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
-          if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `[EXTREME_RSI] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
+          if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `[${stratLabel}] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
+          if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `[${stratLabel}] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
         }
 
       } else {
-        // ---- CONFLUENCE EXIT RULES (original) ----
-        
+        // ---- CONFLUENCE EXIT RULES (legacy — for any remaining open confluence trades) ----
+
         // Progressive SL ratcheting
         const rawPnlPct = pnlPct;
         const slRatchetThreshold = 0.08;
@@ -1211,7 +1358,7 @@ class TradingEngine {
       }
 
       // ============================================================
-      // SHARED CLOSE EXECUTION (both strategies)
+      // SHARED CLOSE EXECUTION (all strategies)
       // ============================================================
 
       if (shouldClose) {
@@ -1375,8 +1522,10 @@ class TradingEngine {
     // Per-strategy stats
     const confluenceTrades = closedTrades.filter(t => (t.strategy || "confluence") === "confluence");
     const extremeTrades = closedTrades.filter(t => t.strategy === "extreme_rsi");
+    const bbReversionTrades = closedTrades.filter(t => t.strategy === "bb_rsi_reversion");
     const confluenceWinRate = confluenceTrades.length > 0 ? (confluenceTrades.filter(t => (t.pnl || 0) > 0).length / confluenceTrades.length) * 100 : 0;
     const extremeWinRate = extremeTrades.length > 0 ? (extremeTrades.filter(t => (t.pnl || 0) > 0).length / extremeTrades.length) * 100 : 0;
+    const bbReversionWinRate = bbReversionTrades.length > 0 ? (bbReversionTrades.filter(t => (t.pnl || 0) > 0).length / bbReversionTrades.length) * 100 : 0;
 
     // Per-strategy dollar P&L
     const confluencePnlUsd = confluenceTrades.reduce((s, t) => {
@@ -1384,6 +1533,10 @@ class TradingEngine {
       return s + cap * ((t.pnl || 0) / 100);
     }, 0);
     const extremePnlUsd = extremeTrades.reduce((s, t) => {
+      const cap = startEq * ((t.size || 10) / 100);
+      return s + cap * ((t.pnl || 0) / 100);
+    }, 0);
+    const bbReversionPnlUsd = bbReversionTrades.reduce((s, t) => {
       const cap = startEq * ((t.size || 10) / 100);
       return s + cap * ((t.pnl || 0) / 100);
     }, 0);
@@ -1415,8 +1568,9 @@ class TradingEngine {
       openTradesWithUsd,
       // Per-strategy breakdown
       strategyStats: {
-        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluencePnlUsd.toFixed(4) },
-        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4) },
+        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluencePnlUsd.toFixed(4), status: "disabled" },
+        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4), status: "active" },
+        bb_rsi_reversion: { trades: bbReversionTrades.length, winRate: bbReversionWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "bb_rsi_reversion").length, pnlUsd: bbReversionPnlUsd.toFixed(4), status: "active" },
       },
     };
   }
