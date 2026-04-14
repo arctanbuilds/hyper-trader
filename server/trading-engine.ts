@@ -616,7 +616,7 @@ class TradingEngine {
       const sessionInfo = getSessionInfo();
       const useSessionFilter = config.useSessionFilter !== false;
       
-      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | DUAL STRATEGY | Trades today: ${this.dailyTradeCount}/${TARGET_DAILY_TRADES}${this.drawdownPaused ? " | DRAWDOWN PAUSED" : ""}`, "engine");
+      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | DUAL STRATEGY | Trades today: ${this.dailyTradeCount}/20${this.drawdownPaused ? " | DRAWDOWN PAUSED" : ""}`, "engine");
 
       // Fetch market data
       const [mainData, xyzData] = await Promise.all([fetchMetaAndAssetCtxs(""), fetchMetaAndAssetCtxs("xyz")]);
