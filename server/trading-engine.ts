@@ -1148,20 +1148,19 @@ class TradingEngine {
 
         if (volume24h < (config.minVolume24h || 1e6)) continue;
 
-        // Fetch candles: OHLCV for 5m, 15m (BB/ADX/volume), 1h & 4h (S/R detection); closes for RSI
-        const [c1m, ohlcv5m, ohlcv15m, ohlcv1h, ohlcv4h, c1d] = await Promise.all([
+        // Fetch candles: OHLCV for 5m, 15m (BB/ADX/volume/S/R), 1h (S/R); closes for RSI on 4h, 1d
+        const [c1m, ohlcv5m, ohlcv15m, ohlcv1h, c4h, c1d] = await Promise.all([
           fetchCandles(asset.coin, "1m", 60),
-          fetchCandlesOHLCV(asset.coin, "5m", 60),
-          fetchCandlesOHLCV(asset.coin, "15m", 60),
-          fetchCandlesOHLCV(asset.coin, "1h", 100),   // 100 bars = ~4 days for S/R
-          fetchCandlesOHLCV(asset.coin, "4h", 100),   // 100 bars = ~17 days for S/R
+          fetchCandlesOHLCV(asset.coin, "5m", 100),    // 100 bars = ~8h for quick S/R
+          fetchCandlesOHLCV(asset.coin, "15m", 100),   // 100 bars = ~25h for medium S/R
+          fetchCandlesOHLCV(asset.coin, "1h", 100),    // 100 bars = ~4 days for macro S/R
+          fetchCandles(asset.coin, "4h", 60),
           fetchCandles(asset.coin, "1d", 30),
         ]);
 
         const c5m = ohlcv5m.map(c => c.close);
         const c15m = ohlcv15m.map(c => c.close);
         const c1h = ohlcv1h.map(c => c.close);
-        const c4h = ohlcv4h.map(c => c.close);
 
         if (c1m.length < 15 && c5m.length < 15 && c15m.length < 15 && c1h.length < 15) continue;
 
@@ -1190,14 +1189,15 @@ class TradingEngine {
         const volume5m = analyzeVolume(volumes5m, 20);
         const volume15m = analyzeVolume(volumes15m, 20);
 
-        // S/R level detection: merge 1h and 4h OHLCV for multi-timeframe levels
-        // Use 1h as primary (more granular), 4h as secondary (stronger macro levels)
-        const sr1h = detectSupportResistance(ohlcv1h, price, 5, 0.003);
-        const sr4h = detectSupportResistance(ohlcv4h, price, 3, 0.005);
-        // Merge: prefer 4h levels (stronger macro zones), then fill with 1h
-        const mergedSRLevels = [...sr4h.levels, ...sr1h.levels]
+        // S/R level detection: 5m + 15m (primary, quick scalp levels) + 1h (secondary, macro confirmation)
+        const sr5m = detectSupportResistance(ohlcv5m, price, 3, 0.002);   // tight pivots, 0.2% cluster
+        const sr15m = detectSupportResistance(ohlcv15m, price, 4, 0.003); // medium pivots, 0.3% cluster
+        const sr1h = detectSupportResistance(ohlcv1h, price, 5, 0.004);   // broad pivots, 0.4% cluster
+        // Merge: 5m/15m levels weighted equally (primary), 1h macro levels as confirmation
+        // Boost 1h levels that also appear on 5m/15m (multi-TF confluence)
+        const mergedSRLevels = [...sr5m.levels, ...sr15m.levels, ...sr1h.levels]
           .sort((a, b) => b.strength - a.strength)
-          .slice(0, 8);
+          .slice(0, 10);
         // Rebuild analysis from merged levels
         const srSupports = mergedSRLevels.filter(l => l.type === "support").sort((a, b) => b.price - a.price);
         const srResistances = mergedSRLevels.filter(l => l.type === "resistance").sort((a, b) => a.price - b.price);
