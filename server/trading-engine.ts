@@ -7,12 +7,14 @@
  *
  * TWO ACTIVE STRATEGIES (one killed):
  *
- * STRATEGY 1 — BB_RSI_REVERSION (LONG only, BTC/ETH only):
- *   - The ONLY net-profitable strategy: +$7.07 across 8 trades
- *   - 87.5% TP1 hit rate (best of all strategies)
- *   - Filter: RSI < 30 on 5m/15m + price at 2.5+ SD Bollinger Band
- *   - BTC and ETH only (SOL BB reversion: -$2.23, 0% WR)
- *   - LONG only (short BB reversion: -$0.29, 0% WR)
+ * STRATEGY 1 — BB_RSI REVERSAL (extreme RSI + Bollinger Band):
+ *   - LONG when RSI ≤ 20 + price at 2.5+ SD lower BB (extreme oversold)
+ *   - SHORT when RSI ≥ 85 + price at 2.5+ SD upper BB (extreme overbought)
+ *   - SL: 0.5% (wide — give reversal room to play out)
+ *   - TP1: 0.3% (lock profit, move SL→BE)
+ *   - TP2: dynamic (bot determines based on S/R, swing levels, BB)
+ *   - All assets (BTC, ETH, SOL) — RSI 20/85 is rare enough to be high conviction
+ *   - Based on BB_RSI_REVERSION which was the ONLY profitable strategy (+$7.07)
  *
  * STRATEGY 2 — BREAKOUT/RETEST (tightened filters):
  *   - Original: -$12.98 across 42 trades (24% WR)
@@ -1152,17 +1154,22 @@ function detectEnhancedRSI(params: {
   let triggerBTF = "";
   let triggerBRSI = 0;
 
-  // Check 5m: price at lower BB + RSI < 30 → long; price at upper BB + RSI > 70 → short
+  // RSI REVERSAL: LONG when RSI ≤ 20 (extreme oversold), SHORT when RSI ≥ 85 (extreme overbought)
+  // These are very rare, high-conviction signals — price at BB + extreme RSI = strong mean reversion
+  // SL: 0.5%, TP1: 0.3% (move SL→BE), TP2: dynamic (bot determines)
+  const REVERSAL_LONG_RSI = 20;   // RSI must be ≤ this to go LONG
+  const REVERSAL_SHORT_RSI = 85;  // RSI must be ≥ this to go SHORT
+
   const bb5mStdDist = bb5m.stdDev > 0 ? Math.abs(price - bb5m.middle) / bb5m.stdDev : 0;
   const bb15mStdDist = bb15m.stdDev > 0 ? Math.abs(price - bb15m.middle) / bb15m.stdDev : 0;
 
   // 5m BB check — require 2.5+ SD for higher-quality entries
   if (triggerBSignal === "none" && bb5mStdDist >= 2.5) {
-    if (price <= bb5m.lower && rsi5m < 28) {
+    if (price <= bb5m.lower && rsi5m <= REVERSAL_LONG_RSI) {
       triggerBSignal = "long";
       triggerBTF = `5m(BB_lower,RSI:${rsi5m.toFixed(1)},${bb5mStdDist.toFixed(1)}SD)`;
       triggerBRSI = rsi5m;
-    } else if (price >= bb5m.upper && rsi5m > 72) {
+    } else if (price >= bb5m.upper && rsi5m >= REVERSAL_SHORT_RSI) {
       triggerBSignal = "short";
       triggerBTF = `5m(BB_upper,RSI:${rsi5m.toFixed(1)},${bb5mStdDist.toFixed(1)}SD)`;
       triggerBRSI = rsi5m;
@@ -1171,11 +1178,11 @@ function detectEnhancedRSI(params: {
 
   // 15m BB check — require 2.5+ SD for higher-quality entries
   if (triggerBSignal === "none" && bb15mStdDist >= 2.5) {
-    if (price <= bb15m.lower && rsi15m < 28) {
+    if (price <= bb15m.lower && rsi15m <= REVERSAL_LONG_RSI) {
       triggerBSignal = "long";
       triggerBTF = `15m(BB_lower,RSI:${rsi15m.toFixed(1)},${bb15mStdDist.toFixed(1)}SD)`;
       triggerBRSI = rsi15m;
-    } else if (price >= bb15m.upper && rsi15m > 72) {
+    } else if (price >= bb15m.upper && rsi15m >= REVERSAL_SHORT_RSI) {
       triggerBSignal = "short";
       triggerBTF = `15m(BB_upper,RSI:${rsi15m.toFixed(1)},${bb15mStdDist.toFixed(1)}SD)`;
       triggerBRSI = rsi15m;
@@ -1247,32 +1254,13 @@ function detectEnhancedRSI(params: {
   // S/R confirmation adds confidence
   if (srConfirm) confidenceScore++;
 
-  // --- TP/SL targets based on trigger type + ADX regime ---
-  // Fee-adjusted: Hyperliquid taker fee = 0.045% per side
-  // Round-trip fee = 0.09% on notional. Min TP1 must exceed this.
-  // We use 0.12% as floor (0.09% fees + 0.03% buffer)
-  const FEE_ADJUSTED_MIN_TP1 = 0.0012; // 0.12% minimum TP1 to guarantee profit after fees
-  let tp1Pct: number;
-  let tp2Pct: number;
-  const slPct = 0.0025; // 0.25% SL for both triggers
-
-  if (triggerType === "extreme_rsi") {
-    tp1Pct = 0.003;  // 0.3%
-    tp2Pct = 0.01;   // 1%
-  } else {
-    // bb_rsi_reversion: tighter targets — raised from 0.2% to 0.3% for fee safety
-    tp1Pct = 0.003;  // 0.3% (was 0.2% — too close to fee breakeven)
-    tp2Pct = 0.005;  // 0.5%
-  }
-
-  // ADX >= 25 (trending): widen TP targets by 50%
-  if (adxRegime === "trending") {
-    tp1Pct *= 1.5;
-    tp2Pct *= 1.5;
-  }
-
-  // Enforce fee floor on TP1
-  tp1Pct = Math.max(tp1Pct, FEE_ADJUSTED_MIN_TP1);
+  // --- TP/SL targets for BB_RSI_REVERSION ---
+  // User-defined: SL = 0.5%, TP1 = 0.3% (move SL→BE after hit), TP2 = dynamic (bot determines)
+  // Fee-adjusted: Hyperliquid taker fee = 0.045% per side, round-trip = 0.09%
+  // TP1 at 0.3% = 0.21% net profit after fees — always profitable
+  const slPct = 0.005;    // 0.5% SL — wider SL gives room for the reversal to play out
+  const tp1Pct = 0.003;   // 0.3% TP1 — lock in profit, move SL to BE
+  const tp2Pct = 0.01;    // 1% initial TP2 placeholder — dynamic TP2 overrides this after TP1 hit
 
   let sl: number, tp1: number, tp2: number;
   if (signal === "long") {
@@ -1700,26 +1688,20 @@ class TradingEngine {
           timestamp: new Date().toISOString(),
         });
 
-        // --- ENHANCED RSI + BB + S/R DETECTION ---
-        // DATA-DRIVEN FILTER: BB_RSI_REVERSION only on BTC/ETH, LONG only, RSI < 30
-        // Analysis of 154 trades showed:
-        //   - BB_RSI on BTC/ETH LONG: +$9.59 (100% WR on BTC, 50% on ETH)
-        //   - BB_RSI SHORT: -$0.29 (0% WR)
-        //   - BB_RSI on SOL: -$2.23 (0% WR)
-        //   - extreme_rsi (confluence) strategy: DISABLED entirely (-$48.60)
-        const bbRsiAllowed = (asset.coin === "BTC" || asset.coin === "ETH");
-        if (bbRsiAllowed) {
-          const enhanced = detectEnhancedRSI({
-            price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d,
-            bb5m, bb15m, volume5m, volume15m, adxValue, srAnalysis,
+        // --- BB_RSI REVERSAL DETECTION ---
+        // Extreme RSI reversal: LONG when RSI ≤ 20, SHORT when RSI ≥ 85
+        // These thresholds are very rare = high conviction. All assets allowed.
+        // SL: 0.5%, TP1: 0.3% (→ SL moves to BE), TP2: dynamic
+        // extreme_rsi (confluence) strategy remains DISABLED (-$48.60 across 103 trades)
+        const enhanced = detectEnhancedRSI({
+          price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d,
+          bb5m, bb15m, volume5m, volume15m, adxValue, srAnalysis,
+        });
+        if (enhanced.triggered) {
+          enhancedSignals.push({
+            asset, price, enhanced, volume24h, change24h, fundingRate: funding, openInterest,
+            rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
           });
-          // Only take LONG signals (data: shorts lost money on BB reversion)
-          if (enhanced.triggered && enhanced.signal === "long" && enhanced.triggerRSI < 30) {
-            enhancedSignals.push({
-              asset, price, enhanced, volume24h, change24h, fundingRate: funding, openInterest,
-              rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
-            });
-          }
         }
 
         // --- BREAKOUT/RETEST DETECTION (completely separate from RSI/BB) ---
