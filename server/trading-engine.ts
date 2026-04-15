@@ -693,7 +693,7 @@ function detectBreakoutRetest(
   currentPrice: number,
   tf: string,
   candles1m: OHLCVCandle[],   // 1m OHLCV for reaction confirmation
-  retestTolerance: number = 0.0015,  // 0.15% proximity to trendline — entry must be TIGHT to TL
+  retestTolerance: number = 0.0005,  // 0.05% proximity to trendline — surgical entry AT the TL
   maxBreakoutAge: number = 30,
 ): BreakoutRetestResult {
   const noResult: BreakoutRetestResult = {
@@ -2091,8 +2091,8 @@ class TradingEngine {
               // v10.5.5: ALWAYS enter at TL price. If price has drifted too far, SKIP the trade.
               const tlEntry = brSig.result.trendlineValueNow;
               const driftFromTL = Math.abs(brSig.price - tlEntry) / brSig.price;
-              if (driftFromTL > 0.002) {
-                // Price is >0.2% away from TL — entry would be too far, skip
+              if (driftFromTL > 0.001) {
+                // Price is >0.1% away from TL — entry would be too far, skip
                 reasoning.push(`SKIP: Price drifted ${(driftFromTL * 100).toFixed(3)}% from TL ($${displayPrice(brSig.price, brSig.asset.szDecimals)} vs TL $${displayPrice(tlEntry, brSig.asset.szDecimals)}) — entry too far from trendline`);
                 await storage.createLog({ type: "order_skipped", message: `SKIP: [BREAKOUT_RETEST] ${brSig.asset.displayName} ${side} — price drifted ${(driftFromTL * 100).toFixed(3)}% from TL`, timestamp: new Date().toISOString() });
                 await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
