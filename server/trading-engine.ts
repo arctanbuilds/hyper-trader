@@ -1060,26 +1060,26 @@ function detectEnhancedRSI(params: {
   const bb5mStdDist = bb5m.stdDev > 0 ? Math.abs(price - bb5m.middle) / bb5m.stdDev : 0;
   const bb15mStdDist = bb15m.stdDev > 0 ? Math.abs(price - bb15m.middle) / bb15m.stdDev : 0;
 
-  // 5m BB check
-  if (triggerBSignal === "none" && bb5mStdDist >= 2) {
-    if (price <= bb5m.lower && rsi5m < 30) {
+  // 5m BB check — require 2.5+ SD for higher-quality entries
+  if (triggerBSignal === "none" && bb5mStdDist >= 2.5) {
+    if (price <= bb5m.lower && rsi5m < 28) {
       triggerBSignal = "long";
       triggerBTF = `5m(BB_lower,RSI:${rsi5m.toFixed(1)},${bb5mStdDist.toFixed(1)}SD)`;
       triggerBRSI = rsi5m;
-    } else if (price >= bb5m.upper && rsi5m > 70) {
+    } else if (price >= bb5m.upper && rsi5m > 72) {
       triggerBSignal = "short";
       triggerBTF = `5m(BB_upper,RSI:${rsi5m.toFixed(1)},${bb5mStdDist.toFixed(1)}SD)`;
       triggerBRSI = rsi5m;
     }
   }
 
-  // 15m BB check
-  if (triggerBSignal === "none" && bb15mStdDist >= 2) {
-    if (price <= bb15m.lower && rsi15m < 30) {
+  // 15m BB check — require 2.5+ SD for higher-quality entries
+  if (triggerBSignal === "none" && bb15mStdDist >= 2.5) {
+    if (price <= bb15m.lower && rsi15m < 28) {
       triggerBSignal = "long";
       triggerBTF = `15m(BB_lower,RSI:${rsi15m.toFixed(1)},${bb15mStdDist.toFixed(1)}SD)`;
       triggerBRSI = rsi15m;
-    } else if (price >= bb15m.upper && rsi15m > 70) {
+    } else if (price >= bb15m.upper && rsi15m > 72) {
       triggerBSignal = "short";
       triggerBTF = `15m(BB_upper,RSI:${rsi15m.toFixed(1)},${bb15mStdDist.toFixed(1)}SD)`;
       triggerBRSI = rsi15m;
@@ -1534,7 +1534,12 @@ class TradingEngine {
           bestBR = br5m;
         }
 
-        if (bestBR && bestBR.triggered && bestBR.confidenceScore >= 2) {
+        // HIGH-QUALITY FILTER: require conf >= 4, rejection candle, and 4-12 bars since breakout
+        if (bestBR && bestBR.triggered
+            && bestBR.confidenceScore >= 4
+            && bestBR.rejectionConfirm === true
+            && bestBR.barsSinceBreakout >= 4
+            && bestBR.barsSinceBreakout <= 12) {
           breakoutRetestSignals.push({
             asset, price, result: bestBR, volume24h, change24h, fundingRate: funding, openInterest,
             rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
@@ -1567,6 +1572,11 @@ class TradingEngine {
 
           const strategyKey = sig.enhanced.triggerType === "bb_rsi_reversion" ? "bb_rsi_reversion" : "extreme_rsi";
           if (openByCoinStrategy.has(`${sig.asset.coin}_${strategyKey}`)) continue;
+
+          // HIGH-QUALITY FILTER: require confidence >= 4/6 for all RSI/BB entries
+          if (sig.enhanced.confidenceScore < 4) continue;
+          // Block trades into strong S/R levels
+          if (sig.enhanced.srBlock) continue;
 
           const side = sig.enhanced.signal as "long" | "short";
           const reasoning: string[] = [];

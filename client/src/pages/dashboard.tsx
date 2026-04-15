@@ -420,12 +420,12 @@ export default function Dashboard() {
                         )}
                         {trade.strategy === "breakout_retest" && (
                           <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-cyan-500/10 text-cyan-400 border-cyan-500/30">
-                            B/R
+                            Retest
                           </Badge>
                         )}
                         {(!trade.strategy || trade.strategy === "confluence") && trade.confluenceScore != null && (
                           <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
-                            C:{trade.confluenceScore}
+                            Conf
                           </Badge>
                         )}
                       </div>
