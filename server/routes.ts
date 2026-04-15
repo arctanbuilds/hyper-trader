@@ -99,11 +99,35 @@ export async function registerRoutes(
       : await storage.getAllTrades(200);
 
     // Enrich each trade with dollar P&L and ROI as % of AUM
+    // v10.5.2: Uses split P&L when TP1 was hit (50% at TP1, 50% at exit) + fee deduction
     const equity = tradingEngine.getLastKnownEquity();
+    const FEE_RATE = 0.00045; // Hyperliquid taker fee per side
     const enriched = trades.map((t: any) => {
       const tradeCapUsd = equity * ((t.size || 10) / 100);
-      const pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
-      // ROI as % of total AUM
+      const positionValue = tradeCapUsd * (t.leverage || 1);
+      let pnlUsd: number;
+      const exitPx = t.exitPrice || t.entryPrice; // fallback for open trades without exitPrice
+      if (t.tp1Hit && t.takeProfit1 && t.exitPrice) {
+        // Split: 50% realized at TP1, 50% at exit
+        const halfPos = positionValue / 2;
+        const tp1Move = t.side === "long"
+          ? (t.takeProfit1 - t.entryPrice) / t.entryPrice
+          : (t.entryPrice - t.takeProfit1) / t.entryPrice;
+        const tp2Move = t.side === "long"
+          ? (exitPx - t.entryPrice) / t.entryPrice
+          : (t.entryPrice - exitPx) / t.entryPrice;
+        pnlUsd = halfPos * tp1Move + halfPos * tp2Move
+          - positionValue * FEE_RATE - halfPos * FEE_RATE - halfPos * FEE_RATE;
+      } else if (t.exitPrice) {
+        // No TP1 hit — full position move
+        const rawMove = t.side === "long"
+          ? (exitPx - t.entryPrice) / t.entryPrice
+          : (t.entryPrice - exitPx) / t.entryPrice;
+        pnlUsd = positionValue * rawMove - positionValue * FEE_RATE * 2;
+      } else {
+        // Open trade — use stored pnl (already corrected by monitoring loop)
+        pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
+      }
       const pnlOfAum = equity > 0 ? (pnlUsd / equity) * 100 : 0;
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
