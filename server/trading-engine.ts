@@ -736,7 +736,7 @@ function detectBreakoutRetest(
     // SL: placed beyond the trendline at current bar + buffer
     // This survives the retest wick that naturally dips into the trendline
     const tp1Pct = 0.0025; // 0.25% profit
-    const tp2Pct = 0.01;   // 1% profit
+    const tp2Pct = 0.005;  // 0.5% profit
     const slBuffer = 0.003; // 0.3% buffer beyond trendline — wide enough to survive retest wicks
 
     let sl: number, tp1: number, tp2: number;
