@@ -35,7 +35,7 @@ export const botConfig = pgTable("bot_config", {
   useEmaFilter: boolean("use_ema_filter").default(true),
   useLiquidationFilter: boolean("use_liquidation_filter").default(true),
   // Scan settings
-  scanIntervalSecs: integer("scan_interval_secs").default(60),
+  scanIntervalSecs: integer("scan_interval_secs").default(10),
   // Max daily/weekly loss
   maxDailyLossPct: doublePrecision("max_daily_loss_pct").default(0.75),
   maxWeeklyLossPct: doublePrecision("max_weekly_loss_pct").default(1.5),

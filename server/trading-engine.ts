@@ -1573,7 +1573,7 @@ class TradingEngine {
   private async scheduleNextScan() {
     const config = await storage.getConfig();
     if (!config?.isRunning) return;
-    this.scanTimer = setTimeout(() => this.runScanCycle(), (config.scanIntervalSecs || 30) * 1000);
+    this.scanTimer = setTimeout(() => this.runScanCycle(), (config.scanIntervalSecs || 10) * 1000);
   }
 
   private async refreshEquity(): Promise<number> {
@@ -2194,7 +2194,7 @@ class TradingEngine {
   private async checkExits(equity?: number) {
     const config = await storage.getConfig();
     if (!config) return;
-    const openTrades = await storage.getOpenTrades();
+    let openTrades = await storage.getOpenTrades();
     const mids = await fetchAllMids();
 
     const xyzData = await fetchMetaAndAssetCtxs("xyz");
@@ -2206,6 +2206,56 @@ class TradingEngine {
       }
     }
     const currentEquity = equity || this.lastKnownEquity || 0;
+
+    // v10.5.2: POSITION SYNC — detect ghost trades (bot thinks open, HL says closed)
+    // Queries actual Hyperliquid positions and auto-closes any bot trades with no match
+    if (config.apiSecret && config.walletAddress && openTrades.length > 0) {
+      try {
+        const syncExec = createExecutor(config.apiSecret, config.walletAddress);
+        const hlPositions = await syncExec.getPositions();
+        const hlCoinsWithPos = new Set<string>();
+        for (const p of hlPositions) {
+          const sz = Math.abs(parseFloat(p.position?.szi || "0"));
+          if (sz > 0) hlCoinsWithPos.add(p.position.coin);
+        }
+        for (const trade of openTrades) {
+          if (!hlCoinsWithPos.has(trade.coin)) {
+            // Bot thinks this trade is open, but no position exists on Hyperliquid
+            const closePrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
+            const FEE_SYNC = 0.00045;
+            const tcap = currentEquity * (trade.size / 100);
+            const pv = tcap * trade.leverage;
+            let syncPnl: number;
+            if (trade.tp1Hit && trade.takeProfit1) {
+              const hp = pv / 2;
+              const t1m = trade.side === "long" ? (trade.takeProfit1 - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - trade.takeProfit1) / trade.entryPrice;
+              const t2m = trade.side === "long" ? (closePrice - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - closePrice) / trade.entryPrice;
+              syncPnl = hp * t1m + hp * t2m - pv * FEE_SYNC - hp * FEE_SYNC - hp * FEE_SYNC;
+            } else {
+              const rm = trade.side === "long" ? (closePrice - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - closePrice) / trade.entryPrice;
+              syncPnl = pv * rm - pv * FEE_SYNC * 2;
+            }
+            const syncLevPnl = tcap > 0 ? (syncPnl / tcap) * 100 : 0;
+            const syncAumPnl = currentEquity > 0 ? (syncPnl / currentEquity) * 100 : 0;
+            await storage.updateTrade(trade.id, {
+              exitPrice: closePrice, pnl: syncLevPnl, pnlPct: syncAumPnl,
+              status: "closed", closeReason: "Position closed on Hyperliquid (sync)",
+              closedAt: new Date().toISOString(),
+            });
+            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed — no HL position found | P&L: $${syncPnl.toFixed(2)}`, "engine");
+            await storage.createLog({
+              type: "trade_close",
+              message: `[SYNC] Auto-closed ${trade.coin} ${trade.side} #${trade.id} — no matching HL position | P&L: $${syncPnl.toFixed(2)}`,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+        // Refresh open trades after sync
+        openTrades = await storage.getOpenTrades();
+      } catch (e) {
+        log(`[SYNC] Position sync error: ${e}`, "engine");
+      }
+    }
 
     for (const trade of openTrades) {
       const currentPrice = parseFloat(mids[trade.coin] || "0");

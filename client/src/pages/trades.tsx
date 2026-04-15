@@ -98,13 +98,17 @@ export default function Trades() {
                 <TableCell className="font-medium text-xs">
                   <div className="flex items-center gap-1">
                     {getAssetLabel(trade.coin)}
-                    {trade.strategy === "extreme_rsi" ? (
-                      <Badge variant="outline" className="text-[8px] px-1 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">
-                        E.RSI
+                    {trade.strategy === "bb_rsi_reversion" ? (
+                      <Badge variant="outline" className="text-[8px] px-1 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                        Reversal
+                      </Badge>
+                    ) : trade.strategy === "breakout_retest" ? (
+                      <Badge variant="outline" className="text-[8px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
+                        Retest
                       </Badge>
                     ) : (
-                      <Badge variant="outline" className="text-[8px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
-                        CONF
+                      <Badge variant="outline" className="text-[8px] px-1 py-0 bg-zinc-500/10 text-zinc-400 border-zinc-500/30">
+                        Legacy
                       </Badge>
                     )}
                   </div>
