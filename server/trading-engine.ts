@@ -14,8 +14,9 @@
  *   - Price BREAKS through trendline
  *   - Price comes BACK to retest
  *   - 1-MINUTE candle shows REACTION (rejection candle off the TL)
- *   - ENTER in direction of the reaction (LONG if bounce up, SHORT if reject down)
- *   - Direction comes from the 1m reaction, NOT the TL type
+ *   - Descending TL break → retest → LONG ONLY
+ *   - Ascending TL break → retest → SHORT ONLY
+ *   - 1m reaction candle must CONFIRM the expected direction
  *   - SL: wide — recent swing extreme (capped at 2%, min 0.3%)
  *   - TP1: 0.3% → BE, TP2: dynamic
  *   - 80% margin, max leverage, one position at a time
@@ -674,14 +675,13 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
  *   3. Price comes BACK to retest the trendline
  *   4. On the 1m timeframe, a candle REACTS off the trendline
  *      (wick touches TL, body closes away = rejection candle)
- *   5. ENTER in the direction of the reaction:
- *      - If price bounces UP off the TL → LONG
- *      - If price rejects DOWN off the TL → SHORT
- *   6. SL: as wide as safely possible (recent swing extreme beyond the TL)
- *   7. TP: standard 0.3% TP1 → BE → dynamic TP2
- *
- * Direction is determined by the 1m reaction candle, NOT by the TL type.
- * Both ascending and descending TLs can produce longs or shorts.
+ *   5. ENTER in the direction dictated by the TL polarity flip:
+ *      - Descending TL broken upward → retest from above → LONG ONLY
+ *      - Ascending TL broken downward → retest from below → SHORT ONLY
+ *      - NEVER the other way around
+ *   6. 1m reaction candle must CONFIRM the expected direction
+ *   7. SL: as wide as safely possible (recent swing extreme beyond the TL)
+ *   8. TP: standard 0.3% TP1 → BE → dynamic TP2
  */
 function detectBreakoutRetest(
   candles: OHLCVCandle[],
@@ -793,6 +793,13 @@ function detectBreakoutRetest(
 
     // No 1m reaction candle found → skip this trendline
     if (signal === "none" || !rejectionConfirm) continue;
+
+    // === DIRECTION RULE (strict) ===
+    // Descending TL broken upward → retest from above → LONG ONLY
+    // Ascending TL broken downward → retest from below → SHORT ONLY
+    // Never the other way around.
+    if (tl.type === "descending" && signal !== "long") continue;
+    if (tl.type === "ascending" && signal !== "short") continue;
 
     // Confidence scoring
     let conf = 2; // base: TL exists + break + retest + 1m reaction = already strong
