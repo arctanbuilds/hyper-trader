@@ -543,12 +543,20 @@ function trendlineAt(tl: Trendline, idx: number): number {
 
 /**
  * Detect trendlines from OHLCV candles by connecting swing highs (descending)
- * and swing lows (ascending). Returns strongest trendlines.
+ * and swing lows (ascending).
+ *
+ * v10 OVERHAUL: Build clean trendlines from well-separated significant swing points.
+ * The ideal pattern (from user chart examples):
+ *   1. Descending TL: 2-3+ swing HIGHS forming lower highs, well spaced apart
+ *   2. Ascending TL: 2-3+ swing LOWS forming higher lows, well spaced apart
+ *   3. Pivots must be SIGNIFICANT — not minor noise wiggles
+ *   4. No candle body should have CLOSED beyond the trendline before the breakout
+ *      (the TL must have held as resistance/support until the break)
  */
 function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Trendline[] {
   if (candles.length < pivotWindow * 2 + 5) return [];
 
-  // Find swing highs and swing lows
+  // Find swing highs and swing lows with proper pivot window
   const swingHighs: { idx: number; price: number }[] = [];
   const swingLows: { idx: number; price: number }[] = [];
 
@@ -562,28 +570,61 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
     if (isLow) swingLows.push({ idx: i, price: candles[i].low });
   }
 
+  // QUALITY FILTER: Remove pivots that are too close together (keep the most significant one)
+  // Minimum spacing: 4 bars apart for swing points to count as separate
+  const MIN_PIVOT_SPACING = 4;
+  function filterPivots(pivots: { idx: number; price: number }[], keepHigher: boolean): typeof pivots {
+    if (pivots.length <= 1) return pivots;
+    const filtered: typeof pivots = [pivots[0]];
+    for (let i = 1; i < pivots.length; i++) {
+      const last = filtered[filtered.length - 1];
+      if (pivots[i].idx - last.idx < MIN_PIVOT_SPACING) {
+        // Too close — keep the more extreme one
+        if (keepHigher ? pivots[i].price > last.price : pivots[i].price < last.price) {
+          filtered[filtered.length - 1] = pivots[i];
+        }
+      } else {
+        filtered.push(pivots[i]);
+      }
+    }
+    return filtered;
+  }
+
+  const cleanHighs = filterPivots(swingHighs, true);
+  const cleanLows = filterPivots(swingLows, false);
+
   const trendlines: Trendline[] = [];
-  const tolerancePct = 0.002; // 0.2% tolerance for "touching" the trendline
+  const tolerancePct = 0.0015; // 0.15% tolerance for "touching" the trendline (tighter = cleaner lines)
 
   // Build DESCENDING trendlines from swing highs (lower highs)
-  for (let a = 0; a < swingHighs.length - 1; a++) {
-    for (let b = a + 1; b < swingHighs.length; b++) {
-      const p1 = swingHighs[a], p2 = swingHighs[b];
+  for (let a = 0; a < cleanHighs.length - 1; a++) {
+    for (let b = a + 1; b < cleanHighs.length; b++) {
+      const p1 = cleanHighs[a], p2 = cleanHighs[b];
       if (p2.price >= p1.price) continue; // must be descending
-      if (p2.idx - p1.idx < 3) continue;  // minimum span
+      if (p2.idx - p1.idx < 5) continue;  // minimum span — need real separation
 
       const slope = (p2.price - p1.price) / (p2.idx - p1.idx);
-      // Count how many swing highs touch this line
+
+      // Count touches
       let touches = 2;
-      for (let c = 0; c < swingHighs.length; c++) {
+      for (let c = 0; c < cleanHighs.length; c++) {
         if (c === a || c === b) continue;
-        const expected = p1.price + slope * (swingHighs[c].idx - p1.idx);
-        if (Math.abs(swingHighs[c].price - expected) / expected <= tolerancePct) touches++;
+        const expected = p1.price + slope * (cleanHighs[c].idx - p1.idx);
+        if (Math.abs(cleanHighs[c].price - expected) / expected <= tolerancePct) touches++;
       }
 
-      let strength = Math.min(touches, 3); // max 3 from touches
-      if (p2.idx - p1.idx >= 15) strength++; // long trendline bonus
-      if (touches >= 3) strength++; // multi-touch bonus
+      // VALIDITY CHECK: no candle body should have CLOSED above the TL between p1 and p2
+      // (the TL must have held as resistance until the actual breakout)
+      let tlHeld = true;
+      for (let i = p1.idx + 1; i <= p2.idx; i++) {
+        const tlVal = p1.price + slope * (i - p1.idx);
+        if (candles[i].close > tlVal * (1 + tolerancePct)) { tlHeld = false; break; }
+      }
+      if (!tlHeld) continue;
+
+      let strength = Math.min(touches, 3);
+      if (p2.idx - p1.idx >= 15) strength++;
+      if (touches >= 3) strength++;
       strength = Math.min(strength, 5);
 
       trendlines.push({
@@ -594,19 +635,27 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
   }
 
   // Build ASCENDING trendlines from swing lows (higher lows)
-  for (let a = 0; a < swingLows.length - 1; a++) {
-    for (let b = a + 1; b < swingLows.length; b++) {
-      const p1 = swingLows[a], p2 = swingLows[b];
+  for (let a = 0; a < cleanLows.length - 1; a++) {
+    for (let b = a + 1; b < cleanLows.length; b++) {
+      const p1 = cleanLows[a], p2 = cleanLows[b];
       if (p2.price <= p1.price) continue; // must be ascending
-      if (p2.idx - p1.idx < 3) continue;
+      if (p2.idx - p1.idx < 5) continue;
 
       const slope = (p2.price - p1.price) / (p2.idx - p1.idx);
       let touches = 2;
-      for (let c = 0; c < swingLows.length; c++) {
+      for (let c = 0; c < cleanLows.length; c++) {
         if (c === a || c === b) continue;
-        const expected = p1.price + slope * (swingLows[c].idx - p1.idx);
-        if (Math.abs(swingLows[c].price - expected) / expected <= tolerancePct) touches++;
+        const expected = p1.price + slope * (cleanLows[c].idx - p1.idx);
+        if (Math.abs(cleanLows[c].price - expected) / expected <= tolerancePct) touches++;
       }
+
+      // VALIDITY CHECK: no candle body should have CLOSED below the TL between p1 and p2
+      let tlHeld = true;
+      for (let i = p1.idx + 1; i <= p2.idx; i++) {
+        const tlVal = p1.price + slope * (i - p1.idx);
+        if (candles[i].close < tlVal * (1 - tolerancePct)) { tlHeld = false; break; }
+      }
+      if (!tlHeld) continue;
 
       let strength = Math.min(touches, 3);
       if (p2.idx - p1.idx >= 15) strength++;
@@ -628,14 +677,21 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
 /**
  * Detect trendline breakout-and-retest patterns.
  *
- * Descending trendline broken to the UPSIDE → price retests from above → LONG
- * Ascending trendline broken to the DOWNSIDE → price retests from below → SHORT
+ * v10 OVERHAUL based on user chart examples:
+ *   1. Build clean trendlines from significant, well-spaced swing points
+ *   2. Trendline must have HELD as S/R (no closes beyond it before breakout)
+ *   3. After breakout, price must come BACK to the trendline
+ *   4. Entry is AT the trendline itself (the projected TL value = entry price)
+ *   5. SL: 0.5% from entry, TP1: 0.3% from entry (→ SL moves to BE), TP2: dynamic
+ *
+ * Descending trendline broken to the UPSIDE → price retests from above → LONG at TL
+ * Ascending trendline broken to the DOWNSIDE → price retests from below → SHORT at TL
  */
 function detectBreakoutRetest(
   candles: OHLCVCandle[],
   currentPrice: number,
   tf: string,
-  retestTolerance: number = 0.003,  // 0.3% proximity to trendline = "retesting"
+  retestTolerance: number = 0.002,  // 0.2% proximity to trendline = "at the trendline"
   maxBreakoutAge: number = 20,
 ): BreakoutRetestResult {
   const noResult: BreakoutRetestResult = {
@@ -655,27 +711,25 @@ function detectBreakoutRetest(
   const lastIdx = candles.length - 1;
 
   for (const tl of trendlines) {
-    // Project trendline value across all bars after the trendline's end
-    // Look for breakout: a candle that closes on the other side of the trendline
-
+    // Find the breakout candle: the FIRST close beyond the trendline after TL end
     let breakoutIdx = -1;
     const scanStart = Math.max(tl.endIdx + 1, lastIdx - maxBreakoutAge - 10);
 
     for (let i = scanStart; i <= lastIdx; i++) {
       const tlValue = trendlineAt(tl, i);
       const c = candles[i];
-      const prev = i > 0 ? candles[i - 1] : c;
-      const prevTlValue = trendlineAt(tl, i - 1);
 
       if (tl.type === "descending") {
-        // Breakout: previous close was below trendline, current close is above
-        if (prev.close <= prevTlValue && c.close > tlValue) {
+        // Breakout upward: candle closes ABOVE descending TL
+        if (c.close > tlValue * (1 + 0.001)) { // need a clear break, not just touching
           breakoutIdx = i;
+          break; // take the first breakout
         }
       } else {
-        // Ascending breakout (bearish): previous close was above, current close is below
-        if (prev.close >= prevTlValue && c.close < tlValue) {
+        // Breakout downward: candle closes BELOW ascending TL
+        if (c.close < tlValue * (1 - 0.001)) {
           breakoutIdx = i;
+          break;
         }
       }
     }
@@ -685,43 +739,55 @@ function detectBreakoutRetest(
     const barsSinceBreak = lastIdx - breakoutIdx;
     if (barsSinceBreak < 2 || barsSinceBreak > maxBreakoutAge) continue;
 
-    // Current trendline value (projected to now)
+    // Current trendline value (projected to the current bar)
     const tlValueNow = trendlineAt(tl, lastIdx);
     const tlValueAtBreak = trendlineAt(tl, breakoutIdx);
+
+    // How close is the current price to the trendline?
     const distToTL = Math.abs(currentPrice - tlValueNow) / tlValueNow;
 
-    // Is price close enough to the trendline to be "retesting"?
+    // ENTRY AT THE TRENDLINE: price must be very close to (or touching) the projected TL
     if (distToTL > retestTolerance) continue;
 
-    // Determine signal
+    // Determine signal — price must be on the correct side for a retest
     let signal: "long" | "short" | "none" = "none";
-    if (tl.type === "descending" && currentPrice >= tlValueNow * (1 - retestTolerance)) {
-      // Broke above descending trendline, retesting from above = LONG
-      signal = "long";
-    } else if (tl.type === "ascending" && currentPrice <= tlValueNow * (1 + retestTolerance)) {
-      // Broke below ascending trendline, retesting from below = SHORT
-      signal = "short";
+    if (tl.type === "descending") {
+      // Broke above descending TL → retesting from above (or right at it) → LONG
+      // Price should be at or just above the TL line
+      if (currentPrice >= tlValueNow * (1 - retestTolerance)) {
+        signal = "long";
+      }
+    } else {
+      // Broke below ascending TL → retesting from below (or right at it) → SHORT
+      if (currentPrice <= tlValueNow * (1 + retestTolerance)) {
+        signal = "short";
+      }
     }
 
     if (signal === "none") continue;
 
-    // Verify price actually moved away from the trendline after breakout
-    // (must have been clearly on the other side at some point)
-    let movedAway = false;
-    for (let i = breakoutIdx + 1; i <= lastIdx - 1; i++) {
+    // VERIFY: After breakout, price must have moved away from the TL at some point
+    // then come back to it (a real retest, not just hovering at the break level)
+    let maxMoveAway = 0;
+    for (let i = breakoutIdx + 1; i <= lastIdx; i++) {
       const tlv = trendlineAt(tl, i);
-      if (signal === "long" && candles[i].close > tlv * (1 + retestTolerance)) movedAway = true;
-      if (signal === "short" && candles[i].close < tlv * (1 - retestTolerance)) movedAway = true;
+      const dist = signal === "long"
+        ? (candles[i].close - tlv) / tlv  // how far above TL (positive = moved away)
+        : (tlv - candles[i].close) / tlv; // how far below TL (positive = moved away)
+      if (dist > maxMoveAway) maxMoveAway = dist;
     }
-    if (!movedAway) continue;
+    // Must have moved at least 0.15% away from TL before coming back
+    if (maxMoveAway < 0.0015) continue;
 
-    // Check rejection candle: wick touching the trendline, body closing away from it
+    // Check if the current candle shows rejection (wick touching TL, body closing away)
     const lastCandle = candles[lastIdx];
     let rejectionConfirm = false;
     if (signal === "long") {
-      rejectionConfirm = lastCandle.low <= tlValueNow * (1 + retestTolerance * 0.5) && lastCandle.close > tlValueNow;
+      // Wick dipped to or below TL, but body closed above it
+      rejectionConfirm = lastCandle.low <= tlValueNow * (1 + 0.001) && lastCandle.close > tlValueNow;
     } else {
-      rejectionConfirm = lastCandle.high >= tlValueNow * (1 - retestTolerance * 0.5) && lastCandle.close < tlValueNow;
+      // Wick reached up to or above TL, but body closed below it
+      rejectionConfirm = lastCandle.high >= tlValueNow * (1 - 0.001) && lastCandle.close < tlValueNow;
     }
 
     // Confidence scoring
@@ -729,27 +795,25 @@ function detectBreakoutRetest(
     if (tl.strength >= 3) conf++;
     if (tl.touches >= 3) conf++;
     if (rejectionConfirm) conf++;
-    if (barsSinceBreak <= 10) conf++; // fresh breakout
+    if (barsSinceBreak >= 6 && barsSinceBreak <= 15) conf++; // sweet spot from data analysis
     conf = Math.min(conf, 5);
 
-    // TP: 0.25% for TP1, 1% for TP2 (from price move)
-    // SL: placed beyond the trendline at current bar + buffer
-    // This survives the retest wick that naturally dips into the trendline
-    const tp1Pct = 0.0025; // 0.25% profit
-    const tp2Pct = 0.005;  // 0.5% profit
-    const slBuffer = 0.003; // 0.3% buffer beyond trendline — wide enough to survive retest wicks
+    // TP/SL: Same as reversal strategy (0.5% SL, 0.3% TP1 → BE, dynamic TP2)
+    // ENTRY is at the trendline value itself for best possible entry price
+    const entryAtTL = tlValueNow; // the ideal entry = exactly at the trendline
+    const tp1Pct = 0.003; // 0.3% TP1
+    const tp2Pct = 0.01;  // 1% initial TP2 placeholder (dynamic TP2 overrides after TP1)
+    const slPct = 0.005;  // 0.5% SL
 
     let sl: number, tp1: number, tp2: number;
     if (signal === "long") {
-      // SL below the trendline value (price is above TL on retest)
-      sl = tlValueNow * (1 - slBuffer);
-      tp1 = currentPrice * (1 + tp1Pct);
-      tp2 = currentPrice * (1 + tp2Pct);
+      sl = entryAtTL * (1 - slPct);
+      tp1 = entryAtTL * (1 + tp1Pct);
+      tp2 = entryAtTL * (1 + tp2Pct);
     } else {
-      // SL above the trendline value (price is below TL on retest)
-      sl = tlValueNow * (1 + slBuffer);
-      tp1 = currentPrice * (1 - tp1Pct);
-      tp2 = currentPrice * (1 - tp2Pct);
+      sl = entryAtTL * (1 + slPct);
+      tp1 = entryAtTL * (1 - tp1Pct);
+      tp2 = entryAtTL * (1 - tp2Pct);
     }
 
     candidates.push({
@@ -764,7 +828,14 @@ function detectBreakoutRetest(
 
   if (candidates.length === 0) return noResult;
 
-  candidates.sort((a, b) => b.confidenceScore - a.confidenceScore || b.trendlineStrength - a.trendlineStrength);
+  // Sort by confidence, then by how close price is to the TL (closer = better entry)
+  candidates.sort((a, b) => {
+    if (b.confidenceScore !== a.confidenceScore) return b.confidenceScore - a.confidenceScore;
+    // Prefer entry closer to trendline
+    const distA = Math.abs(a.retestPrice - a.trendlineValueNow) / a.trendlineValueNow;
+    const distB = Math.abs(b.retestPrice - b.trendlineValueNow) / b.trendlineValueNow;
+    return distA - distB;
+  });
   return candidates[0];
 }
 
