@@ -2214,12 +2214,39 @@ class TradingEngine {
       const szd = ac?.szDecimals ?? 2;
       const strategy: StrategyType = (trade.strategy as StrategyType) || "confluence";
 
-      const rawPnlPctMove = trade.side === "long"
-        ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100
-        : ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100;
-      const leveragedPnl = rawPnlPctMove * trade.leverage;
+      // v10.5 FIX: Accurate P&L that accounts for partial close at TP1
+      // After TP1: 50% was closed at ~takeProfit1, 50% rides to current price
+      // Fees: Hyperliquid taker 0.045% per side, applied to full open + each close
+      const FEE_RATE = 0.00045; // 0.045% taker fee per side
       const tradeCapUsd = currentEquity * (trade.size / 100);
-      const pnlUsd = tradeCapUsd * (leveragedPnl / 100);
+      const positionValue = tradeCapUsd * trade.leverage;
+      let pnlUsd: number;
+      if (trade.tp1Hit && trade.takeProfit1) {
+        // Split: 50% realized at TP1, 50% at current price
+        const halfPos = positionValue / 2;
+        const tp1Move = trade.side === "long"
+          ? (trade.takeProfit1 - trade.entryPrice) / trade.entryPrice
+          : (trade.entryPrice - trade.takeProfit1) / trade.entryPrice;
+        const tp2Move = trade.side === "long"
+          ? (currentPrice - trade.entryPrice) / trade.entryPrice
+          : (trade.entryPrice - currentPrice) / trade.entryPrice;
+        const tp1Pnl = halfPos * tp1Move; // realized from first half
+        const tp2Pnl = halfPos * tp2Move; // unrealized/realized from second half
+        // Fees: open (full), close TP1 (half), close TP2 (half)
+        const openFee = positionValue * FEE_RATE;
+        const tp1CloseFee = halfPos * FEE_RATE;
+        const tp2CloseFee = halfPos * FEE_RATE;
+        pnlUsd = tp1Pnl + tp2Pnl - openFee - tp1CloseFee - tp2CloseFee;
+      } else {
+        // No TP1 yet — full position, single move
+        const rawMove = trade.side === "long"
+          ? (currentPrice - trade.entryPrice) / trade.entryPrice
+          : (trade.entryPrice - currentPrice) / trade.entryPrice;
+        pnlUsd = positionValue * rawMove;
+        // Fees: open (full) + projected close (full)
+        pnlUsd -= positionValue * FEE_RATE * 2; // round-trip fee estimate
+      }
+      const leveragedPnl = tradeCapUsd > 0 ? (pnlUsd / tradeCapUsd) * 100 : 0;
       // ROI as % of total AUM — this is what we display everywhere
       const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0;
       const currentPeak = Math.max(trade.peakPnlPct || 0, leveragedPnl);
@@ -2629,13 +2656,29 @@ class TradingEngine {
         }
       } catch (e) { log(`Close error: ${e}`, "engine"); }
     }
-    const leveragedPnl = trade.side === "long"
-      ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100 * trade.leverage
-      : ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100 * trade.leverage;
+    // v10.5 FIX: Accurate P&L for manual close (accounts for TP1 partial + fees)
+    const FEE_RATE_MC = 0.00045;
     const eq = this.lastKnownEquity || 0;
     const tradeCapUsd = eq * (trade.size / 100);
-    const pnlUsd = tradeCapUsd * (leveragedPnl / 100);
-    // ROI as % of total AUM
+    const posValue = tradeCapUsd * trade.leverage;
+    let pnlUsd: number;
+    if (trade.tp1Hit && trade.takeProfit1) {
+      const halfPos = posValue / 2;
+      const tp1Move = trade.side === "long"
+        ? (trade.takeProfit1 - trade.entryPrice) / trade.entryPrice
+        : (trade.entryPrice - trade.takeProfit1) / trade.entryPrice;
+      const tp2Move = trade.side === "long"
+        ? (currentPrice - trade.entryPrice) / trade.entryPrice
+        : (trade.entryPrice - currentPrice) / trade.entryPrice;
+      pnlUsd = halfPos * tp1Move + halfPos * tp2Move
+        - posValue * FEE_RATE_MC - halfPos * FEE_RATE_MC - halfPos * FEE_RATE_MC;
+    } else {
+      const rawMove = trade.side === "long"
+        ? (currentPrice - trade.entryPrice) / trade.entryPrice
+        : (trade.entryPrice - currentPrice) / trade.entryPrice;
+      pnlUsd = posValue * rawMove - posValue * FEE_RATE_MC * 2;
+    }
+    const leveragedPnl = tradeCapUsd > 0 ? (pnlUsd / tradeCapUsd) * 100 : 0;
     const pnlOfAum = eq > 0 ? (pnlUsd / eq) * 100 : 0;
 
     const updated = await storage.updateTrade(trade.id, {
@@ -2716,12 +2759,11 @@ class TradingEngine {
     const drawdownPct = this.dayStartEquity > 0 ? ((this.dayStartEquity - currentEquity) / this.dayStartEquity) * 100 : 0;
     const drawdownUsd = this.dayStartEquity - currentEquity;
 
-    // Per-trade dollar P&L for open positions
-    // pnl = leveraged position P&L %, pnlPct = ROI as % of AUM
+    // Per-trade dollar P&L for open positions (uses already-corrected pnl from monitoring loop)
+    // pnl field now accounts for TP1 partial close split + fees (v10.5 fix)
     const openTradesWithUsd = openTrades.map(t => {
       const tradeCapUsd = currentEquity * ((t.size || 10) / 100);
       const pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
-      // Also compute pnlOfAum for display (in case pnlPct not yet updated on open trades)
       const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0;
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
