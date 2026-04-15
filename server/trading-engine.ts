@@ -693,7 +693,7 @@ function detectBreakoutRetest(
   currentPrice: number,
   tf: string,
   candles1m: OHLCVCandle[],   // 1m OHLCV for reaction confirmation
-  retestTolerance: number = 0.003,  // 0.3% proximity to trendline = "at the trendline"
+  retestTolerance: number = 0.0015,  // 0.15% proximity to trendline — entry must be TIGHT to TL
   maxBreakoutAge: number = 30,
 ): BreakoutRetestResult {
   const noResult: BreakoutRetestResult = {
@@ -833,19 +833,20 @@ function detectBreakoutRetest(
       wideSL = highestHigh * 1.001; // tiny buffer above the swing high
     }
 
-    // Safety cap: SL should not be more than 2% away (prevent absurd SLs)
-    const maxSlDist = currentPrice * 0.02;
-    if (Math.abs(wideSL - currentPrice) > maxSlDist) {
-      wideSL = signal === "long" ? currentPrice - maxSlDist : currentPrice + maxSlDist;
+    // Safety cap: SL should not be more than 2% away from TL entry (prevent absurd SLs)
+    const maxSlDist = tlValueNow * 0.02;
+    if (Math.abs(wideSL - tlValueNow) > maxSlDist) {
+      wideSL = signal === "long" ? tlValueNow - maxSlDist : tlValueNow + maxSlDist;
     }
-    // Minimum SL distance: at least 0.3% to avoid getting stopped on noise
-    const minSlDist = currentPrice * 0.003;
-    if (Math.abs(wideSL - currentPrice) < minSlDist) {
-      wideSL = signal === "long" ? currentPrice - minSlDist : currentPrice + minSlDist;
+    // Minimum SL distance: at least 0.3% from TL entry to avoid getting stopped on noise
+    const minSlDist = tlValueNow * 0.003;
+    if (Math.abs(wideSL - tlValueNow) < minSlDist) {
+      wideSL = signal === "long" ? tlValueNow - minSlDist : tlValueNow + minSlDist;
     }
 
     // TP: standard 0.3% TP1, 1% TP2 placeholder (dynamic TP2 kicks in after TP1)
-    const entryAtTL = currentPrice; // enter at current price (confirmed by 1m reaction)
+    // Use TL value as entry basis — we ALWAYS enter at the trendline, not at market price
+    const entryAtTL = tlValueNow;
     const tp1Pct = 0.003;
     const tp2Pct = 0.01;
 
@@ -2062,13 +2063,16 @@ class TradingEngine {
           reasoning.push(`Confidence: ${brSig.result.confidenceScore}/5 | TF: ${brSig.result.triggerTF}`);
           reasoning.push(`TP1: $${displayPrice(brSig.result.suggestedTP1, brSig.asset.szDecimals)} (0.3%) | TP2: dynamic after TP1`);
           reasoning.push(`SL: $${displayPrice(brSig.result.suggestedSL, brSig.asset.szDecimals)} (wide — swing extreme) → BE after TP1`);
+          const tlDist = Math.abs(brSig.price - brSig.result.trendlineValueNow);
+          reasoning.push(`TL Entry: $${displayPrice(brSig.result.trendlineValueNow, brSig.asset.szDecimals)} | Market: $${displayPrice(brSig.price, brSig.asset.szDecimals)} | Gap: $${tlDist.toFixed(1)} (${((tlDist / brSig.price) * 100).toFixed(3)}%)`);
           reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(brSig.fundingRate * 100).toFixed(4)}%`);
 
           // Position sizing — 80% of equity, max leverage (high conviction single trade)
           const leverage = brSig.asset.maxLeverage;
           const capitalForTrade = equity * 0.80; // 80% of AUM
           const notionalSize = capitalForTrade * leverage;
-          const assetSize = notionalSize / brSig.price;
+          // Size based on TL entry price, not market price
+          const assetSize = notionalSize / brSig.result.trendlineValueNow;
           const tradeAmountPct = 80;
 
           if (capitalForTrade < 5) {
@@ -2084,13 +2088,18 @@ class TradingEngine {
               const executor = createExecutor(config.apiSecret, config.walletAddress);
               const isCross = !brSig.asset.isolatedOnly;
               await executor.setLeverage(brSig.asset.coin, leverage, isCross);
-              // Use TL value as target entry for best fill near the line,
-              // with small slippage buffer to ensure IOC fills
+              // v10.5.5: ALWAYS enter at TL price. If price has drifted too far, SKIP the trade.
               const tlEntry = brSig.result.trendlineValueNow;
-              const slippageMult = side === "long" ? 1.005 : 0.995; // tighter slippage — we want entry near TL
-              const orderPrice = (Math.abs(brSig.price - tlEntry) / brSig.price < 0.003)
-                ? tlEntry * (side === "long" ? 1.003 : 0.997) // if close to TL, use TL + tiny buffer
-                : brSig.price * slippageMult; // fallback to market if drifted from TL
+              const driftFromTL = Math.abs(brSig.price - tlEntry) / brSig.price;
+              if (driftFromTL > 0.002) {
+                // Price is >0.2% away from TL — entry would be too far, skip
+                reasoning.push(`SKIP: Price drifted ${(driftFromTL * 100).toFixed(3)}% from TL ($${displayPrice(brSig.price, brSig.asset.szDecimals)} vs TL $${displayPrice(tlEntry, brSig.asset.szDecimals)}) — entry too far from trendline`);
+                await storage.createLog({ type: "order_skipped", message: `SKIP: [BREAKOUT_RETEST] ${brSig.asset.displayName} ${side} — price drifted ${(driftFromTL * 100).toFixed(3)}% from TL`, timestamp: new Date().toISOString() });
+                await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
+                continue;
+              }
+              // Place limit order at TL price + tiny buffer for fill (0.1% slippage max)
+              const orderPrice = tlEntry * (side === "long" ? 1.001 : 0.999);
               const roundedSize = parseFloat(formatHLSize(assetSize, brSig.asset.szDecimals));
               if (roundedSize <= 0) { reasoning.push(`SKIP: Rounded size is 0`); continue; }
               const orderResult = await executor.placeOrder({
