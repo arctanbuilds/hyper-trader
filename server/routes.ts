@@ -104,7 +104,17 @@ export async function registerRoutes(
     const currentEquity = tradingEngine.getLastKnownEquity();
     const FEE_RATE = 0.00045; // Hyperliquid taker fee per side
     const enriched = trades.map((t: any) => {
-      const eqForTrade = t.entryEquity || currentEquity;
+      // Use entryEquity if stored; otherwise extract from reason field ("80% AUM ($54)")
+      let eqForTrade = t.entryEquity;
+      if (!eqForTrade && t.reason) {
+        const capMatch = t.reason.match(/AUM \(\$(\d+)\)/);
+        if (capMatch) {
+          const capUsd = parseFloat(capMatch[1]);
+          const sizePct = (t.size || 10) / 100;
+          eqForTrade = sizePct > 0 ? capUsd / sizePct : currentEquity;
+        }
+      }
+      if (!eqForTrade) eqForTrade = currentEquity;
       const tradeCapUsd = eqForTrade * ((t.size || 10) / 100);
       const positionValue = tradeCapUsd * (t.leverage || 1);
       let pnlUsd: number;
