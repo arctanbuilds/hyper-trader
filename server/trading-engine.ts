@@ -2048,12 +2048,16 @@ class TradingEngine {
 
         const stratLabel = strategy.toUpperCase();
 
-        // TP1 check — PARTIAL CLOSE 50% + move SL to breakeven
+        // TP1 check — PARTIAL CLOSE 50% + move SL to breakeven+buffer
         if (!trade.tp1Hit) {
           const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
-            const breakEvenSL = trade.entryPrice;
+            // BE + 0.06% buffer: covers close fee (0.045%) + slippage so "breakeven" is never a loss
+            const beBuffer = 0.0006;
+            const breakEvenSL = trade.side === "long"
+              ? trade.entryPrice * (1 + beBuffer)
+              : trade.entryPrice * (1 - beBuffer);
             // Execute 50% partial close on Hyperliquid
             let partialCloseSuccess = false;
             if (config.apiSecret && config.walletAddress) {
@@ -2086,12 +2090,12 @@ class TradingEngine {
             await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-              reasoning: `[${stratLabel}] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+              reasoning: `[${stratLabel}] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE+buffer @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
               equity: currentEquity, leverage: trade.leverage, strategy,
             });
             await storage.createLog({
               type: "trade_tp1",
-              message: `[${stratLabel}] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BREAKEVEN`,
+              message: `[${stratLabel}] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE+0.06%`,
               timestamp: new Date().toISOString(),
             });
           }
@@ -2115,12 +2119,16 @@ class TradingEngine {
         // ---- BREAKOUT/RETEST EXIT RULES (fully separate) ----
         // TP1 0.3% → close 50% + SL to BE, TP2 0.7% → close remaining, SL 0.25%
 
-        // TP1 check — PARTIAL CLOSE 50% + move SL to breakeven
+        // TP1 check — PARTIAL CLOSE 50% + move SL to breakeven+buffer
         if (!trade.tp1Hit) {
           const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
-            const breakEvenSL = trade.entryPrice;
+            // BE + 0.06% buffer: covers close fee (0.045%) + slippage so "breakeven" is never a loss
+            const beBuffer = 0.0006;
+            const breakEvenSL = trade.side === "long"
+              ? trade.entryPrice * (1 + beBuffer)
+              : trade.entryPrice * (1 - beBuffer);
             // Execute 50% partial close on Hyperliquid
             let partialCloseSuccess = false;
             if (config.apiSecret && config.walletAddress) {
@@ -2153,12 +2161,12 @@ class TradingEngine {
             await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-              reasoning: `[BREAKOUT_RETEST] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+              reasoning: `[BREAKOUT_RETEST] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE+buffer @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
               equity: currentEquity, leverage: trade.leverage, strategy: "breakout_retest",
             });
             await storage.createLog({
               type: "trade_tp1",
-              message: `[BREAKOUT_RETEST] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BREAKEVEN`,
+              message: `[BREAKOUT_RETEST] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE+0.06%`,
               timestamp: new Date().toISOString(),
             });
           }
