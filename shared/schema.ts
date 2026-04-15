@@ -68,6 +68,8 @@ export const trades = pgTable("trades", {
   confluenceScore: integer("confluence_score").default(0),
   confluenceDetails: text("confluence_details").default(""),
   riskRewardRatio: doublePrecision("risk_reward_ratio"),
+  // Equity at trade open (for accurate P&L calculation)
+  entryEquity: doublePrecision("entry_equity"),
   // P&L
   pnl: doublePrecision("pnl"),
   pnlPct: doublePrecision("pnl_pct"),

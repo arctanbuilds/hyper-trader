@@ -1994,6 +1994,7 @@ class TradingEngine {
 
           const trade = await storage.createTrade({
             coin: sig.asset.coin, side, entryPrice: sig.price, size: tradeAmountPct, leverage,
+            entryEquity: equity,
             rsiAtEntry: sig.enhanced.triggerRSI, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
             ema10: sig.ema10, ema21: sig.ema21, ema50: sig.ema50,
             stopLoss: sig.enhanced.suggestedSL,
@@ -2130,6 +2131,7 @@ class TradingEngine {
 
           const trade = await storage.createTrade({
             coin: brSig.asset.coin, side, entryPrice: brSig.price, size: tradeAmountPct, leverage,
+            entryEquity: equity,
             rsiAtEntry: brSig.rsi1h, rsi4h: brSig.rsi4h, rsi1d: brSig.rsi1d,
             ema10: brSig.ema10, ema21: brSig.ema21, ema50: brSig.ema50,
             stopLoss: brSig.result.suggestedSL,
@@ -2223,7 +2225,8 @@ class TradingEngine {
             // Bot thinks this trade is open, but no position exists on Hyperliquid
             const closePrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
             const FEE_SYNC = 0.00045;
-            const tcap = currentEquity * (trade.size / 100);
+            const syncEq = (trade as any).entryEquity || currentEquity;
+            const tcap = syncEq * (trade.size / 100);
             const pv = tcap * trade.leverage;
             let syncPnl: number;
             if (trade.tp1Hit && trade.takeProfit1) {
@@ -2236,7 +2239,7 @@ class TradingEngine {
               syncPnl = pv * rm - pv * FEE_SYNC * 2;
             }
             const syncLevPnl = tcap > 0 ? (syncPnl / tcap) * 100 : 0;
-            const syncAumPnl = currentEquity > 0 ? (syncPnl / currentEquity) * 100 : 0;
+            const syncAumPnl = syncEq > 0 ? (syncPnl / syncEq) * 100 : 0;
             await storage.updateTrade(trade.id, {
               exitPrice: closePrice, pnl: syncLevPnl, pnlPct: syncAumPnl,
               status: "closed", closeReason: "Position closed on Hyperliquid (sync)",
@@ -2268,7 +2271,9 @@ class TradingEngine {
       // After TP1: 50% was closed at ~takeProfit1, 50% rides to current price
       // Fees: Hyperliquid taker 0.045% per side, applied to full open + each close
       const FEE_RATE = 0.00045; // 0.045% taker fee per side
-      const tradeCapUsd = currentEquity * (trade.size / 100);
+      // Use entryEquity (stored at trade open) for accurate position sizing
+      const eqForTrade = (trade as any).entryEquity || currentEquity;
+      const tradeCapUsd = eqForTrade * (trade.size / 100);
       const positionValue = tradeCapUsd * trade.leverage;
       let pnlUsd: number;
       if (trade.tp1Hit && trade.takeProfit1) {
@@ -2297,8 +2302,8 @@ class TradingEngine {
         pnlUsd -= positionValue * FEE_RATE * 2; // round-trip fee estimate
       }
       const leveragedPnl = tradeCapUsd > 0 ? (pnlUsd / tradeCapUsd) * 100 : 0;
-      // ROI as % of total AUM — this is what we display everywhere
-      const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0;
+      // ROI as % of AUM at trade entry — this is what we display everywhere
+      const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
       const currentPeak = Math.max(trade.peakPnlPct || 0, leveragedPnl);
 
       let shouldClose = false;
@@ -2709,7 +2714,8 @@ class TradingEngine {
     // v10.5 FIX: Accurate P&L for manual close (accounts for TP1 partial + fees)
     const FEE_RATE_MC = 0.00045;
     const eq = this.lastKnownEquity || 0;
-    const tradeCapUsd = eq * (trade.size / 100);
+    const eqForClose = (trade as any).entryEquity || eq;
+    const tradeCapUsd = eqForClose * (trade.size / 100);
     const posValue = tradeCapUsd * trade.leverage;
     let pnlUsd: number;
     if (trade.tp1Hit && trade.takeProfit1) {
@@ -2729,7 +2735,7 @@ class TradingEngine {
       pnlUsd = posValue * rawMove - posValue * FEE_RATE_MC * 2;
     }
     const leveragedPnl = tradeCapUsd > 0 ? (pnlUsd / tradeCapUsd) * 100 : 0;
-    const pnlOfAum = eq > 0 ? (pnlUsd / eq) * 100 : 0;
+    const pnlOfAum = eqForClose > 0 ? (pnlUsd / eqForClose) * 100 : 0;
 
     const updated = await storage.updateTrade(trade.id, {
       exitPrice: currentPrice, pnl: leveragedPnl, pnlPct: pnlOfAum, status: "closed",

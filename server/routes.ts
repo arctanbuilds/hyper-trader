@@ -99,11 +99,13 @@ export async function registerRoutes(
       : await storage.getAllTrades(200);
 
     // Enrich each trade with dollar P&L and ROI as % of AUM
-    // v10.5.2: Uses split P&L when TP1 was hit (50% at TP1, 50% at exit) + fee deduction
-    const equity = tradingEngine.getLastKnownEquity();
+    // v10.5.3: Uses entryEquity (stored at trade time) for accurate position sizing
+    // Falls back to current equity for old trades without entryEquity
+    const currentEquity = tradingEngine.getLastKnownEquity();
     const FEE_RATE = 0.00045; // Hyperliquid taker fee per side
     const enriched = trades.map((t: any) => {
-      const tradeCapUsd = equity * ((t.size || 10) / 100);
+      const eqForTrade = t.entryEquity || currentEquity;
+      const tradeCapUsd = eqForTrade * ((t.size || 10) / 100);
       const positionValue = tradeCapUsd * (t.leverage || 1);
       let pnlUsd: number;
       const exitPx = t.exitPrice || t.entryPrice; // fallback for open trades without exitPrice
@@ -128,7 +130,7 @@ export async function registerRoutes(
         // Open trade — use stored pnl (already corrected by monitoring loop)
         pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
       }
-      const pnlOfAum = equity > 0 ? (pnlUsd / equity) * 100 : 0;
+      const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
     res.json(enriched);
