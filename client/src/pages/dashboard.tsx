@@ -249,7 +249,7 @@ export default function Dashboard() {
           <Card>
             <CardContent className="p-4">
               <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-violet-500/10 text-violet-400 border-violet-500/30">REVERSAL</Badge>
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">REVERSAL</Badge>
               </div>
               <div className="space-y-1 mt-2">
                 <div className="flex justify-between text-xs font-mono">
@@ -266,7 +266,7 @@ export default function Dashboard() {
           <Card>
             <CardContent className="p-4">
               <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-cyan-500/10 text-cyan-400 border-cyan-500/30">BREAKOUT/RETEST</Badge>
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">RETEST</Badge>
               </div>
               <div className="space-y-1 mt-2">
                 <div className="flex justify-between text-xs font-mono">
@@ -409,12 +409,12 @@ export default function Dashboard() {
                         <span className="text-sm font-medium">{getAssetLabel(trade.coin)}</span>
                         <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
                         {trade.strategy === "bb_rsi_reversion" && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-violet-500/10 text-violet-400 border-violet-500/30">
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
                             Reversal
                           </Badge>
                         )}
                         {trade.strategy === "breakout_retest" && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-cyan-500/10 text-cyan-400 border-cyan-500/30">
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
                             Retest
                           </Badge>
                         )}
