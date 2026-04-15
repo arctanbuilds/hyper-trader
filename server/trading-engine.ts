@@ -768,6 +768,119 @@ function detectBreakoutRetest(
   return candidates[0];
 }
 
+// ============ DYNAMIC TP2 DETERMINATION ============
+// After TP1 hit, scan price structure to find optimal exit:
+// 1. Nearest S/R level in the direction of the trade
+// 2. Recent swing high/low from 5m/15m candles
+// 3. Bollinger Band middle or opposite band
+// 4. Fallback: 0.5% from entry if nothing found
+function determineDynamicTP2(params: {
+  side: "long" | "short";
+  entryPrice: number;
+  currentPrice: number;
+  ohlcv5m: Array<{ open: number; high: number; low: number; close: number }>;
+  ohlcv15m: Array<{ open: number; high: number; low: number; close: number }>;
+  bb15m: { upper: number; middle: number; lower: number; stdDev: number };
+  srLevels: Array<{ price: number; strength: number; type: string }>;
+}): { tp2: number; reason: string } {
+  const { side, entryPrice, currentPrice, ohlcv5m, ohlcv15m, bb15m, srLevels } = params;
+  const candidates: Array<{ price: number; reason: string; priority: number }> = [];
+
+  // 1. S/R levels in the trade direction (strongest signal)
+  if (srLevels && srLevels.length > 0) {
+    for (const sr of srLevels) {
+      if (side === "long" && sr.price > currentPrice && sr.price > entryPrice) {
+        // Resistance above — natural exit for longs
+        candidates.push({ price: sr.price * 0.999, reason: `S/R resistance @ $${sr.price.toFixed(0)} (str:${sr.strength})`, priority: sr.strength >= 3 ? 1 : 2 });
+      } else if (side === "short" && sr.price < currentPrice && sr.price < entryPrice) {
+        // Support below — natural exit for shorts
+        candidates.push({ price: sr.price * 1.001, reason: `S/R support @ $${sr.price.toFixed(0)} (str:${sr.strength})`, priority: sr.strength >= 3 ? 1 : 2 });
+      }
+    }
+  }
+
+  // 2. Recent swing highs/lows from 15m candles (last 30 candles)
+  const swingCandles = ohlcv15m.slice(-30);
+  if (swingCandles.length >= 5) {
+    for (let i = 2; i < swingCandles.length - 2; i++) {
+      const c = swingCandles[i];
+      if (side === "long") {
+        // Swing high = potential resistance
+        if (c.high > swingCandles[i-1].high && c.high > swingCandles[i-2].high &&
+            c.high > swingCandles[i+1].high && c.high > swingCandles[i+2].high &&
+            c.high > currentPrice && c.high > entryPrice) {
+          candidates.push({ price: c.high * 0.999, reason: `15m swing high @ $${c.high.toFixed(0)}`, priority: 3 });
+        }
+      } else {
+        // Swing low = potential support
+        if (c.low < swingCandles[i-1].low && c.low < swingCandles[i-2].low &&
+            c.low < swingCandles[i+1].low && c.low < swingCandles[i+2].low &&
+            c.low < currentPrice && c.low < entryPrice) {
+          candidates.push({ price: c.low * 1.001, reason: `15m swing low @ $${c.low.toFixed(0)}`, priority: 3 });
+        }
+      }
+    }
+  }
+
+  // 3. Also check 5m swings for closer targets
+  const swing5m = ohlcv5m.slice(-40);
+  if (swing5m.length >= 5) {
+    for (let i = 2; i < swing5m.length - 2; i++) {
+      const c = swing5m[i];
+      if (side === "long") {
+        if (c.high > swing5m[i-1].high && c.high > swing5m[i-2].high &&
+            c.high > swing5m[i+1].high && c.high > swing5m[i+2].high &&
+            c.high > currentPrice && c.high > entryPrice) {
+          candidates.push({ price: c.high * 0.999, reason: `5m swing high @ $${c.high.toFixed(0)}`, priority: 4 });
+        }
+      } else {
+        if (c.low < swing5m[i-1].low && c.low < swing5m[i-2].low &&
+            c.low < swing5m[i+1].low && c.low < swing5m[i+2].low &&
+            c.low < currentPrice && c.low < entryPrice) {
+          candidates.push({ price: c.low * 1.001, reason: `5m swing low @ $${c.low.toFixed(0)}`, priority: 4 });
+        }
+      }
+    }
+  }
+
+  // 4. Bollinger Band targets
+  if (bb15m.stdDev > 0) {
+    if (side === "long" && bb15m.upper > currentPrice) {
+      candidates.push({ price: bb15m.upper * 0.999, reason: `BB upper band @ $${bb15m.upper.toFixed(0)}`, priority: 5 });
+    } else if (side === "short" && bb15m.lower < currentPrice) {
+      candidates.push({ price: bb15m.lower * 1.001, reason: `BB lower band @ $${bb15m.lower.toFixed(0)}`, priority: 5 });
+    }
+    // BB middle as conservative target
+    if (side === "long" && bb15m.middle > currentPrice && bb15m.middle > entryPrice) {
+      candidates.push({ price: bb15m.middle, reason: `BB middle @ $${bb15m.middle.toFixed(0)}`, priority: 6 });
+    } else if (side === "short" && bb15m.middle < currentPrice && bb15m.middle < entryPrice) {
+      candidates.push({ price: bb15m.middle, reason: `BB middle @ $${bb15m.middle.toFixed(0)}`, priority: 6 });
+    }
+  }
+
+  // Filter: TP2 must be profitable (better than entry)
+  const profitable = candidates.filter(c => {
+    if (side === "long") return c.price > entryPrice * 1.001; // at least 0.1% profit
+    return c.price < entryPrice * 0.999;
+  });
+
+  // Sort by priority (lower = better), then by distance from current price (nearest first for same priority)
+  profitable.sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    const distA = Math.abs(a.price - currentPrice);
+    const distB = Math.abs(b.price - currentPrice);
+    return distA - distB;
+  });
+
+  if (profitable.length > 0) {
+    return { tp2: profitable[0].price, reason: profitable[0].reason };
+  }
+
+  // Fallback: 0.5% from entry
+  const fallbackTp2 = side === "long" ? entryPrice * 1.005 : entryPrice * 0.995;
+  return { tp2: fallbackTp2, reason: `Fallback 0.5% from entry` };
+}
+
 // ============ HYPERLIQUID API ============
 const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
 
@@ -2051,18 +2164,63 @@ class TradingEngine {
           }
         }
 
-        // TP2 check — close remaining position
+        // TP2 check — DYNAMIC after TP1, or fixed before TP1
         if (!shouldClose) {
-          const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
-                         (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
-          if (tp2Hit) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] TP2 @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`; exitType = "tp2"; }
+          if (trade.tp1Hit) {
+            // DYNAMIC TP2: fetch fresh OHLCV + S/R and determine best exit
+            try {
+              const asset = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
+              if (asset) {
+                const [ohlcv5m, ohlcv15m] = await Promise.all([
+                  fetchOHLCV(trade.coin, "5m", 50),
+                  fetchOHLCV(trade.coin, "15m", 35),
+                ]);
+                const bb15m = computeBollingerBands(ohlcv15m);
+                const srData = this.latestSRLevels[trade.coin];
+                const srLevels = srData ? [...(srData.levels5m || []), ...(srData.levels15m || []), ...(srData.levels1h || [])] : [];
+
+                const dynamic = determineDynamicTP2({
+                  side: trade.side as "long" | "short",
+                  entryPrice: trade.entryPrice,
+                  currentPrice,
+                  ohlcv5m, ohlcv15m, bb15m,
+                  srLevels,
+                });
+
+                // Update the stored TP2 so dashboard shows it
+                if (Math.abs(dynamic.tp2 - (trade.takeProfit2 || 0)) > 1) {
+                  await storage.updateTrade(trade.id, { takeProfit2: dynamic.tp2 });
+                  log(`[DYNAMIC_TP2] ${trade.coin} TP2 updated to $${displayPrice(dynamic.tp2, szd)} — ${dynamic.reason}`, "engine");
+                }
+
+                const tp2Hit = (trade.side === "long" && currentPrice >= dynamic.tp2) ||
+                               (trade.side === "short" && currentPrice <= dynamic.tp2);
+                if (tp2Hit) {
+                  shouldClose = true;
+                  closeReason = `[BREAKOUT_RETEST] DYNAMIC TP2 @ $${displayPrice(currentPrice, szd)} | Target: ${dynamic.reason} | $${pnlUsd.toFixed(2)}`;
+                  exitType = "tp2";
+                }
+              }
+            } catch (e) {
+              log(`[DYNAMIC_TP2] Error: ${e}`, "engine");
+              // Fallback to stored TP2
+              const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
+                             (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
+              if (tp2Hit) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] TP2 @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`; exitType = "tp2"; }
+            }
+          } else {
+            // Before TP1: use stored TP2 as normal
+            const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
+                           (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
+            if (tp2Hit) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] TP2 @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`; exitType = "tp2"; }
+          }
         }
 
-        // SL check (breakeven after TP1, or original SL before TP1)
+        // SL check (breakeven after TP1, or trendline-based SL before TP1)
         if (!shouldClose) {
           const activeSL = trade.stopLoss;
-          if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
-          if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
+          if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : " (below trendline)"}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
+          if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `[BREAKOUT_RETEST] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : " (above trendline)"}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
         }
 
       } else {
