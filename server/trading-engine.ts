@@ -1596,30 +1596,13 @@ class TradingEngine {
         });
       }
 
-      // 50% DRAWDOWN CHECK — from day-start AUM
-      if (this.dayStartEquity > 0) {
-        const drawdownPct = ((this.dayStartEquity - equity) / this.dayStartEquity) * 100;
-        if (drawdownPct >= 50 && !this.drawdownPaused) {
-          this.drawdownPaused = true;
-          const msg = `50% DRAWDOWN HIT — Day start: $${this.dayStartEquity.toFixed(2)} → Current: $${equity.toFixed(2)} (${drawdownPct.toFixed(1)}% down). Pausing new entries for today. Triggering learning review.`;
-          await logDecision({ coin: "ALL", action: "circuit_breaker", price: 0, reasoning: msg, equity, strategy: "extreme_rsi" });
-          await storage.createLog({ type: "drawdown_stop", message: msg, timestamp: new Date().toISOString() });
-          log(msg, "engine");
-          // Trigger immediate deep learning review to analyze mistakes
-          try {
-            await run24hReview();
-            this.lastLearningReview = Date.now();
-            await storage.createLog({ type: "learning_24h", message: "DRAWDOWN REVIEW — emergency learning review triggered by 50% drawdown", timestamp: new Date().toISOString() });
-          } catch (e) { log(`Drawdown review error: ${e}`, "engine"); }
-        }
-      }
-      // If drawdown paused, still check exits but skip new entries
-      const canOpenNew = !this.drawdownPaused;
+      // Drawdown check removed — user disabled all exposure reduction
+      const canOpenNew = true;
 
       const sessionInfo = getSessionInfo();
       const useSessionFilter = config.useSessionFilter !== false;
 
-      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | v10 DATA-DRIVEN MODE (BB_RSI+Breakout only) | Trades today: ${this.dailyTradeCount}/20${this.drawdownPaused ? " | DRAWDOWN PAUSED" : ""}`, "engine");
+      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | v10.3 REVERSAL+RETEST (80% margin, no limits) | Trades today: ${this.dailyTradeCount}`, "engine");
 
       // Fetch market data
       const [mainData, xyzData] = await Promise.all([fetchMetaAndAssetCtxs(""), fetchMetaAndAssetCtxs("xyz")]);
@@ -1875,31 +1858,26 @@ class TradingEngine {
             continue;
           }
 
-          // Check learning insights
+          // Learning insights — log only, never block trades
           const insightCheck = await checkInsights({ coin: sig.asset.coin, side, session: sessionInfo.session, confluenceScore: 7, dayOfWeek: now.getUTCDay() });
-          if (insightCheck.shouldBlock) {
-            reasoning.push(`BLOCKED BY LEARNING: ${insightCheck.blockReason}`);
+          if (insightCheck.warnings.length > 0) {
+            reasoning.push(`LEARNING NOTE: ${insightCheck.warnings.join(", ")}`);
+          }
+
+          // Position sizing — 80% of equity, max leverage (same as breakout)
+          const leverage = sig.asset.maxLeverage;
+          const capitalForTrade = equity * 0.80;
+          const notionalSize = capitalForTrade * leverage;
+          const assetSize = notionalSize / sig.price;
+          const tradeAmountPct = 80;
+
+          if (capitalForTrade < 5) {
+            reasoning.push(`SKIP: Capital too low ($${capitalForTrade.toFixed(2)})`);
             await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
             continue;
           }
 
-          // ADX regime: reduce position size to 75% when trending
-          const sizeMultiplier = sig.enhanced.adxRegime === "trending" ? 0.75 : 1.0;
-          if (sizeMultiplier < 1.0) {
-            reasoning.push(`ADX trending (${sig.enhanced.adxValue.toFixed(1)}) — position reduced to 75%`);
-          }
-
-          // Position sizing
-          const pos = calculateAdaptivePosition({ equity, price: sig.price, asset: sig.asset, config, sizeMultiplier });
-          if (!pos.canTrade) {
-            reasoning.push(`SKIP: ${pos.skipReason}`);
-            await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
-            continue;
-          }
-
-          const { leverage, capitalForTrade, assetSize, notionalSize } = pos;
-          const tradeAmountPct = (capitalForTrade / equity) * 100;
-          reasoning.push(`ENTRY: ${side.toUpperCase()} ${sig.asset.displayName} | ${leverage}x (MAX) | $${capitalForTrade.toFixed(2)} capital ($${notionalSize.toFixed(0)} notional) | sizeMult: ${sizeMultiplier}`);
+          reasoning.push(`ENTRY: ${side.toUpperCase()} ${sig.asset.displayName} | ${leverage}x (MAX) | $${capitalForTrade.toFixed(2)} capital ($${notionalSize.toFixed(0)} notional) | 80% margin`);
 
           // Execute order
           if (config.apiSecret && config.walletAddress) {
@@ -2727,7 +2705,7 @@ class TradingEngine {
       sessionDescription: si.description,
       drawdownPct: drawdownPct.toFixed(2),
       drawdownUsd: drawdownUsd.toFixed(4),
-      drawdownPaused: this.drawdownPaused,
+      drawdownPaused: false,
       dayStartEquity: this.dayStartEquity.toFixed(2),
       dailyTradeCount: this.dailyTradeCount,
       dailyTradeTarget: 20,

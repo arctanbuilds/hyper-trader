@@ -215,7 +215,7 @@ export default function Dashboard() {
           <Card>
             <CardContent className="p-4">
               <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">CONFLUENCE</Badge>
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-zinc-500/10 text-zinc-400 border-zinc-500/30">LEGACY (CONF)</Badge>
               </div>
               <div className="space-y-1 mt-2">
                 <div className="flex justify-between text-xs font-mono">
@@ -232,7 +232,7 @@ export default function Dashboard() {
           <Card>
             <CardContent className="p-4">
               <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">EXTREME RSI</Badge>
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-zinc-500/10 text-zinc-400 border-zinc-500/30">LEGACY (RSI)</Badge>
               </div>
               <div className="space-y-1 mt-2">
                 <div className="flex justify-between text-xs font-mono">
@@ -249,7 +249,7 @@ export default function Dashboard() {
           <Card>
             <CardContent className="p-4">
               <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-violet-500/10 text-violet-400 border-violet-500/30">BB REVERSION</Badge>
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-violet-500/10 text-violet-400 border-violet-500/30">REVERSAL</Badge>
               </div>
               <div className="space-y-1 mt-2">
                 <div className="flex justify-between text-xs font-mono">
@@ -408,14 +408,9 @@ export default function Dashboard() {
                       <div>
                         <span className="text-sm font-medium">{getAssetLabel(trade.coin)}</span>
                         <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
-                        {trade.strategy === "extreme_rsi" && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">
-                            RSI
-                          </Badge>
-                        )}
                         {trade.strategy === "bb_rsi_reversion" && (
                           <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-violet-500/10 text-violet-400 border-violet-500/30">
-                            BB
+                            Reversal
                           </Badge>
                         )}
                         {trade.strategy === "breakout_retest" && (
@@ -423,9 +418,9 @@ export default function Dashboard() {
                             Retest
                           </Badge>
                         )}
-                        {(!trade.strategy || trade.strategy === "confluence") && trade.confluenceScore != null && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
-                            Conf
+                        {(trade.strategy === "extreme_rsi" || trade.strategy === "confluence" || (!trade.strategy && trade.confluenceScore != null)) && (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-zinc-500/10 text-zinc-400 border-zinc-500/30">
+                            Legacy
                           </Badge>
                         )}
                       </div>
