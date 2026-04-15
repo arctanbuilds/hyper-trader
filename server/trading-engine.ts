@@ -732,9 +732,11 @@ function detectBreakoutRetest(
     if (barsSinceBreak <= 10) conf++; // fresh breakout
     conf = Math.min(conf, 5);
 
-    // TP/SL — same rules: SL 0.25%, TP1 0.3%, TP2 0.7%
+    // TP/SL — SL 0.25%, TP1 0.3%, TP2 0.7%
+    // Fee-adjusted: TP1 must exceed round-trip taker fees (0.045% × 2 = 0.09%)
+    // Min TP1 = 0.12% to guarantee profit after fees
     const slPct = 0.0025;
-    const tp1Pct = 0.003;
+    const tp1Pct = Math.max(0.003, 0.0012); // 0.3% (already exceeds 0.12% min)
     const tp2Pct = 0.007;
 
     let sl: number, tp1: number, tp2: number;
@@ -1156,6 +1158,10 @@ function detectEnhancedRSI(params: {
   if (srConfirm) confidenceScore++;
 
   // --- TP/SL targets based on trigger type + ADX regime ---
+  // Fee-adjusted: Hyperliquid taker fee = 0.045% per side
+  // Round-trip fee = 0.09% on notional. Min TP1 must exceed this.
+  // We use 0.12% as floor (0.09% fees + 0.03% buffer)
+  const FEE_ADJUSTED_MIN_TP1 = 0.0012; // 0.12% minimum TP1 to guarantee profit after fees
   let tp1Pct: number;
   let tp2Pct: number;
   const slPct = 0.0025; // 0.25% SL for both triggers
@@ -1164,8 +1170,8 @@ function detectEnhancedRSI(params: {
     tp1Pct = 0.003;  // 0.3%
     tp2Pct = 0.01;   // 1%
   } else {
-    // bb_rsi_reversion: tighter targets
-    tp1Pct = 0.002;  // 0.2%
+    // bb_rsi_reversion: tighter targets — raised from 0.2% to 0.3% for fee safety
+    tp1Pct = 0.003;  // 0.3% (was 0.2% — too close to fee breakeven)
     tp2Pct = 0.005;  // 0.5%
   }
 
@@ -1174,6 +1180,9 @@ function detectEnhancedRSI(params: {
     tp1Pct *= 1.5;
     tp2Pct *= 1.5;
   }
+
+  // Enforce fee floor on TP1
+  tp1Pct = Math.max(tp1Pct, FEE_ADJUSTED_MIN_TP1);
 
   let sl: number, tp1: number, tp2: number;
   if (signal === "long") {
@@ -1914,27 +1923,56 @@ class TradingEngine {
 
         const stratLabel = strategy.toUpperCase();
 
-        // TP1 check — move SL to breakeven
+        // TP1 check — PARTIAL CLOSE 50% + move SL to breakeven
         if (!trade.tp1Hit) {
           const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
             const breakEvenSL = trade.entryPrice;
+            // Execute 50% partial close on Hyperliquid
+            let partialCloseSuccess = false;
+            if (config.apiSecret && config.walletAddress) {
+              try {
+                const executor = createExecutor(config.apiSecret, config.walletAddress);
+                const positions = await executor.getPositions();
+                const pos = positions.find((p: any) => p.position?.coin === trade.coin);
+                if (pos) {
+                  const fullSz = Math.abs(parseFloat(pos.position.szi || "0"));
+                  const halfSz = parseFloat(formatHLSize(fullSz * 0.5, szd));
+                  if (halfSz > 0) {
+                    const slippage = trade.side === "long" ? 0.99 : 1.01;
+                    const closeResult = await executor.placeOrder({
+                      coin: trade.coin, isBuy: trade.side === "short", sz: halfSz,
+                      limitPx: parseFloat(formatHLPrice(currentPrice * slippage, szd)),
+                      orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
+                    });
+                    const closeStatus = closeResult?.response?.data?.statuses?.[0];
+                    const closedSz = closeStatus?.filled?.totalSz;
+                    if (closedSz && parseFloat(closedSz) > 0) {
+                      partialCloseSuccess = true;
+                      log(`[TP1] ${trade.coin} partial close 50%: ${closedSz} sz closed @ ~$${displayPrice(currentPrice, szd)}`, "engine");
+                    } else {
+                      log(`[TP1] ${trade.coin} partial close IOC not filled`, "engine");
+                    }
+                  }
+                }
+              } catch (e) { log(`[TP1] Partial close error: ${e}`, "engine"); }
+            }
             await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-              reasoning: `[${stratLabel}] TP1 hit @ $${displayPrice(currentPrice, szd)} | SL moved to BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+              reasoning: `[${stratLabel}] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
               equity: currentEquity, leverage: trade.leverage, strategy,
             });
             await storage.createLog({
               type: "trade_tp1",
-              message: `[${stratLabel}] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | SL → BREAKEVEN`,
+              message: `[${stratLabel}] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BREAKEVEN`,
               timestamp: new Date().toISOString(),
             });
           }
         }
 
-        // TP2 check — full close
+        // TP2 check — close remaining position
         if (!shouldClose) {
           const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
@@ -1950,29 +1988,58 @@ class TradingEngine {
 
       } else if (strategy === "breakout_retest") {
         // ---- BREAKOUT/RETEST EXIT RULES (fully separate) ----
-        // Same structure: TP1 0.3% → SL to BE, TP2 0.7% → full close, SL 0.25%
+        // TP1 0.3% → close 50% + SL to BE, TP2 0.7% → close remaining, SL 0.25%
 
-        // TP1 check — move SL to breakeven
+        // TP1 check — PARTIAL CLOSE 50% + move SL to breakeven
         if (!trade.tp1Hit) {
           const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
             const breakEvenSL = trade.entryPrice;
+            // Execute 50% partial close on Hyperliquid
+            let partialCloseSuccess = false;
+            if (config.apiSecret && config.walletAddress) {
+              try {
+                const executor = createExecutor(config.apiSecret, config.walletAddress);
+                const positions = await executor.getPositions();
+                const pos = positions.find((p: any) => p.position?.coin === trade.coin);
+                if (pos) {
+                  const fullSz = Math.abs(parseFloat(pos.position.szi || "0"));
+                  const halfSz = parseFloat(formatHLSize(fullSz * 0.5, szd));
+                  if (halfSz > 0) {
+                    const slippage = trade.side === "long" ? 0.99 : 1.01;
+                    const closeResult = await executor.placeOrder({
+                      coin: trade.coin, isBuy: trade.side === "short", sz: halfSz,
+                      limitPx: parseFloat(formatHLPrice(currentPrice * slippage, szd)),
+                      orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
+                    });
+                    const closeStatus = closeResult?.response?.data?.statuses?.[0];
+                    const closedSz = closeStatus?.filled?.totalSz;
+                    if (closedSz && parseFloat(closedSz) > 0) {
+                      partialCloseSuccess = true;
+                      log(`[TP1] ${trade.coin} partial close 50%: ${closedSz} sz closed @ ~$${displayPrice(currentPrice, szd)}`, "engine");
+                    } else {
+                      log(`[TP1] ${trade.coin} partial close IOC not filled`, "engine");
+                    }
+                  }
+                }
+              } catch (e) { log(`[TP1] Partial close error: ${e}`, "engine"); }
+            }
             await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-              reasoning: `[BREAKOUT_RETEST] TP1 hit @ $${displayPrice(currentPrice, szd)} | SL moved to BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+              reasoning: `[BREAKOUT_RETEST] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BREAKEVEN @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
               equity: currentEquity, leverage: trade.leverage, strategy: "breakout_retest",
             });
             await storage.createLog({
               type: "trade_tp1",
-              message: `[BREAKOUT_RETEST] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | SL → BREAKEVEN`,
+              message: `[BREAKOUT_RETEST] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BREAKEVEN`,
               timestamp: new Date().toISOString(),
             });
           }
         }
 
-        // TP2 check — full close
+        // TP2 check — close remaining position
         if (!shouldClose) {
           const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit2 || 0));
