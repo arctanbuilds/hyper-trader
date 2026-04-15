@@ -2039,8 +2039,13 @@ class TradingEngine {
               const executor = createExecutor(config.apiSecret, config.walletAddress);
               const isCross = !brSig.asset.isolatedOnly;
               await executor.setLeverage(brSig.asset.coin, leverage, isCross);
-              const slippageMult = side === "long" ? 1.01 : 0.99;
-              const orderPrice = brSig.price * slippageMult;
+              // Use TL value as target entry for best fill near the line,
+              // with small slippage buffer to ensure IOC fills
+              const tlEntry = brSig.result.trendlineValueNow;
+              const slippageMult = side === "long" ? 1.005 : 0.995; // tighter slippage — we want entry near TL
+              const orderPrice = (Math.abs(brSig.price - tlEntry) / brSig.price < 0.003)
+                ? tlEntry * (side === "long" ? 1.003 : 0.997) // if close to TL, use TL + tiny buffer
+                : brSig.price * slippageMult; // fallback to market if drifted from TL
               const roundedSize = parseFloat(formatHLSize(assetSize, brSig.asset.szDecimals));
               if (roundedSize <= 0) { reasoning.push(`SKIP: Rounded size is 0`); continue; }
               const orderResult = await executor.placeOrder({
