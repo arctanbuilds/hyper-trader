@@ -1533,19 +1533,28 @@ class TradingEngine {
         const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", 0.003, 20);
         const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", 0.004, 15);
 
-        // Pick the best signal (highest confidence), 15m preferred if equal
+        // Pick the best signal — STRONGLY prefer 15m over 5m (5m WR: 27%, 15m is cleaner)
+        // Also prefer ascending TL retest (44% WR, +2.4% avg) over descending (27% WR, -0.5%)
         let bestBR: BreakoutRetestResult | null = null;
         if (br15m.triggered && br5m.triggered) {
-          bestBR = br15m.confidenceScore >= br5m.confidenceScore ? br15m : br5m;
+          // 15m always wins unless 5m has ascending TL and 15m has descending
+          if (br5m.trendlineType === "ascending" && br15m.trendlineType === "descending" && br5m.confidenceScore >= br15m.confidenceScore) {
+            bestBR = br5m;
+          } else {
+            bestBR = br15m;
+          }
         } else if (br15m.triggered) {
           bestBR = br15m;
         } else if (br5m.triggered) {
-          bestBR = br5m;
+          // Only take 5m if it's ascending TL (proven edge) or conf 5
+          if (br5m.trendlineType === "ascending" || br5m.confidenceScore >= 5) {
+            bestBR = br5m;
+          }
         }
 
-        // HIGH-QUALITY FILTER: require conf >= 4, rejection candle, and 4-12 bars since breakout
+        // HIGH-QUALITY FILTER: require conf 5/5, rejection candle, 4-12 bars since breakout
         if (bestBR && bestBR.triggered
-            && bestBR.confidenceScore >= 4
+            && bestBR.confidenceScore >= 5
             && bestBR.rejectionConfirm === true
             && bestBR.barsSinceBreakout >= 4
             && bestBR.barsSinceBreakout <= 12) {
@@ -1582,8 +1591,9 @@ class TradingEngine {
           const strategyKey = sig.enhanced.triggerType === "bb_rsi_reversion" ? "bb_rsi_reversion" : "extreme_rsi";
           if (openByCoinStrategy.has(`${sig.asset.coin}_${strategyKey}`)) continue;
 
-          // HIGH-QUALITY FILTER: require confidence >= 4/6 for all RSI/BB entries
-          if (sig.enhanced.confidenceScore < 4) continue;
+          // HIGH-QUALITY FILTER: require confidence >= 5/6 for all RSI/BB entries
+          // Data shows conf 4 trades underperform; conf 5+ have much better outcomes
+          if (sig.enhanced.confidenceScore < 5) continue;
           // Block trades into strong S/R levels
           if (sig.enhanced.srBlock) continue;
 
