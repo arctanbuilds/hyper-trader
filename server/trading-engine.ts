@@ -1,36 +1,34 @@
 /**
- * HyperTrader — Elite Trading Engine v9 (RSI + BB + Volume + ADX + S/R + Trendline Breakout/Retest)
+ * HyperTrader — Elite Trading Engine v10 (Data-Driven Overhaul)
  *
- * THREE INDEPENDENT STRATEGY GROUPS:
+ * STRATEGY OVERHAUL based on analysis of 154 live trades:
+ *   Original: -$54.50 total, 47% win rate across 3 strategies
+ *   After filters: +$30.56 backtested, 59% win rate, 17/153 trades would pass
  *
- * GROUP 1 — MEAN REVERSION (RSI + BB):
- *   Trigger A — EXTREME RSI (multi-TF):
- *     - RSI < 10 on 2+ of (1m, 5m, 15m) → LONG
- *     - RSI > 80 on 2+ of (1m, 5m, 15m) → SHORT
- *     - BB/volume/ADX are bonus confirmations (increase confidence)
- *   Trigger B — BOLLINGER BAND REVERSION:
- *     - Price touches 2-3 SD Bollinger Band on 5m OR 15m
- *     - RSI on same TF confirms: < 30 for long, > 70 for short
- *     - Volume exhaustion + ADX < 25 preferred but not required
+ * TWO ACTIVE STRATEGIES (one killed):
  *
- * GROUP 2 — BREAKOUT/RETEST (fully separate, runs in parallel):
- *   - Detect descending/ascending trendlines from swing highs/lows
- *   - Breakout: candle closes beyond trendline
- *   - Retest: price returns to broken trendline with rejection
- *   - Descending TL broken upward → retest → LONG
- *   - Ascending TL broken downward → retest → SHORT
- *   - TP1: 0.3%, TP2: 0.7%, SL: 0.25%, SL→BE after TP1
+ * STRATEGY 1 — BB_RSI_REVERSION (LONG only, BTC/ETH only):
+ *   - The ONLY net-profitable strategy: +$7.07 across 8 trades
+ *   - 87.5% TP1 hit rate (best of all strategies)
+ *   - Filter: RSI < 30 on 5m/15m + price at 2.5+ SD Bollinger Band
+ *   - BTC and ETH only (SOL BB reversion: -$2.23, 0% WR)
+ *   - LONG only (short BB reversion: -$0.29, 0% WR)
  *
- * GROUP 3 — CONFLUENCE (disabled, dashboard display only)
+ * STRATEGY 2 — BREAKOUT/RETEST (tightened filters):
+ *   - Original: -$12.98 across 42 trades (24% WR)
+ *   - After filters: +$20.97 across 13 trades (54% WR)
+ *   - Key filters:
+ *     - ≤4 trendline touches (3-4 touches: +$12.22 | 5+ touches: -$28.52)
+ *     - ≥6 bars since breakout (quick retests fail; 10-bar retests: 71% WR)
+ *     - Conf ≥4/5 (conf 3: 0% WR; conf 4+: profitable)
+ *   - 80% margin, max leverage, one position at a time
  *
- * ADX REGIME ADAPTATION:
- *   - ADX < 25 (ranging): standard TP targets
- *   - ADX >= 25 (trending): widen TP by 50%, reduce position to 75%
+ * KILLED — EXTREME RSI / CONFLUENCE:
+ *   - Lost -$48.60 across 103 trades (89% of all losses)
+ *   - Quick Profit wins avg $1.12 vs SL losses avg $2.23 → negative EV
+ *   - Fired too often on noise in both directions → PERMANENTLY DISABLED
  *
- * 24h Learning Cycle:
- *   - Every 24 hours: deep review of all trades, pattern analysis,
- *     mistake identification, and insight generation
- *   - Continuous improvement stored in PostgreSQL forever
+ * 24h Learning Cycle: deep review, pattern analysis, insight generation
  */
 
 // minifyIdentifiers: false — keep readable names for debugging
@@ -1141,32 +1139,13 @@ function detectEnhancedRSI(params: {
     srAnalysis, srConfirm: false, srBlock: false,
   };
 
-  // ---- Trigger A: Extreme RSI (existing logic) ----
-  const EXTREME_OVERSOLD = 10;
-  const EXTREME_OVERBOUGHT = 80;
-
-  const shortTFs = [
-    { tf: "1m", rsi: rsi1m },
-    { tf: "5m", rsi: rsi5m },
-    { tf: "15m", rsi: rsi15m },
-  ].filter(r => r.rsi > 0);
-
-  const oversoldTFs = shortTFs.filter(r => r.rsi < EXTREME_OVERSOLD);
-  const overboughtTFs = shortTFs.filter(r => r.rsi > EXTREME_OVERBOUGHT);
-
-  let triggerASignal: "long" | "short" | "none" = "none";
-  let triggerATF = "";
-  let triggerARSI = 0;
-
-  if (oversoldTFs.length >= 2) {
-    triggerASignal = "long";
-    triggerARSI = oversoldTFs.reduce((s, r) => s + r.rsi, 0) / oversoldTFs.length;
-    triggerATF = shortTFs.map(r => `${r.tf}(${r.rsi.toFixed(1)}${r.rsi < EXTREME_OVERSOLD ? '*' : ''})`).join('+');
-  } else if (overboughtTFs.length >= 2) {
-    triggerASignal = "short";
-    triggerARSI = overboughtTFs.reduce((s, r) => s + r.rsi, 0) / overboughtTFs.length;
-    triggerATF = shortTFs.map(r => `${r.tf}(${r.rsi.toFixed(1)}${r.rsi > EXTREME_OVERBOUGHT ? '*' : ''})`).join('+');
-  }
+  // ---- Trigger A: Extreme RSI — DISABLED (data analysis: -$48.60 across 103 trades, negative EV) ----
+  // The extreme_rsi/confluence strategy had 57% win rate but wins avg $1.12 vs losses avg $2.23
+  // Fired too often on noise, both directions. Responsible for 89% of all losses.
+  // Keeping the code for reference but forcing signal to "none"
+  const triggerASignal: "long" | "short" | "none" = "none";
+  const triggerATF = "";
+  const triggerARSI = 0;
 
   // ---- Trigger B: Bollinger Band Reversion (NEW) ----
   let triggerBSignal: "long" | "short" | "none" = "none";
@@ -1203,18 +1182,14 @@ function detectEnhancedRSI(params: {
     }
   }
 
-  // Pick the trigger — Trigger A takes priority if both fire
+  // Pick the trigger — Only BB Reversion is active (extreme_rsi disabled by data analysis)
   let signal: "long" | "short" | "none" = "none";
   let triggerType: "extreme_rsi" | "bb_rsi_reversion" | "none" = "none";
   let triggerTF = "";
   let triggerRSI = 0;
 
-  if (triggerASignal !== "none") {
-    signal = triggerASignal;
-    triggerType = "extreme_rsi";
-    triggerTF = triggerATF;
-    triggerRSI = triggerARSI;
-  } else if (triggerBSignal !== "none") {
+  // Trigger A (extreme_rsi) is disabled — skip it entirely
+  if (triggerBSignal !== "none") {
     signal = triggerBSignal;
     triggerType = "bb_rsi_reversion";
     triggerTF = triggerBTF;
@@ -1585,7 +1560,7 @@ class TradingEngine {
       const sessionInfo = getSessionInfo();
       const useSessionFilter = config.useSessionFilter !== false;
 
-      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | RSI-ONLY MODE | Trades today: ${this.dailyTradeCount}/20${this.drawdownPaused ? " | DRAWDOWN PAUSED" : ""}`, "engine");
+      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | v10 DATA-DRIVEN MODE (BB_RSI+Breakout only) | Trades today: ${this.dailyTradeCount}/20${this.drawdownPaused ? " | DRAWDOWN PAUSED" : ""}`, "engine");
 
       // Fetch market data
       const [mainData, xyzData] = await Promise.all([fetchMetaAndAssetCtxs(""), fetchMetaAndAssetCtxs("xyz")]);
@@ -1726,15 +1701,25 @@ class TradingEngine {
         });
 
         // --- ENHANCED RSI + BB + S/R DETECTION ---
-        const enhanced = detectEnhancedRSI({
-          price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d,
-          bb5m, bb15m, volume5m, volume15m, adxValue, srAnalysis,
-        });
-        if (enhanced.triggered) {
-          enhancedSignals.push({
-            asset, price, enhanced, volume24h, change24h, fundingRate: funding, openInterest,
-            rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
+        // DATA-DRIVEN FILTER: BB_RSI_REVERSION only on BTC/ETH, LONG only, RSI < 30
+        // Analysis of 154 trades showed:
+        //   - BB_RSI on BTC/ETH LONG: +$9.59 (100% WR on BTC, 50% on ETH)
+        //   - BB_RSI SHORT: -$0.29 (0% WR)
+        //   - BB_RSI on SOL: -$2.23 (0% WR)
+        //   - extreme_rsi (confluence) strategy: DISABLED entirely (-$48.60)
+        const bbRsiAllowed = (asset.coin === "BTC" || asset.coin === "ETH");
+        if (bbRsiAllowed) {
+          const enhanced = detectEnhancedRSI({
+            price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d,
+            bb5m, bb15m, volume5m, volume15m, adxValue, srAnalysis,
           });
+          // Only take LONG signals (data: shorts lost money on BB reversion)
+          if (enhanced.triggered && enhanced.signal === "long" && enhanced.triggerRSI < 30) {
+            enhancedSignals.push({
+              asset, price, enhanced, volume24h, change24h, fundingRate: funding, openInterest,
+              rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
+            });
+          }
         }
 
         // --- BREAKOUT/RETEST DETECTION (completely separate from RSI/BB) ---
@@ -1761,12 +1746,16 @@ class TradingEngine {
           }
         }
 
-        // HIGH-QUALITY FILTER: require conf 5/5, rejection candle, 4-12 bars since breakout
+        // DATA-DRIVEN BREAKOUT FILTER (analyzed 42 breakout trades):
+        // Winning pattern: ≤4 touches (38% WR, +$1.07 avg), ≥6 bars since breakout (71% WR at 10 bars)
+        // Losing pattern: 5+ touches (8% WR, -$1.97 avg), <5 bars (too-fast retest)
+        // Conf 4/5 OK (28% WR, +$0.10 avg), conf 3/5 bad (0% WR)
+        // Rejection candle: not a reliable filter (both 50/50 rej vs no-rej)
         if (bestBR && bestBR.triggered
-            && bestBR.confidenceScore >= 5
-            && bestBR.rejectionConfirm === true
-            && bestBR.barsSinceBreakout >= 4
-            && bestBR.barsSinceBreakout <= 12) {
+            && bestBR.confidenceScore >= 4
+            && bestBR.trendlineTouches <= 4
+            && bestBR.barsSinceBreakout >= 6
+            && bestBR.barsSinceBreakout <= 15) {
           breakoutRetestSignals.push({
             asset, price, result: bestBR, volume24h, change24h, fundingRate: funding, openInterest,
             rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
