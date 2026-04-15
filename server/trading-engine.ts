@@ -1,36 +1,27 @@
 /**
- * HyperTrader — Elite Trading Engine v10 (Data-Driven Overhaul)
+ * HyperTrader — Elite Trading Engine v10.4
  *
- * STRATEGY OVERHAUL based on analysis of 154 live trades:
- *   Original: -$54.50 total, 47% win rate across 3 strategies
- *   After filters: +$30.56 backtested, 59% win rate, 17/153 trades would pass
+ * TWO ACTIVE STRATEGIES:
  *
- * TWO ACTIVE STRATEGIES (one killed):
+ * STRATEGY 1 — BB_RSI REVERSAL:
+ *   - LONG when RSI ≤ 20 + price at 2.5+ SD lower BB
+ *   - SHORT when RSI ≥ 85 + price at 2.5+ SD upper BB
+ *   - 80% margin, max leverage
+ *   - SL: 0.5%, TP1: 0.3% → BE, TP2: dynamic
  *
- * STRATEGY 1 — BB_RSI REVERSAL (extreme RSI + Bollinger Band):
- *   - LONG when RSI ≤ 20 + price at 2.5+ SD lower BB (extreme oversold)
- *   - SHORT when RSI ≥ 85 + price at 2.5+ SD upper BB (extreme overbought)
- *   - SL: 0.5% (wide — give reversal room to play out)
- *   - TP1: 0.3% (lock profit, move SL→BE)
- *   - TP2: dynamic (bot determines based on S/R, swing levels, BB)
- *   - All assets (BTC, ETH, SOL) — RSI 20/85 is rare enough to be high conviction
- *   - Based on BB_RSI_REVERSION which was the ONLY profitable strategy (+$7.07)
- *
- * STRATEGY 2 — BREAKOUT/RETEST (tightened filters):
- *   - Original: -$12.98 across 42 trades (24% WR)
- *   - After filters: +$20.97 across 13 trades (54% WR)
- *   - Key filters:
- *     - ≤4 trendline touches (3-4 touches: +$12.22 | 5+ touches: -$28.52)
- *     - ≥6 bars since breakout (quick retests fail; 10-bar retests: 71% WR)
- *     - Conf ≥4/5 (conf 3: 0% WR; conf 4+: profitable)
+ * STRATEGY 2 — TRENDLINE RETEST (v10.4 overhaul):
+ *   - Build trendlines on 5m/15m from swing pivots
+ *   - Price BREAKS through trendline
+ *   - Price comes BACK to retest
+ *   - 1-MINUTE candle shows REACTION (rejection candle off the TL)
+ *   - ENTER in direction of the reaction (LONG if bounce up, SHORT if reject down)
+ *   - Direction comes from the 1m reaction, NOT the TL type
+ *   - SL: wide — recent swing extreme (capped at 2%, min 0.3%)
+ *   - TP1: 0.3% → BE, TP2: dynamic
  *   - 80% margin, max leverage, one position at a time
  *
- * KILLED — EXTREME RSI / CONFLUENCE:
- *   - Lost -$48.60 across 103 trades (89% of all losses)
- *   - Quick Profit wins avg $1.12 vs SL losses avg $2.23 → negative EV
- *   - Fired too often on noise in both directions → PERMANENTLY DISABLED
- *
- * 24h Learning Cycle: deep review, pattern analysis, insight generation
+ * KILLED: extreme_rsi / confluence — permanently disabled
+ * No exposure reduction, no drawdown pause, no learning blocks
  */
 
 // minifyIdentifiers: false — keep readable names for debugging
@@ -675,24 +666,30 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
 }
 
 /**
- * Detect trendline breakout-and-retest patterns.
+ * v10.4 OVERHAUL — Trendline Break + Retest + 1m Reaction.
  *
- * v10 OVERHAUL based on user chart examples:
- *   1. Build clean trendlines from significant, well-spaced swing points
- *   2. Trendline must have HELD as S/R (no closes beyond it before breakout)
- *   3. After breakout, price must come BACK to the trendline
- *   4. Entry is AT the trendline itself (the projected TL value = entry price)
- *   5. SL: 0.5% from entry, TP1: 0.3% from entry (→ SL moves to BE), TP2: dynamic
+ * The pattern (from user chart examples):
+ *   1. Build clean trendlines on 5m/15m
+ *   2. Price BREAKS through the trendline (close beyond it)
+ *   3. Price comes BACK to retest the trendline
+ *   4. On the 1m timeframe, a candle REACTS off the trendline
+ *      (wick touches TL, body closes away = rejection candle)
+ *   5. ENTER in the direction of the reaction:
+ *      - If price bounces UP off the TL → LONG
+ *      - If price rejects DOWN off the TL → SHORT
+ *   6. SL: as wide as safely possible (recent swing extreme beyond the TL)
+ *   7. TP: standard 0.3% TP1 → BE → dynamic TP2
  *
- * Descending trendline broken to the UPSIDE → price retests from above → LONG at TL
- * Ascending trendline broken to the DOWNSIDE → price retests from below → SHORT at TL
+ * Direction is determined by the 1m reaction candle, NOT by the TL type.
+ * Both ascending and descending TLs can produce longs or shorts.
  */
 function detectBreakoutRetest(
   candles: OHLCVCandle[],
   currentPrice: number,
   tf: string,
-  retestTolerance: number = 0.002,  // 0.2% proximity to trendline = "at the trendline"
-  maxBreakoutAge: number = 20,
+  candles1m: OHLCVCandle[],   // 1m OHLCV for reaction confirmation
+  retestTolerance: number = 0.003,  // 0.3% proximity to trendline = "at the trendline"
+  maxBreakoutAge: number = 30,
 ): BreakoutRetestResult {
   const noResult: BreakoutRetestResult = {
     triggered: false, signal: "none", trendlineType: "none",
@@ -721,9 +718,9 @@ function detectBreakoutRetest(
 
       if (tl.type === "descending") {
         // Breakout upward: candle closes ABOVE descending TL
-        if (c.close > tlValue * (1 + 0.001)) { // need a clear break, not just touching
+        if (c.close > tlValue * (1 + 0.001)) {
           breakoutIdx = i;
-          break; // take the first breakout
+          break;
         }
       } else {
         // Breakout downward: candle closes BELOW ascending TL
@@ -737,7 +734,7 @@ function detectBreakoutRetest(
     if (breakoutIdx === -1) continue;
 
     const barsSinceBreak = lastIdx - breakoutIdx;
-    if (barsSinceBreak < 2 || barsSinceBreak > maxBreakoutAge) continue;
+    if (barsSinceBreak < 1 || barsSinceBreak > maxBreakoutAge) continue;
 
     // Current trendline value (projected to the current bar)
     const tlValueNow = trendlineAt(tl, lastIdx);
@@ -746,72 +743,105 @@ function detectBreakoutRetest(
     // How close is the current price to the trendline?
     const distToTL = Math.abs(currentPrice - tlValueNow) / tlValueNow;
 
-    // ENTRY AT THE TRENDLINE: price must be very close to (or touching) the projected TL
+    // Price must be near the trendline (within tolerance) for a retest
     if (distToTL > retestTolerance) continue;
-
-    // Determine signal — price must be on the correct side for a retest
-    let signal: "long" | "short" | "none" = "none";
-    if (tl.type === "descending") {
-      // Broke above descending TL → retesting from above (or right at it) → LONG
-      // Price should be at or just above the TL line
-      if (currentPrice >= tlValueNow * (1 - retestTolerance)) {
-        signal = "long";
-      }
-    } else {
-      // Broke below ascending TL → retesting from below (or right at it) → SHORT
-      if (currentPrice <= tlValueNow * (1 + retestTolerance)) {
-        signal = "short";
-      }
-    }
-
-    if (signal === "none") continue;
 
     // VERIFY: After breakout, price must have moved away from the TL at some point
     // then come back to it (a real retest, not just hovering at the break level)
     let maxMoveAway = 0;
     for (let i = breakoutIdx + 1; i <= lastIdx; i++) {
       const tlv = trendlineAt(tl, i);
-      const dist = signal === "long"
-        ? (candles[i].close - tlv) / tlv  // how far above TL (positive = moved away)
-        : (tlv - candles[i].close) / tlv; // how far below TL (positive = moved away)
+      const distUp = (candles[i].close - tlv) / tlv;
+      const distDown = (tlv - candles[i].close) / tlv;
+      const dist = Math.max(distUp, distDown);
       if (dist > maxMoveAway) maxMoveAway = dist;
     }
-    // Must have moved at least 0.15% away from TL before coming back
-    if (maxMoveAway < 0.0015) continue;
+    // Must have moved at least 0.1% away from TL before coming back
+    if (maxMoveAway < 0.001) continue;
 
-    // Check if the current candle shows rejection (wick touching TL, body closing away)
-    const lastCandle = candles[lastIdx];
+    // === 1-MINUTE REACTION CANDLE CONFIRMATION ===
+    // Look at the last 3 completed 1m candles for a clear reaction off the TL
+    // A reaction candle: wick touches/crosses TL, body closes AWAY from it
+    let signal: "long" | "short" | "none" = "none";
     let rejectionConfirm = false;
-    if (signal === "long") {
-      // Wick dipped to or below TL, but body closed above it
-      rejectionConfirm = lastCandle.low <= tlValueNow * (1 + 0.001) && lastCandle.close > tlValueNow;
-    } else {
-      // Wick reached up to or above TL, but body closed below it
-      rejectionConfirm = lastCandle.high >= tlValueNow * (1 - 0.001) && lastCandle.close < tlValueNow;
+    const lookback1m = Math.min(3, candles1m.length - 1); // check last 3 completed 1m candles
+
+    for (let k = candles1m.length - 2; k >= Math.max(0, candles1m.length - 1 - lookback1m); k--) {
+      const c1 = candles1m[k];
+      // Bullish reaction: wick dipped to/below TL, closed above it (bounce UP)
+      const wickTouchedBelow = c1.low <= tlValueNow * (1 + 0.001);
+      const closedAbove = c1.close > tlValueNow && c1.close > c1.open; // green candle closing above TL
+      const bullishBody = c1.close - c1.open > 0; // green candle
+      const bullishWickRatio = bullishBody ? (c1.close - c1.open) / (c1.high - c1.low + 1e-10) : 0;
+
+      // Bearish reaction: wick reached up to/above TL, closed below it (rejection DOWN)
+      const wickTouchedAbove = c1.high >= tlValueNow * (1 - 0.001);
+      const closedBelow = c1.close < tlValueNow && c1.close < c1.open; // red candle closing below TL
+      const bearishBody = c1.open - c1.close > 0; // red candle
+
+      if (wickTouchedBelow && closedAbove && bullishBody) {
+        signal = "long";
+        rejectionConfirm = true;
+        break;
+      }
+      if (wickTouchedAbove && closedBelow && bearishBody) {
+        signal = "short";
+        rejectionConfirm = true;
+        break;
+      }
     }
 
+    // No 1m reaction candle found → skip this trendline
+    if (signal === "none" || !rejectionConfirm) continue;
+
     // Confidence scoring
-    let conf = 1;
+    let conf = 2; // base: TL exists + break + retest + 1m reaction = already strong
     if (tl.strength >= 3) conf++;
     if (tl.touches >= 3) conf++;
-    if (rejectionConfirm) conf++;
-    if (barsSinceBreak >= 6 && barsSinceBreak <= 15) conf++; // sweet spot from data analysis
+    if (barsSinceBreak >= 3) conf++; // not too fresh
     conf = Math.min(conf, 5);
 
-    // TP/SL: Same as reversal strategy (0.5% SL, 0.3% TP1 → BE, dynamic TP2)
-    // ENTRY is at the trendline value itself for best possible entry price
-    const entryAtTL = tlValueNow; // the ideal entry = exactly at the trendline
-    const tp1Pct = 0.003; // 0.3% TP1
-    const tp2Pct = 0.01;  // 1% initial TP2 placeholder (dynamic TP2 overrides after TP1)
-    const slPct = 0.005;  // 0.5% SL
-
-    let sl: number, tp1: number, tp2: number;
+    // === WIDE SL: find the furthest safe level ===
+    // Look for recent swing extreme beyond the TL in the last 20 higher-TF candles
+    const slScanBars = Math.min(20, candles.length);
+    let wideSL: number;
     if (signal === "long") {
-      sl = entryAtTL * (1 - slPct);
+      // SL below: find the lowest low in recent candles that's below the TL
+      let lowestLow = tlValueNow;
+      for (let i = lastIdx; i >= Math.max(0, lastIdx - slScanBars); i--) {
+        if (candles[i].low < lowestLow) lowestLow = candles[i].low;
+      }
+      wideSL = lowestLow * 0.999; // tiny buffer below the swing low
+    } else {
+      // SL above: find the highest high in recent candles that's above the TL
+      let highestHigh = tlValueNow;
+      for (let i = lastIdx; i >= Math.max(0, lastIdx - slScanBars); i--) {
+        if (candles[i].high > highestHigh) highestHigh = candles[i].high;
+      }
+      wideSL = highestHigh * 1.001; // tiny buffer above the swing high
+    }
+
+    // Safety cap: SL should not be more than 2% away (prevent absurd SLs)
+    const maxSlDist = currentPrice * 0.02;
+    if (Math.abs(wideSL - currentPrice) > maxSlDist) {
+      wideSL = signal === "long" ? currentPrice - maxSlDist : currentPrice + maxSlDist;
+    }
+    // Minimum SL distance: at least 0.3% to avoid getting stopped on noise
+    const minSlDist = currentPrice * 0.003;
+    if (Math.abs(wideSL - currentPrice) < minSlDist) {
+      wideSL = signal === "long" ? currentPrice - minSlDist : currentPrice + minSlDist;
+    }
+
+    // TP: standard 0.3% TP1, 1% TP2 placeholder (dynamic TP2 kicks in after TP1)
+    const entryAtTL = currentPrice; // enter at current price (confirmed by 1m reaction)
+    const tp1Pct = 0.003;
+    const tp2Pct = 0.01;
+
+    let tp1: number, tp2: number;
+    if (signal === "long") {
       tp1 = entryAtTL * (1 + tp1Pct);
       tp2 = entryAtTL * (1 + tp2Pct);
     } else {
-      sl = entryAtTL * (1 + slPct);
       tp1 = entryAtTL * (1 - tp1Pct);
       tp2 = entryAtTL * (1 - tp2Pct);
     }
@@ -822,7 +852,7 @@ function detectBreakoutRetest(
       retestPrice: currentPrice, barsSinceBreakout: barsSinceBreak,
       trendlineTouches: tl.touches, trendlineStrength: tl.strength,
       rejectionConfirm, confidenceScore: conf, triggerTF: tf,
-      suggestedSL: sl, suggestedTP1: tp1, suggestedTP2: tp2,
+      suggestedSL: wideSL, suggestedTP1: tp1, suggestedTP2: tp2,
     });
   }
 
@@ -831,7 +861,6 @@ function detectBreakoutRetest(
   // Sort by confidence, then by how close price is to the TL (closer = better entry)
   candidates.sort((a, b) => {
     if (b.confidenceScore !== a.confidenceScore) return b.confidenceScore - a.confidenceScore;
-    // Prefer entry closer to trendline
     const distA = Math.abs(a.retestPrice - a.trendlineValueNow) / a.trendlineValueNow;
     const distB = Math.abs(b.retestPrice - b.trendlineValueNow) / b.trendlineValueNow;
     return distA - distB;
@@ -1602,7 +1631,7 @@ class TradingEngine {
       const sessionInfo = getSessionInfo();
       const useSessionFilter = config.useSessionFilter !== false;
 
-      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | v10.3 REVERSAL+RETEST (80% margin, no limits) | Trades today: ${this.dailyTradeCount}`, "engine");
+      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | v10.4 REVERSAL+RETEST (1m reaction, wide SL) | Trades today: ${this.dailyTradeCount}`, "engine");
 
       // Fetch market data
       const [mainData, xyzData] = await Promise.all([fetchMetaAndAssetCtxs(""), fetchMetaAndAssetCtxs("xyz")]);
@@ -1657,8 +1686,8 @@ class TradingEngine {
         if (volume24h < (config.minVolume24h || 1e6)) continue;
 
         // Fetch candles: OHLCV for 5m, 15m (BB/ADX/volume/S/R), 1h (S/R); closes for RSI on 4h, 1d
-        const [c1m, ohlcv5m, ohlcv15m, ohlcv1h, c4h, c1d] = await Promise.all([
-          fetchCandles(asset.coin, "1m", 60),
+        const [ohlcv1m, ohlcv5m, ohlcv15m, ohlcv1h, c4h, c1d] = await Promise.all([
+          fetchCandlesOHLCV(asset.coin, "1m", 60),
           fetchCandlesOHLCV(asset.coin, "5m", 100),    // 100 bars = ~8h for quick S/R
           fetchCandlesOHLCV(asset.coin, "15m", 100),   // 100 bars = ~25h for medium S/R
           fetchCandlesOHLCV(asset.coin, "1h", 100),    // 100 bars = ~4 days for macro S/R
@@ -1669,6 +1698,8 @@ class TradingEngine {
         const c5m = ohlcv5m.map(c => c.close);
         const c15m = ohlcv15m.map(c => c.close);
         const c1h = ohlcv1h.map(c => c.close);
+
+        const c1m = ohlcv1m.map(c => c.close);
 
         if (c1m.length < 15 && c5m.length < 15 && c15m.length < 15 && c1h.length < 15) continue;
 
@@ -1759,39 +1790,24 @@ class TradingEngine {
         }
 
         // --- BREAKOUT/RETEST DETECTION (completely separate from RSI/BB) ---
-        // Scan 5m and 15m for trendline breakout+retest patterns
-        const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", 0.003, 20);
-        const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", 0.004, 15);
+        // v10.4: Scan 5m and 15m for trendline break + retest + 1m reaction candle
+        const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", ohlcv1m, 0.003, 30);
+        const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", ohlcv1m, 0.004, 25);
 
-        // Pick the best signal — STRONGLY prefer 15m over 5m (5m WR: 27%, 15m is cleaner)
-        // Also prefer ascending TL retest (44% WR, +2.4% avg) over descending (27% WR, -0.5%)
+        // Pick the best signal — prefer higher confidence, then prefer 15m
         let bestBR: BreakoutRetestResult | null = null;
         if (br15m.triggered && br5m.triggered) {
-          // 15m always wins unless 5m has ascending TL and 15m has descending
-          if (br5m.trendlineType === "ascending" && br15m.trendlineType === "descending" && br5m.confidenceScore >= br15m.confidenceScore) {
-            bestBR = br5m;
-          } else {
-            bestBR = br15m;
-          }
+          bestBR = br15m.confidenceScore >= br5m.confidenceScore ? br15m : br5m;
         } else if (br15m.triggered) {
           bestBR = br15m;
         } else if (br5m.triggered) {
-          // Only take 5m if it's ascending TL (proven edge) or conf 5
-          if (br5m.trendlineType === "ascending" || br5m.confidenceScore >= 5) {
-            bestBR = br5m;
-          }
+          bestBR = br5m;
         }
 
-        // DATA-DRIVEN BREAKOUT FILTER (analyzed 42 breakout trades):
-        // Winning pattern: ≤4 touches (38% WR, +$1.07 avg), ≥6 bars since breakout (71% WR at 10 bars)
-        // Losing pattern: 5+ touches (8% WR, -$1.97 avg), <5 bars (too-fast retest)
-        // Conf 4/5 OK (28% WR, +$0.10 avg), conf 3/5 bad (0% WR)
-        // Rejection candle: not a reliable filter (both 50/50 rej vs no-rej)
-        if (bestBR && bestBR.triggered
-            && bestBR.confidenceScore >= 4
-            && bestBR.trendlineTouches <= 4
-            && bestBR.barsSinceBreakout >= 6
-            && bestBR.barsSinceBreakout <= 15) {
+        // v10.4: The 1m reaction candle IS the primary filter.
+        // If detectBreakoutRetest triggered, it already has TL + break + retest + 1m reaction confirmed.
+        // Only require minimum confidence of 2 (base score).
+        if (bestBR && bestBR.triggered && bestBR.confidenceScore >= 2) {
           breakoutRetestSignals.push({
             asset, price, result: bestBR, volume24h, change24h, fundingRate: funding, openInterest,
             rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
@@ -1990,19 +2006,11 @@ class TradingEngine {
           reasoning.push(`[BREAKOUT_RETEST] Signal: ${side.toUpperCase()} ${brSig.asset.displayName}`);
           reasoning.push(`TRENDLINE: ${brSig.result.trendlineType} | Touches: ${brSig.result.trendlineTouches} | Strength: ${brSig.result.trendlineStrength}`);
           reasoning.push(`BREAKOUT: ${brSig.result.barsSinceBreakout} bars ago | TL@break: $${displayPrice(brSig.result.trendlineValueAtBreak, brSig.asset.szDecimals)} | TL@now: $${displayPrice(brSig.result.trendlineValueNow, brSig.asset.szDecimals)}`);
-          reasoning.push(`RETEST: price $${displayPrice(brSig.result.retestPrice, brSig.asset.szDecimals)} near trendline | Rejection candle: ${brSig.result.rejectionConfirm ? 'YES' : 'NO'}`);
+          reasoning.push(`RETEST: price $${displayPrice(brSig.result.retestPrice, brSig.asset.szDecimals)} near TL | 1m Reaction: ${brSig.result.rejectionConfirm ? 'CONFIRMED' : 'NO'}`);
           reasoning.push(`Confidence: ${brSig.result.confidenceScore}/5 | TF: ${brSig.result.triggerTF}`);
-          reasoning.push(`TP1: $${displayPrice(brSig.result.suggestedTP1, brSig.asset.szDecimals)} (0.25%) | TP2: $${displayPrice(brSig.result.suggestedTP2, brSig.asset.szDecimals)} (1%)`);
-          reasoning.push(`SL: $${displayPrice(brSig.result.suggestedSL, brSig.asset.szDecimals)} (below trendline @ $${displayPrice(brSig.result.trendlineValueNow, brSig.asset.szDecimals)} + 0.3% buffer) → BE after TP1`);
+          reasoning.push(`TP1: $${displayPrice(brSig.result.suggestedTP1, brSig.asset.szDecimals)} (0.3%) | TP2: dynamic after TP1`);
+          reasoning.push(`SL: $${displayPrice(brSig.result.suggestedSL, brSig.asset.szDecimals)} (wide — swing extreme) → BE after TP1`);
           reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(brSig.fundingRate * 100).toFixed(4)}%`);
-
-          // Check learning insights
-          const insightCheck = await checkInsights({ coin: brSig.asset.coin, side, session: sessionInfo.session, confluenceScore: 7, dayOfWeek: now.getUTCDay() });
-          if (insightCheck.shouldBlock) {
-            reasoning.push(`BLOCKED BY LEARNING: ${insightCheck.blockReason}`);
-            await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
-            continue;
-          }
 
           // Position sizing — 80% of equity, max leverage (high conviction single trade)
           const leverage = brSig.asset.maxLeverage;
