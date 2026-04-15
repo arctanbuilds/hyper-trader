@@ -1336,11 +1336,68 @@ class TradingEngine {
   private pnlResetTimestamp = ""; // only count trades opened after this for P&L display
   private pnlResetEquity = 0;     // AUM at time of reset — the baseline
   private latestSRLevels: Record<string, SRAnalysis> = {}; // per-asset S/R levels from last scan
+  // Track Hyperliquid SL order OIDs per trade — allows cancel+replace on TP1 hit and cleanup on close
+  private slOrderOids: Map<number, number[]> = new Map(); // tradeId → [oid1, oid2, ...]
 
   private resetLossTrackers() {
     this.drawdownPaused = false;
     this.dailyTradeCount = 0;
     this.dailyTradeDate = new Date().toISOString().split("T")[0];
+  }
+
+  /**
+   * Place a real stop-loss trigger order on Hyperliquid.
+   * Returns the order OID if successful, null otherwise.
+   */
+  private async placeHLStopLoss(executor: ReturnType<typeof createExecutor>, coin: string, side: "long" | "short", slPrice: number, sz: number, szDecimals: number): Promise<number | null> {
+    try {
+      // For a LONG position, SL sells when price drops to slPrice
+      // For a SHORT position, SL buys when price rises to slPrice
+      const isBuy = side === "short";
+      const triggerPx = formatHLPrice(slPrice, szDecimals);
+      // Limit price with 1% slippage tolerance to ensure fill
+      const limitSlippage = side === "long" ? 0.99 : 1.01;
+      const limitPx = formatHLPrice(slPrice * limitSlippage, szDecimals);
+
+      const result = await executor.placeOrder({
+        coin,
+        isBuy,
+        sz: parseFloat(formatHLSize(sz, szDecimals)),
+        limitPx: parseFloat(limitPx),
+        orderType: { trigger: { triggerPx, isMarket: true, tpsl: "sl" } },
+        reduceOnly: true,
+      });
+
+      const status = result?.response?.data?.statuses?.[0];
+      const oid = status?.resting?.oid;
+      if (oid) {
+        log(`[HL_SL] Placed SL order: ${coin} ${side} trigger@$${triggerPx} oid=${oid}`, "engine");
+        return oid;
+      } else {
+        const errMsg = status?.error || JSON.stringify(result).slice(0, 200);
+        log(`[HL_SL] SL order not placed for ${coin}: ${errMsg}`, "engine");
+        return null;
+      }
+    } catch (e) {
+      log(`[HL_SL] Error placing SL: ${e}`, "engine");
+      return null;
+    }
+  }
+
+  /**
+   * Cancel all tracked SL orders for a trade.
+   */
+  private async cancelSLOrders(executor: ReturnType<typeof createExecutor>, tradeId: number, coin: string): Promise<void> {
+    const oids = this.slOrderOids.get(tradeId) || [];
+    for (const oid of oids) {
+      try {
+        await executor.cancelOrder(coin, oid);
+        log(`[HL_SL] Cancelled SL oid=${oid} for trade #${tradeId} ${coin}`, "engine");
+      } catch (e) {
+        log(`[HL_SL] Cancel SL oid=${oid} error: ${e}`, "engine");
+      }
+    }
+    this.slOrderOids.delete(tradeId);
   }
 
   async start() {
@@ -1369,12 +1426,49 @@ class TradingEngine {
     }
 
     const insights = await storage.getActiveInsights();
+
+    // Re-sync SL orders for any open trades (in case bot restarted and lost in-memory OIDs)
+    if (config.apiSecret && config.walletAddress) {
+      try {
+        const openTrades = await storage.getOpenTrades();
+        const executor = createExecutor(config.apiSecret, config.walletAddress);
+        const existingOrders = await executor.getOpenOrders();
+        const triggerOrders = (existingOrders || []).filter((o: any) => o.orderType === "Stop Market" || o.orderType === "Stop Limit" || o.isTrigger);
+        const positions = await executor.getPositions();
+
+        for (const trade of openTrades) {
+          if (!trade.stopLoss) continue;
+          const asset = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
+          if (!asset) continue;
+          const pos = positions.find((p: any) => p.position?.coin === trade.coin);
+          if (!pos) continue;
+          const posSize = Math.abs(parseFloat(pos.position.szi || "0"));
+          if (posSize <= 0) continue;
+
+          // Check if there's already a trigger order for this coin
+          const hasSL = triggerOrders.some((o: any) => o.coin === trade.coin);
+          if (!hasSL) {
+            const slOid = await this.placeHLStopLoss(executor, trade.coin, trade.side as "long" | "short", trade.stopLoss, posSize, asset.szDecimals);
+            if (slOid) this.slOrderOids.set(trade.id, [slOid]);
+            log(`[HL_SL] Startup: placed missing SL for trade #${trade.id} ${trade.coin} @ $${trade.stopLoss}`, "engine");
+          } else {
+            // Track the existing trigger order OID
+            const existingTrigger = triggerOrders.find((o: any) => o.coin === trade.coin);
+            if (existingTrigger?.oid) this.slOrderOids.set(trade.id, [existingTrigger.oid]);
+            log(`[HL_SL] Startup: found existing SL for trade #${trade.id} ${trade.coin} oid=${existingTrigger?.oid}`, "engine");
+          }
+        }
+      } catch (e) {
+        log(`[HL_SL] Startup SL sync error: ${e}`, "engine");
+      }
+    }
+
     await storage.createLog({
       type: "system",
-      message: `Engine v7 started | RSI-ONLY + BB + VOLUME + ADX | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights`,
+      message: `Engine v7 started | RSI-ONLY + BB + VOLUME + ADX | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights | SL orders: ON`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v7 started — RSI-ONLY + BB + VOLUME + ADX — AUM: $${this.lastKnownEquity.toFixed(2)} | ${insights.length} learned insights`, "engine");
+    log(`Engine v7 started — RSI-ONLY + BB + VOLUME + ADX — AUM: $${this.lastKnownEquity.toFixed(2)} | ${insights.length} learned insights | REAL SL ORDERS`, "engine");
     this.scheduleNextScan();
   }
 
@@ -1829,6 +1923,13 @@ class TradingEngine {
             openedAt: new Date().toISOString(),
           });
 
+          // Place REAL SL order on Hyperliquid
+          if (config.apiSecret && config.walletAddress) {
+            const slExecutor = createExecutor(config.apiSecret, config.walletAddress);
+            const slOid = await this.placeHLStopLoss(slExecutor, sig.asset.coin, side, sig.enhanced.suggestedSL, assetSize, sig.asset.szDecimals);
+            if (slOid) this.slOrderOids.set(trade.id, [slOid]);
+          }
+
           await logDecision({
             tradeId: trade.id, coin: sig.asset.coin, action: "entry", side, price: sig.price,
             rsi1h: sig.rsi1h, rsi4h: sig.rsi4h, rsi1d: sig.rsi1d,
@@ -1961,6 +2062,13 @@ class TradingEngine {
             openedAt: new Date().toISOString(),
           });
 
+          // Place REAL SL order on Hyperliquid
+          if (config.apiSecret && config.walletAddress) {
+            const slExecutor = createExecutor(config.apiSecret, config.walletAddress);
+            const slOid = await this.placeHLStopLoss(slExecutor, brSig.asset.coin, side, brSig.result.suggestedSL, assetSize, brSig.asset.szDecimals);
+            if (slOid) this.slOrderOids.set(trade.id, [slOid]);
+          }
+
           await logDecision({
             tradeId: trade.id, coin: brSig.asset.coin, action: "entry", side, price: brSig.price,
             rsi1h: brSig.rsi1h, rsi4h: brSig.rsi4h, rsi1d: brSig.rsi1d,
@@ -2053,11 +2161,7 @@ class TradingEngine {
           const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
-            // BE + 0.06% buffer: covers close fee (0.045%) + slippage so "breakeven" is never a loss
-            const beBuffer = 0.0006;
-            const breakEvenSL = trade.side === "long"
-              ? trade.entryPrice * (1 + beBuffer)
-              : trade.entryPrice * (1 - beBuffer);
+            const breakEvenSL = trade.entryPrice; // Exact entry price — real HL SL order handles execution
             // Execute 50% partial close on Hyperliquid
             let partialCloseSuccess = false;
             if (config.apiSecret && config.walletAddress) {
@@ -2088,14 +2192,30 @@ class TradingEngine {
               } catch (e) { log(`[TP1] Partial close error: ${e}`, "engine"); }
             }
             await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
+            // Cancel old SL order and place new one at breakeven on Hyperliquid
+            if (config.apiSecret && config.walletAddress) {
+              const slExec = createExecutor(config.apiSecret, config.walletAddress);
+              await this.cancelSLOrders(slExec, trade.id, trade.coin);
+              try {
+                const posList = await slExec.getPositions();
+                const curPos = posList.find((p: any) => p.position?.coin === trade.coin);
+                if (curPos) {
+                  const remainSz = Math.abs(parseFloat(curPos.position.szi || "0"));
+                  if (remainSz > 0) {
+                    const newOid = await this.placeHLStopLoss(slExec, trade.coin, trade.side as "long" | "short", breakEvenSL, remainSz, szd);
+                    if (newOid) this.slOrderOids.set(trade.id, [newOid]);
+                  }
+                }
+              } catch (e) { log(`[HL_SL] BE SL placement error: ${e}`, "engine"); }
+            }
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-              reasoning: `[${stratLabel}] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE+buffer @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+              reasoning: `[${stratLabel}] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE @ $${displayPrice(breakEvenSL, szd)} (real HL order) | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
               equity: currentEquity, leverage: trade.leverage, strategy,
             });
             await storage.createLog({
               type: "trade_tp1",
-              message: `[${stratLabel}] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE+0.06%`,
+              message: `[${stratLabel}] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE (HL order)`,
               timestamp: new Date().toISOString(),
             });
           }
@@ -2124,11 +2244,7 @@ class TradingEngine {
           const tp1Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                          (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
           if (tp1Hit) {
-            // BE + 0.06% buffer: covers close fee (0.045%) + slippage so "breakeven" is never a loss
-            const beBuffer = 0.0006;
-            const breakEvenSL = trade.side === "long"
-              ? trade.entryPrice * (1 + beBuffer)
-              : trade.entryPrice * (1 - beBuffer);
+            const breakEvenSL = trade.entryPrice; // Exact entry price — real HL SL order handles execution
             // Execute 50% partial close on Hyperliquid
             let partialCloseSuccess = false;
             if (config.apiSecret && config.walletAddress) {
@@ -2159,14 +2275,31 @@ class TradingEngine {
               } catch (e) { log(`[TP1] Partial close error: ${e}`, "engine"); }
             }
             await storage.updateTrade(trade.id, { tp1Hit: true, stopLoss: breakEvenSL, peakPnlPct: currentPeak, pnl: leveragedPnl, pnlPct: pnlOfAum });
+            // Cancel old SL order and place new one at breakeven (entry price) on Hyperliquid
+            if (config.apiSecret && config.walletAddress) {
+              const slExec = createExecutor(config.apiSecret, config.walletAddress);
+              await this.cancelSLOrders(slExec, trade.id, trade.coin);
+              // Get remaining position size for the new SL
+              try {
+                const posList = await slExec.getPositions();
+                const curPos = posList.find((p: any) => p.position?.coin === trade.coin);
+                if (curPos) {
+                  const remainSz = Math.abs(parseFloat(curPos.position.szi || "0"));
+                  if (remainSz > 0) {
+                    const newOid = await this.placeHLStopLoss(slExec, trade.coin, trade.side as "long" | "short", breakEvenSL, remainSz, szd);
+                    if (newOid) this.slOrderOids.set(trade.id, [newOid]);
+                  }
+                }
+              } catch (e) { log(`[HL_SL] BE SL placement error: ${e}`, "engine"); }
+            }
             await logDecision({
               tradeId: trade.id, coin: trade.coin, action: "tp1_hit", side: trade.side as any, price: currentPrice,
-              reasoning: `[BREAKOUT_RETEST] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE+buffer @ $${displayPrice(breakEvenSL, szd)} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
+              reasoning: `[BREAKOUT_RETEST] TP1 hit @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE @ $${displayPrice(breakEvenSL, szd)} (real HL order) | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)})`,
               equity: currentEquity, leverage: trade.leverage, strategy: "breakout_retest",
             });
             await storage.createLog({
               type: "trade_tp1",
-              message: `[BREAKOUT_RETEST] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE+0.06%`,
+              message: `[BREAKOUT_RETEST] TP1 HIT: ${trade.coin} @ $${displayPrice(currentPrice, szd)} | 50% CLOSED: ${partialCloseSuccess ? 'YES' : 'FAILED'} | SL → BE (HL order)`,
               timestamp: new Date().toISOString(),
             });
           }
@@ -2327,6 +2460,8 @@ class TradingEngine {
         if (config.apiSecret && config.walletAddress) {
           try {
             const executor = createExecutor(config.apiSecret, config.walletAddress);
+            // Cancel any tracked SL orders first so they don't interfere
+            await this.cancelSLOrders(executor, trade.id, trade.coin);
             const positions = await executor.getPositions();
             const pos = positions.find((p: any) => p.position?.coin === trade.coin);
             if (pos) {
