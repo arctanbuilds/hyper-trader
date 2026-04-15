@@ -732,20 +732,22 @@ function detectBreakoutRetest(
     if (barsSinceBreak <= 10) conf++; // fresh breakout
     conf = Math.min(conf, 5);
 
-    // TP/SL — SL 0.25%, TP1 0.3%, TP2 0.7%
-    // Fee-adjusted: TP1 must exceed round-trip taker fees (0.045% × 2 = 0.09%)
-    // Min TP1 = 0.12% to guarantee profit after fees
-    const slPct = 0.0025;
-    const tp1Pct = Math.max(0.003, 0.0012); // 0.3% (already exceeds 0.12% min)
-    const tp2Pct = 0.007;
+    // TP: 0.25% for TP1, 1% for TP2 (from price move)
+    // SL: placed beyond the trendline at current bar + buffer
+    // This survives the retest wick that naturally dips into the trendline
+    const tp1Pct = 0.0025; // 0.25% profit
+    const tp2Pct = 0.01;   // 1% profit
+    const slBuffer = 0.003; // 0.3% buffer beyond trendline — wide enough to survive retest wicks
 
     let sl: number, tp1: number, tp2: number;
     if (signal === "long") {
-      sl = currentPrice * (1 - slPct);
+      // SL below the trendline value (price is above TL on retest)
+      sl = tlValueNow * (1 - slBuffer);
       tp1 = currentPrice * (1 + tp1Pct);
       tp2 = currentPrice * (1 + tp2Pct);
     } else {
-      sl = currentPrice * (1 + slPct);
+      // SL above the trendline value (price is below TL on retest)
+      sl = tlValueNow * (1 + slBuffer);
       tp1 = currentPrice * (1 - tp1Pct);
       tp2 = currentPrice * (1 - tp2Pct);
     }
@@ -1739,16 +1741,15 @@ class TradingEngine {
 
       // =============================================
       // EXECUTE BREAKOUT/RETEST ENTRIES (fully separate)
+      // ONE position at a time — 80% margin, max leverage, wait for the right trade
       // =============================================
-      const brSlotsAvailable = maxPos - openTrades.length - slotsUsed;
-      if (canOpenNew && brSlotsAvailable > 0 && breakoutRetestSignals.length > 0) {
-        let brSlotsUsed = 0;
-        // Sort by confidence descending
+      const brOpenCount = openTrades.filter(t => t.strategy === "breakout_retest").length;
+      if (canOpenNew && brOpenCount === 0 && breakoutRetestSignals.length > 0) {
+        // Sort by confidence descending, pick only the best one
         breakoutRetestSignals.sort((a, b) => b.result.confidenceScore - a.result.confidenceScore);
 
-        for (const brSig of breakoutRetestSignals.slice(0, brSlotsAvailable)) {
+        for (const brSig of breakoutRetestSignals.slice(0, 1)) {
           if (brSig.result.signal === "none") continue;
-          if (openByCoinStrategy.has(`${brSig.asset.coin}_breakout_retest`)) continue;
 
           const side = brSig.result.signal as "long" | "short";
           const reasoning: string[] = [];
@@ -1757,8 +1758,8 @@ class TradingEngine {
           reasoning.push(`BREAKOUT: ${brSig.result.barsSinceBreakout} bars ago | TL@break: $${displayPrice(brSig.result.trendlineValueAtBreak, brSig.asset.szDecimals)} | TL@now: $${displayPrice(brSig.result.trendlineValueNow, brSig.asset.szDecimals)}`);
           reasoning.push(`RETEST: price $${displayPrice(brSig.result.retestPrice, brSig.asset.szDecimals)} near trendline | Rejection candle: ${brSig.result.rejectionConfirm ? 'YES' : 'NO'}`);
           reasoning.push(`Confidence: ${brSig.result.confidenceScore}/5 | TF: ${brSig.result.triggerTF}`);
-          reasoning.push(`TP1: $${displayPrice(brSig.result.suggestedTP1, brSig.asset.szDecimals)} | TP2: $${displayPrice(brSig.result.suggestedTP2, brSig.asset.szDecimals)}`);
-          reasoning.push(`SL: $${displayPrice(brSig.result.suggestedSL, brSig.asset.szDecimals)} → moves to BE after TP1`);
+          reasoning.push(`TP1: $${displayPrice(brSig.result.suggestedTP1, brSig.asset.szDecimals)} (0.25%) | TP2: $${displayPrice(brSig.result.suggestedTP2, brSig.asset.szDecimals)} (1%)`);
+          reasoning.push(`SL: $${displayPrice(brSig.result.suggestedSL, brSig.asset.szDecimals)} (below trendline @ $${displayPrice(brSig.result.trendlineValueNow, brSig.asset.szDecimals)} + 0.3% buffer) → BE after TP1`);
           reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(brSig.fundingRate * 100).toFixed(4)}%`);
 
           // Check learning insights
@@ -1769,17 +1770,19 @@ class TradingEngine {
             continue;
           }
 
-          // Position sizing — same 25% AUM, max leverage
-          const pos = calculateAdaptivePosition({ equity, price: brSig.price, asset: brSig.asset, config });
-          if (!pos.canTrade) {
-            reasoning.push(`SKIP: ${pos.skipReason}`);
+          // Position sizing — 80% of equity, max leverage (high conviction single trade)
+          const leverage = brSig.asset.maxLeverage;
+          const capitalForTrade = equity * 0.80; // 80% of AUM
+          const notionalSize = capitalForTrade * leverage;
+          const assetSize = notionalSize / brSig.price;
+          const tradeAmountPct = 80;
+
+          if (capitalForTrade < 5) {
+            reasoning.push(`SKIP: Capital too low ($${capitalForTrade.toFixed(2)})`);
             await logDecision({ coin: brSig.asset.coin, action: "skip", side, price: brSig.price, reasoning: reasoning.join(" | "), equity, strategy: "breakout_retest" });
             continue;
           }
-
-          const { leverage, capitalForTrade, assetSize, notionalSize } = pos;
-          const tradeAmountPct = (capitalForTrade / equity) * 100;
-          reasoning.push(`ENTRY: ${side.toUpperCase()} ${brSig.asset.displayName} | ${leverage}x (MAX) | $${capitalForTrade.toFixed(2)} capital ($${notionalSize.toFixed(0)} notional)`);
+          reasoning.push(`ENTRY: ${side.toUpperCase()} ${brSig.asset.displayName} | ${leverage}x MAX | 80% AUM ($${capitalForTrade.toFixed(2)}) | Notional: $${notionalSize.toFixed(0)}`);
 
           // Execute order
           if (config.apiSecret && config.walletAddress) {
@@ -1839,7 +1842,7 @@ class TradingEngine {
             confluenceDetails: `BREAKOUT_RETEST: ${brSig.result.trendlineType} TL | ${brSig.result.trendlineTouches} touches | str:${brSig.result.trendlineStrength} | rej:${brSig.result.rejectionConfirm} | ${brSig.result.barsSinceBreakout} bars | conf:${brSig.result.confidenceScore}/5`,
             riskRewardRatio: 0,
             status: "open",
-            reason: `[BREAKOUT_RETEST] ${side.toUpperCase()} | ${brSig.result.trendlineType} TL retest | ${brSig.result.triggerTF} | Conf:${brSig.result.confidenceScore}/5 | ${leverage}x MAX | $${capitalForTrade.toFixed(0)}`,
+            reason: `[BREAKOUT_RETEST] ${side.toUpperCase()} | ${brSig.result.trendlineType} TL retest | ${brSig.result.triggerTF} | Conf:${brSig.result.confidenceScore}/5 | ${leverage}x MAX | 80% AUM ($${capitalForTrade.toFixed(0)}) | SL@TL`,
             setupType: "breakout_retest",
             strategy: "breakout_retest",
             openedAt: new Date().toISOString(),
@@ -1857,15 +1860,14 @@ class TradingEngine {
 
           await storage.createLog({
             type: "trade_open",
-            message: `[BREAKOUT_RETEST] ${side.toUpperCase()} ${brSig.asset.displayName} @ $${displayPrice(brSig.price, brSig.asset.szDecimals)} | ${leverage}x | ${brSig.result.trendlineType} TL | ${brSig.result.triggerTF} | Conf:${brSig.result.confidenceScore}/5 | $${capitalForTrade.toFixed(0)}`,
+            message: `[BREAKOUT_RETEST] ${side.toUpperCase()} ${brSig.asset.displayName} @ $${displayPrice(brSig.price, brSig.asset.szDecimals)} | ${leverage}x | 80% AUM ($${capitalForTrade.toFixed(0)}) | ${brSig.result.trendlineType} TL | ${brSig.result.triggerTF} | Conf:${brSig.result.confidenceScore}/5 | SL@TL $${displayPrice(brSig.result.suggestedSL, brSig.asset.szDecimals)}`,
             data: JSON.stringify(trade),
             timestamp: new Date().toISOString(),
           });
 
-          openByCoinStrategy.add(`${brSig.asset.coin}_breakout_retest`);
-          brSlotsUsed++;
           slotsUsed++;
           this.dailyTradeCount++;
+          break; // Only one breakout_retest position at a time
         }
       }
 
