@@ -1,15 +1,19 @@
 /**
- * HyperTrader — Elite Trading Engine v10.4
+ * HyperTrader — Elite Trading Engine v10.5
+ *
+ * BTC ONLY — fewer trades, higher quality, bigger wins
  *
  * TWO ACTIVE STRATEGIES:
  *
  * STRATEGY 1 — BB_RSI REVERSAL:
- *   - LONG when RSI ≤ 20 + price at 2.5+ SD lower BB
- *   - SHORT when RSI ≥ 85 + price at 2.5+ SD upper BB
+ *   - LONG when RSI ≤ 20 + price at 2.5+ SD lower BB + near historical SUPPORT (required)
+ *   - SHORT when RSI ≥ 85 + price at 2.5+ SD upper BB + near historical RESISTANCE (required)
+ *   - S/R confirmation is MANDATORY (not just a confidence boost)
  *   - 80% margin, max leverage
- *   - SL: 0.5%, TP1: 0.3% → BE, TP2: dynamic
+ *   - SL: WIDE — recent swing extreme from 15m candles (capped at 2%, min 0.3%)
+ *   - TP1: 0.3% → BE, TP2: dynamic
  *
- * STRATEGY 2 — TRENDLINE RETEST (v10.4 overhaul):
+ * STRATEGY 2 — TRENDLINE RETEST:
  *   - Build trendlines on 5m/15m from swing pivots
  *   - Price BREAKS through trendline
  *   - Price comes BACK to retest
@@ -47,8 +51,9 @@ interface AssetConfig {
 
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",  displayName: "Bitcoin",  dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
-  { coin: "ETH",  displayName: "Ethereum", dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
-  { coin: "SOL",  displayName: "Solana",   dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
+  // ETH & SOL disabled — BTC only for higher quality trades (v10.5)
+  // { coin: "ETH",  displayName: "Ethereum", dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
+  // { coin: "SOL",  displayName: "Solana",   dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
 ];
 
 // ============ STRATEGY TYPES ============
@@ -1362,10 +1367,11 @@ function detectEnhancedRSI(params: {
   if (srConfirm) confidenceScore++;
 
   // --- TP/SL targets for BB_RSI_REVERSION ---
-  // User-defined: SL = 0.5%, TP1 = 0.3% (move SL→BE after hit), TP2 = dynamic (bot determines)
+  // NOTE: This SL is a fallback default. At execution time (v10.5), it's OVERRIDDEN with a
+  // wide SL computed from the swing extreme of recent 15m candles, matching trendline strategy.
   // Fee-adjusted: Hyperliquid taker fee = 0.045% per side, round-trip = 0.09%
   // TP1 at 0.3% = 0.21% net profit after fees — always profitable
-  const slPct = 0.005;    // 0.5% SL — wider SL gives room for the reversal to play out
+  const slPct = 0.005;    // 0.5% fallback SL — overridden by wide swing SL at execution
   const tp1Pct = 0.003;   // 0.3% TP1 — lock in profit, move SL to BE
   const tp2Pct = 0.01;    // 1% initial TP2 placeholder — dynamic TP2 overrides this after TP1 hit
 
@@ -1851,6 +1857,9 @@ class TradingEngine {
           // HIGH-QUALITY FILTER: require confidence >= 5/6 for all RSI/BB entries
           // Data shows conf 4 trades underperform; conf 5+ have much better outcomes
           if (sig.enhanced.confidenceScore < 5) continue;
+          // v10.5: S/R confirmation REQUIRED for reversals — must be near historical S/R level
+          // LONG must be at support, SHORT must be at resistance. No S/R = no trade.
+          if (!sig.enhanced.srConfirm) continue;
           // Block trades into strong S/R levels
           if (sig.enhanced.srBlock) continue;
 
@@ -1869,10 +1878,6 @@ class TradingEngine {
           if (sig.enhanced.srBlock) srInfo.push(`S/R BLOCKS — trading INTO strong level`);
           if (srInfo.length > 0) reasoning.push(`S/R: ${srInfo.join(" | ")}`);
           reasoning.push(`Confidence: ${sig.enhanced.confidenceScore}/6`);
-          reasoning.push(`Price: $${displayPrice(sig.price, sig.asset.szDecimals)}`);
-          reasoning.push(`TP1: $${displayPrice(sig.enhanced.suggestedTP1, sig.asset.szDecimals)} | TP2: $${displayPrice(sig.enhanced.suggestedTP2, sig.asset.szDecimals)}`);
-          reasoning.push(`SL: $${displayPrice(sig.enhanced.suggestedSL, sig.asset.szDecimals)} → moves to BE after TP1`);
-          reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(sig.fundingRate * 100).toFixed(4)}%`);
 
           // S/R block: skip if trading into a strong level
           if (sig.enhanced.srBlock) {
@@ -1880,6 +1885,45 @@ class TradingEngine {
             await logDecision({ coin: sig.asset.coin, action: "skip", side, price: sig.price, reasoning: reasoning.join(" | "), equity, strategy: strategyKey });
             continue;
           }
+
+          // v10.5: WIDE SL for reversals — use swing extreme from 15m candles (matches trendline strategy)
+          // Instead of fixed 0.5%, find the recent swing high/low and place SL beyond it
+          const revSlScanBars = Math.min(20, ohlcv15m.length);
+          const revLastIdx = ohlcv15m.length - 1;
+          let revWideSL: number;
+          if (side === "long") {
+            // SL below: lowest low in recent 15m candles
+            let lowestLow = sig.price;
+            for (let i = revLastIdx; i >= Math.max(0, revLastIdx - revSlScanBars); i--) {
+              if (ohlcv15m[i].low < lowestLow) lowestLow = ohlcv15m[i].low;
+            }
+            revWideSL = lowestLow * 0.999; // tiny buffer below swing low
+          } else {
+            // SL above: highest high in recent 15m candles
+            let highestHigh = sig.price;
+            for (let i = revLastIdx; i >= Math.max(0, revLastIdx - revSlScanBars); i--) {
+              if (ohlcv15m[i].high > highestHigh) highestHigh = ohlcv15m[i].high;
+            }
+            revWideSL = highestHigh * 1.001; // tiny buffer above swing high
+          }
+          // Safety cap: max 2% away
+          const revMaxSlDist = sig.price * 0.02;
+          if (Math.abs(revWideSL - sig.price) > revMaxSlDist) {
+            revWideSL = side === "long" ? sig.price - revMaxSlDist : sig.price + revMaxSlDist;
+          }
+          // Minimum SL distance: at least 0.3% to avoid noise stops
+          const revMinSlDist = sig.price * 0.003;
+          if (Math.abs(revWideSL - sig.price) < revMinSlDist) {
+            revWideSL = side === "long" ? sig.price - revMinSlDist : sig.price + revMinSlDist;
+          }
+          // Override the fixed SL with the wide SL
+          sig.enhanced.suggestedSL = revWideSL;
+          const revSlPct = (Math.abs(revWideSL - sig.price) / sig.price * 100).toFixed(3);
+
+          reasoning.push(`Price: $${displayPrice(sig.price, sig.asset.szDecimals)}`);
+          reasoning.push(`TP1: $${displayPrice(sig.enhanced.suggestedTP1, sig.asset.szDecimals)} | TP2: $${displayPrice(sig.enhanced.suggestedTP2, sig.asset.szDecimals)}`);
+          reasoning.push(`SL: $${displayPrice(revWideSL, sig.asset.szDecimals)} (WIDE: ${revSlPct}% swing extreme) → moves to BE after TP1`);
+          reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(sig.fundingRate * 100).toFixed(4)}%`);
 
           // Learning insights — log only, never block trades
           const insightCheck = await checkInsights({ coin: sig.asset.coin, side, session: sessionInfo.session, confluenceScore: 7, dayOfWeek: now.getUTCDay() });
