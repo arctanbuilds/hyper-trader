@@ -531,6 +531,8 @@ interface BreakoutRetestResult {
   suggestedSL: number;
   suggestedTP1: number;
   suggestedTP2: number;
+  // v10.6: TL signature for blacklisting failed setups
+  tlSignature: { type: string; startPrice: number; slope: number };
 }
 
 /** Get the trendline price at a given candle index using linear projection */
@@ -539,19 +541,20 @@ function trendlineAt(tl: Trendline, idx: number): number {
 }
 
 /**
- * Detect trendlines from OHLCV candles by connecting swing highs (descending)
- * and swing lows (ascending).
+ * v10.6 OVERHAUL — Detect REAL trendlines only.
  *
- * v10 OVERHAUL: Build clean trendlines from well-separated significant swing points.
- * The ideal pattern (from user chart examples):
- *   1. Descending TL: 2-3+ swing HIGHS forming lower highs, well spaced apart
- *   2. Ascending TL: 2-3+ swing LOWS forming higher lows, well spaced apart
- *   3. Pivots must be SIGNIFICANT — not minor noise wiggles
- *   4. No candle body should have CLOSED beyond the trendline before the breakout
- *      (the TL must have held as resistance/support until the break)
+ * A real trendline (from user's chart examples):
+ *   1. Must span at least 20 candles on the 5m timeframe
+ *   2. Must have at least 3 clear rejections (price touches TL and bounces back)
+ *   3. The TL must have HELD as support/resistance — no candle body closed beyond it
+ *   4. Only on the 4th+ touch or later does it break through
+ *   5. Then we wait for the retest
+ *
+ * Descending TL: 3+ swing HIGHS forming lower highs, well spaced apart
+ * Ascending TL: 3+ swing LOWS forming higher lows, well spaced apart
  */
 function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Trendline[] {
-  if (candles.length < pivotWindow * 2 + 5) return [];
+  if (candles.length < pivotWindow * 2 + 20) return [];
 
   // Find swing highs and swing lows with proper pivot window
   const swingHighs: { idx: number; price: number }[] = [];
@@ -568,8 +571,8 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
   }
 
   // QUALITY FILTER: Remove pivots that are too close together (keep the most significant one)
-  // Minimum spacing: 4 bars apart for swing points to count as separate
-  const MIN_PIVOT_SPACING = 4;
+  // Minimum spacing: 8 bars apart (40 min on 5m) — pivots must be real, not noise
+  const MIN_PIVOT_SPACING = 8;
   function filterPivots(pivots: { idx: number; price: number }[], keepHigher: boolean): typeof pivots {
     if (pivots.length <= 1) return pivots;
     const filtered: typeof pivots = [pivots[0]];
@@ -598,17 +601,20 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
     for (let b = a + 1; b < cleanHighs.length; b++) {
       const p1 = cleanHighs[a], p2 = cleanHighs[b];
       if (p2.price >= p1.price) continue; // must be descending
-      if (p2.idx - p1.idx < 5) continue;  // minimum span — need real separation
+      if (p2.idx - p1.idx < 20) continue;  // v10.6: minimum 20 candles — real trendlines only
 
       const slope = (p2.price - p1.price) / (p2.idx - p1.idx);
 
-      // Count touches
+      // Count touches (p1 and p2 are the anchor points, count additional touches)
       let touches = 2;
       for (let c = 0; c < cleanHighs.length; c++) {
         if (c === a || c === b) continue;
         const expected = p1.price + slope * (cleanHighs[c].idx - p1.idx);
         if (Math.abs(cleanHighs[c].price - expected) / expected <= tolerancePct) touches++;
       }
+
+      // v10.6: MINIMUM 3 touches (rejections) required — real TLs get tested multiple times
+      if (touches < 3) continue;
 
       // VALIDITY CHECK: no candle body should have CLOSED above the TL between p1 and p2
       // (the TL must have held as resistance until the actual breakout)
@@ -620,8 +626,8 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
       if (!tlHeld) continue;
 
       let strength = Math.min(touches, 3);
-      if (p2.idx - p1.idx >= 15) strength++;
-      if (touches >= 3) strength++;
+      if (p2.idx - p1.idx >= 30) strength++;  // bonus for longer TLs (30+ candles = 2.5h on 5m)
+      if (touches >= 4) strength++;            // bonus for 4+ rejections
       strength = Math.min(strength, 5);
 
       trendlines.push({
@@ -636,7 +642,7 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
     for (let b = a + 1; b < cleanLows.length; b++) {
       const p1 = cleanLows[a], p2 = cleanLows[b];
       if (p2.price <= p1.price) continue; // must be ascending
-      if (p2.idx - p1.idx < 5) continue;
+      if (p2.idx - p1.idx < 20) continue;  // v10.6: minimum 20 candles — real trendlines only
 
       const slope = (p2.price - p1.price) / (p2.idx - p1.idx);
       let touches = 2;
@@ -645,6 +651,9 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
         const expected = p1.price + slope * (cleanLows[c].idx - p1.idx);
         if (Math.abs(cleanLows[c].price - expected) / expected <= tolerancePct) touches++;
       }
+
+      // v10.6: MINIMUM 3 touches (rejections) required
+      if (touches < 3) continue;
 
       // VALIDITY CHECK: no candle body should have CLOSED below the TL between p1 and p2
       let tlHeld = true;
@@ -655,8 +664,8 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
       if (!tlHeld) continue;
 
       let strength = Math.min(touches, 3);
-      if (p2.idx - p1.idx >= 15) strength++;
-      if (touches >= 3) strength++;
+      if (p2.idx - p1.idx >= 30) strength++;  // bonus for longer TLs
+      if (touches >= 4) strength++;            // bonus for 4+ rejections
       strength = Math.min(strength, 5);
 
       trendlines.push({
@@ -702,6 +711,7 @@ function detectBreakoutRetest(
     barsSinceBreakout: 0, trendlineTouches: 0, trendlineStrength: 0,
     rejectionConfirm: false, confidenceScore: 0, triggerTF: tf,
     suggestedSL: 0, suggestedTP1: 0, suggestedTP2: 0,
+    tlSignature: { type: "none", startPrice: 0, slope: 0 },
   };
 
   if (candles.length < 30) return noResult;
@@ -833,8 +843,8 @@ function detectBreakoutRetest(
       wideSL = highestHigh * 1.001; // tiny buffer above the swing high
     }
 
-    // Safety cap: SL should not be more than 2% away from TL entry (prevent absurd SLs)
-    const maxSlDist = tlValueNow * 0.02;
+    // v10.6: SL capped at 0.50% of position — hard max
+    const maxSlDist = tlValueNow * 0.005;
     if (Math.abs(wideSL - tlValueNow) > maxSlDist) {
       wideSL = signal === "long" ? tlValueNow - maxSlDist : tlValueNow + maxSlDist;
     }
@@ -844,10 +854,9 @@ function detectBreakoutRetest(
       wideSL = signal === "long" ? tlValueNow - minSlDist : tlValueNow + minSlDist;
     }
 
-    // TP: standard 0.3% TP1, 1% TP2 placeholder (dynamic TP2 kicks in after TP1)
-    // Use TL value as entry basis — we ALWAYS enter at the trendline, not at market price
+    // v10.6: TP1 0.35%, TP2 1% — TL value as entry basis
     const entryAtTL = tlValueNow;
-    const tp1Pct = 0.003;
+    const tp1Pct = 0.0035;
     const tp2Pct = 0.01;
 
     let tp1: number, tp2: number;
@@ -866,6 +875,7 @@ function detectBreakoutRetest(
       trendlineTouches: tl.touches, trendlineStrength: tl.strength,
       rejectionConfirm, confidenceScore: conf, triggerTF: tf,
       suggestedSL: wideSL, suggestedTP1: tp1, suggestedTP2: tp2,
+      tlSignature: { type: tl.type, startPrice: tl.startPrice, slope: tl.slope },
     });
   }
 
@@ -1415,6 +1425,48 @@ class TradingEngine {
   private latestSRLevels: Record<string, SRAnalysis> = {}; // per-asset S/R levels from last scan
   // Track Hyperliquid SL order OIDs per trade — allows cancel+replace on TP1 hit and cleanup on close
   private slOrderOids: Map<number, number[]> = new Map(); // tradeId → [oid1, oid2, ...]
+  // v10.6: Track failed TL setups — if a TL trade loses, blacklist that TL signature so bot doesn't retry
+  // Key = "type|startPrice|slope" rounded, Value = timestamp of failure
+  private failedTLSetups: Map<string, number> = new Map();
+
+  private getTLSignature(tl: { type: string; startPrice: number; slope: number }): string {
+    // Round to create a stable key — same TL detected across scans will match
+    return `${tl.type}|${Math.round(tl.startPrice)}|${(tl.slope * 1000).toFixed(3)}`;
+  }
+
+  private blacklistTL(tl: { type: string; startPrice: number; slope: number }) {
+    const sig = this.getTLSignature(tl);
+    this.failedTLSetups.set(sig, Date.now());
+    // Clean old entries (>6h) to avoid unbounded growth
+    const cutoff = Date.now() - 6 * 3600 * 1000;
+    for (const [k, v] of this.failedTLSetups) {
+      if (v < cutoff) this.failedTLSetups.delete(k);
+    }
+  }
+
+  private isTLBlacklisted(tl: { type: string; startPrice: number; slope: number }): boolean {
+    // Check exact signature match first
+    const sig = this.getTLSignature(tl);
+    const failedAt = this.failedTLSetups.get(sig);
+    if (failedAt) {
+      if (Date.now() - failedAt > 6 * 3600 * 1000) {
+        this.failedTLSetups.delete(sig);
+      } else {
+        return true;
+      }
+    }
+    // Also check price proximity — if any failed TL of same type was within 0.5% of this TL, block it
+    // This catches the same TL being slightly recalculated across scans
+    const cutoff = Date.now() - 6 * 3600 * 1000;
+    for (const [k, v] of this.failedTLSetups) {
+      if (v < cutoff) { this.failedTLSetups.delete(k); continue; }
+      const [fType, fPrice] = k.split("|");
+      if (fType === tl.type && Math.abs(parseFloat(fPrice) - tl.startPrice) / tl.startPrice < 0.005) {
+        return true; // same type TL within 0.5% price range — blocked
+      }
+    }
+    return false;
+  }
 
   private resetLossTrackers() {
     this.drawdownPaused = false;
@@ -1805,8 +1857,9 @@ class TradingEngine {
 
         // --- BREAKOUT/RETEST DETECTION (completely separate from RSI/BB) ---
         // v10.4: Scan 5m and 15m for trendline break + retest + 1m reaction candle
-        const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", ohlcv1m, 0.003, 30);
-        const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", ohlcv1m, 0.004, 25);
+        // v10.6: Tight retest tolerance — price must be within 0.05% of TL to trigger
+        const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", ohlcv1m, 0.0005, 30);
+        const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", ohlcv1m, 0.0005, 25);
 
         // Pick the best signal — prefer higher confidence, then prefer 15m
         let bestBR: BreakoutRetestResult | null = null;
@@ -2054,6 +2107,12 @@ class TradingEngine {
         for (const brSig of breakoutRetestSignals.slice(0, 1)) {
           if (brSig.result.signal === "none") continue;
 
+          // v10.6: Skip if this TL setup already failed once
+          if (this.isTLBlacklisted(brSig.result.tlSignature)) {
+            await storage.createLog({ type: "order_skipped", message: `SKIP: [BREAKOUT_RETEST] ${brSig.asset.displayName} — TL setup already failed, blacklisted`, timestamp: new Date().toISOString() });
+            continue;
+          }
+
           const side = brSig.result.signal as "long" | "short";
           const reasoning: string[] = [];
           reasoning.push(`[BREAKOUT_RETEST] Signal: ${side.toUpperCase()} ${brSig.asset.displayName}`);
@@ -2255,6 +2314,15 @@ class TradingEngine {
               closedAt: new Date().toISOString(),
             });
             log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed — no HL position found | P&L: $${syncPnl.toFixed(2)}`, "engine");
+            // v10.6: Blacklist TL if sync-closed at a loss
+            if (trade.strategy === "breakout_retest" && syncPnl < -0.5) {
+              const r = trade.reason || "";
+              const tt = r.includes("ascending") ? "ascending" : r.includes("descending") ? "descending" : "";
+              if (tt) {
+                this.blacklistTL({ type: tt, startPrice: trade.entryPrice, slope: 0 });
+                log(`[BLACKLIST] TL setup blacklisted (sync): ${tt} near $${trade.entryPrice}`, "engine");
+              }
+            }
             await storage.createLog({
               type: "trade_close",
               message: `[SYNC] Auto-closed ${trade.coin} ${trade.side} #${trade.id} — no matching HL position | P&L: $${syncPnl.toFixed(2)}`,
@@ -2655,6 +2723,19 @@ class TradingEngine {
           exitPrice: currentPrice, pnl: leveragedPnl, pnlPct: pnlOfAum, peakPnlPct: currentPeak,
           status: "closed", closeReason, closedAt: new Date().toISOString(),
         });
+
+        // v10.6: If breakout_retest trade closed at a loss (not breakeven), blacklist this TL setup
+        if (strategy === "breakout_retest" && pnlUsd < -0.5) {
+          // Extract TL info from the trade reason to build a signature
+          const reason = trade.reason || "";
+          const tlType = reason.includes("ascending") ? "ascending" : reason.includes("descending") ? "descending" : "";
+          if (tlType) {
+            // Use entry price + side as a rough TL identifier since we don't store exact TL params on the trade
+            // This will prevent re-entry on the same general TL area
+            this.blacklistTL({ type: tlType, startPrice: trade.entryPrice, slope: 0 });
+            log(`[BLACKLIST] TL setup blacklisted: ${tlType} near $${trade.entryPrice} — trade #${trade.id} lost $${Math.abs(pnlUsd).toFixed(2)}`, "engine");
+          }
+        }
 
         await logDecision({
           tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
