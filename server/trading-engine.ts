@@ -1859,8 +1859,8 @@ class TradingEngine {
         // --- BREAKOUT/RETEST DETECTION (completely separate from RSI/BB) ---
         // v10.4: Scan 5m and 15m for trendline break + retest + 1m reaction candle
         // v10.6: Tight retest tolerance — price must be within 0.05% of TL to trigger
-        const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", ohlcv1m, 0.0005, 30);
-        const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", ohlcv1m, 0.0005, 25);
+        const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", ohlcv1m, 0.001, 30);
+        const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", ohlcv1m, 0.001, 25);
 
         // Pick the best signal — prefer higher confidence, then prefer 15m
         let bestBR: BreakoutRetestResult | null = null;
