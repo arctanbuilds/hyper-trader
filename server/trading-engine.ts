@@ -6,7 +6,7 @@
  * TWO ACTIVE STRATEGIES:
  *
  * STRATEGY 1 — BB_RSI REVERSAL:
- *   - LONG when RSI ≤ 20 + price at 2.5+ SD lower BB + near historical SUPPORT (required)
+ *   - LONG when RSI ≤ 25 + price at 2.5+ SD lower BB + near historical SUPPORT (required)
  *   - SHORT when RSI ≥ 85 + price at 2.5+ SD upper BB + near historical RESISTANCE (required)
  *   - S/R confirmation is MANDATORY (not just a confidence boost)
  *   - 80% margin, max leverage
@@ -1280,10 +1280,10 @@ function detectEnhancedRSI(params: {
   let triggerBTF = "";
   let triggerBRSI = 0;
 
-  // RSI REVERSAL: LONG when RSI ≤ 20 (extreme oversold), SHORT when RSI ≥ 85 (extreme overbought)
+  // RSI REVERSAL: LONG when RSI ≤ 25 (extreme oversold), SHORT when RSI ≥ 85 (extreme overbought)
   // These are very rare, high-conviction signals — price at BB + extreme RSI = strong mean reversion
   // SL: 0.5%, TP1: 0.3% (move SL→BE), TP2: dynamic (bot determines)
-  const REVERSAL_LONG_RSI = 20;   // RSI must be ≤ this to go LONG
+  const REVERSAL_LONG_RSI = 25;   // RSI must be ≤ this to go LONG
   const REVERSAL_SHORT_RSI = 85;  // RSI must be ≥ this to go SHORT
 
   const bb5mStdDist = bb5m.stdDev > 0 ? Math.abs(price - bb5m.middle) / bb5m.stdDev : 0;
@@ -1431,6 +1431,9 @@ class TradingEngine {
   // v10.6: Track failed TL setups — if a TL trade loses, blacklist that TL signature so bot doesn't retry
   // Key = "type|startPrice|slope" rounded, Value = timestamp of failure
   private failedTLSetups: Map<string, number> = new Map();
+  // v10.6.6: RSI cross tracking — record price at the moment RSI first hits extreme
+  // Key = "coin_tf_direction", Value = { price, timestamp, rsi }
+  private rsiCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
 
   private getTLSignature(tl: { type: string; startPrice: number; slope: number }): string {
     // Round to create a stable key — same TL detected across scans will match
@@ -1844,7 +1847,7 @@ class TradingEngine {
         });
 
         // --- BB_RSI REVERSAL DETECTION ---
-        // Extreme RSI reversal: LONG when RSI ≤ 20, SHORT when RSI ≥ 85
+        // Extreme RSI reversal: LONG when RSI ≤ 25, SHORT when RSI ≥ 85
         // These thresholds are very rare = high conviction. All assets allowed.
         // SL: 0.5%, TP1: 0.3% (→ SL moves to BE), TP2: dynamic
         // extreme_rsi (confluence) strategy remains DISABLED (-$48.60 across 103 trades)
@@ -1859,30 +1862,71 @@ class TradingEngine {
           });
         }
 
-        // --- BREAKOUT/RETEST DETECTION (completely separate from RSI/BB) ---
-        // v10.4: Scan 5m and 15m for trendline break + retest + 1m reaction candle
-        // v10.6: Tight retest tolerance — price must be within 0.05% of TL to trigger
-        const br5m = detectBreakoutRetest(ohlcv5m, price, "5m", ohlcv1m, 0.001, 30);
-        const br15m = detectBreakoutRetest(ohlcv15m, price, "15m", ohlcv1m, 0.001, 25);
+        // --- v10.7: INSTANT RSI CROSS DETECTION ---
+        // Enter the MOMENT RSI crosses below 25 (long) or above 85 (short)
+        // Track cross state per coin+tf to detect the first cross, not stale readings
+        const REVERSAL_LONG_RSI = 25;
+        const REVERSAL_SHORT_RSI = 85;
+        const RSI_ENTRY_TOLERANCE = 0.0005; // 0.05% price tolerance for entry
 
-        // Pick the best signal — prefer higher confidence, then prefer 15m
-        let bestBR: BreakoutRetestResult | null = null;
-        if (br15m.triggered && br5m.triggered) {
-          bestBR = br15m.confidenceScore >= br5m.confidenceScore ? br15m : br5m;
-        } else if (br15m.triggered) {
-          bestBR = br15m;
-        } else if (br5m.triggered) {
-          bestBR = br5m;
-        }
+        for (const [tfLabel, rsiVal] of [["5m", rsi5m], ["15m", rsi15m]] as [string, number][]) {
+          const longKey = `${asset.coin}_${tfLabel}_long`;
+          const shortKey = `${asset.coin}_${tfLabel}_short`;
 
-        // v10.4: The 1m reaction candle IS the primary filter.
-        // If detectBreakoutRetest triggered, it already has TL + break + retest + 1m reaction confirmed.
-        // Only require minimum confidence of 2 (base score).
-        if (bestBR && bestBR.triggered && bestBR.confidenceScore >= 2) {
-          breakoutRetestSignals.push({
-            asset, price, result: bestBR, volume24h, change24h, fundingRate: funding, openInterest,
-            rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
-          });
+          // --- LONG: RSI just crossed below threshold ---
+          if (rsiVal <= REVERSAL_LONG_RSI) {
+            if (!this.rsiCrossState.has(longKey)) {
+              // First cross! Record the price and signal immediately
+              this.rsiCrossState.set(longKey, { price, timestamp: Date.now(), rsi: rsiVal });
+              // Check S/R (soft — boosts confidence but not required)
+              const srData = this.latestSRLevels[asset.coin];
+              const hasSR = srData && srData.nearestSupport && srData.supportDistance < 0.3;
+              enhancedSignals.push({
+                asset, price, volume24h, change24h, fundingRate: funding, openInterest,
+                rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
+                enhanced: {
+                  signal: "long" as const, triggerType: "bb_rsi_reversion" as const,
+                  triggerTF: tfLabel, triggerRSI: rsiVal,
+                  bollingerConfirm: true, volumeExhaustion: false,
+                  adxValue: 0, adxRegime: "" as any,
+                  allRSIs: [{ tf: tfLabel, rsi: rsiVal }],
+                  confidenceScore: hasSR ? 6 : 5,
+                  srConfirm: !!hasSR, srBlock: false,
+                  srAnalysis: srData || { levels5m: [], levels15m: [], levels1h: [], nearestSupport: null, nearestResistance: null, supportDistance: 99, resistanceDistance: 99 },
+                },
+              });
+              log(`[RSI_CROSS] ${asset.coin} ${tfLabel} RSI=${rsiVal.toFixed(1)} ≤ ${REVERSAL_LONG_RSI} → LONG signal @ $${price} ${hasSR ? '(S/R confirmed)' : ''}`, "engine");
+            }
+          } else {
+            // RSI recovered above threshold — reset cross state
+            this.rsiCrossState.delete(longKey);
+          }
+
+          // --- SHORT: RSI just crossed above threshold ---
+          if (rsiVal >= REVERSAL_SHORT_RSI) {
+            if (!this.rsiCrossState.has(shortKey)) {
+              this.rsiCrossState.set(shortKey, { price, timestamp: Date.now(), rsi: rsiVal });
+              const srData = this.latestSRLevels[asset.coin];
+              const hasSR = srData && srData.nearestResistance && srData.resistanceDistance < 0.3;
+              enhancedSignals.push({
+                asset, price, volume24h, change24h, fundingRate: funding, openInterest,
+                rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
+                enhanced: {
+                  signal: "short" as const, triggerType: "bb_rsi_reversion" as const,
+                  triggerTF: tfLabel, triggerRSI: rsiVal,
+                  bollingerConfirm: true, volumeExhaustion: false,
+                  adxValue: 0, adxRegime: "" as any,
+                  allRSIs: [{ tf: tfLabel, rsi: rsiVal }],
+                  confidenceScore: hasSR ? 6 : 5,
+                  srConfirm: !!hasSR, srBlock: false,
+                  srAnalysis: srData || { levels5m: [], levels15m: [], levels1h: [], nearestSupport: null, nearestResistance: null, supportDistance: 99, resistanceDistance: 99 },
+                },
+              });
+              log(`[RSI_CROSS] ${asset.coin} ${tfLabel} RSI=${rsiVal.toFixed(1)} ≥ ${REVERSAL_SHORT_RSI} → SHORT signal @ $${price} ${hasSR ? '(S/R confirmed)' : ''}`, "engine");
+            }
+          } else {
+            this.rsiCrossState.delete(shortKey);
+          }
         }
 
         await new Promise(r => setTimeout(r, 150));
