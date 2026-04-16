@@ -1602,6 +1602,9 @@ class TradingEngine {
   // v10.6.6: RSI cross tracking — record price at the moment RSI first hits extreme
   // Key = "coin_tf_direction", Value = { price, timestamp, rsi }
   private rsiCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
+  // v10.9.3: Robust position sync — track consecutive "no position" readings per tradeId
+  // Only sync-close after 3 consecutive misses to avoid intermittent HL API empty responses
+  private syncMissCount: Map<number, number> = new Map();
 
   private getTLSignature(tl: { type: string; startPrice: number; slope: number }): string {
     // Round to create a stable key — same TL detected across scans will match
@@ -2522,8 +2525,10 @@ class TradingEngine {
     }
     const currentEquity = equity || this.lastKnownEquity || 0;
 
-    // v10.5.2: POSITION SYNC — detect ghost trades (bot thinks open, HL says closed)
-    // Queries actual Hyperliquid positions and auto-closes any bot trades with no match
+    // v10.9.3: POSITION SYNC — detect ghost trades (bot thinks open, HL says closed)
+    // ROBUST: Requires 3 CONSECUTIVE "no position" readings before sync-closing.
+    // This prevents false closes from intermittent HL API empty responses.
+    // Also has a 5-minute grace period for newly opened/imported trades.
     if (config.apiSecret && config.walletAddress && openTrades.length > 0) {
       try {
         const syncExec = createExecutor(config.apiSecret, config.walletAddress);
@@ -2533,16 +2538,37 @@ class TradingEngine {
           const sz = Math.abs(parseFloat(p.position?.szi || "0"));
           if (sz > 0) hlCoinsWithPos.add(p.position.coin);
         }
+
+        // Track which tradeIds we still see as open for cleanup
+        const currentOpenIds = new Set(openTrades.map(t => t.id));
+
         for (const trade of openTrades) {
-          // v10.9.2: Grace period — don't sync-close trades opened less than 60s ago
-          // Prevents false sync-close when HL API returns stale data right after order fill
+          // v10.9.3: 5-minute grace period — don't sync-close trades opened less than 5 min ago
           const tradeAge = Date.now() - new Date(trade.openedAt || 0).getTime();
-          if (tradeAge < 60_000) {
-            log(`[SYNC] Skipping trade #${trade.id} ${trade.coin} — opened ${(tradeAge/1000).toFixed(0)}s ago (grace period)`, "engine");
+          if (tradeAge < 300_000) {
+            log(`[SYNC] Skipping trade #${trade.id} ${trade.coin} — opened ${(tradeAge/1000).toFixed(0)}s ago (5m grace)`, "engine");
+            this.syncMissCount.delete(trade.id); // reset miss count during grace
             continue;
           }
-          if (!hlCoinsWithPos.has(trade.coin)) {
-            // Bot thinks this trade is open, but no position exists on Hyperliquid
+
+          if (hlCoinsWithPos.has(trade.coin)) {
+            // Position confirmed on HL — reset miss count
+            if (this.syncMissCount.has(trade.id)) {
+              log(`[SYNC] Trade #${trade.id} ${trade.coin} — position confirmed on HL (was at ${this.syncMissCount.get(trade.id)} misses, reset)`, "engine");
+              this.syncMissCount.delete(trade.id);
+            }
+          } else {
+            // No position found — increment consecutive miss counter
+            const misses = (this.syncMissCount.get(trade.id) || 0) + 1;
+            this.syncMissCount.set(trade.id, misses);
+            log(`[SYNC] Trade #${trade.id} ${trade.coin} — no HL position (miss ${misses}/3)`, "engine");
+
+            if (misses < 3) {
+              continue; // Wait for more consecutive misses before acting
+            }
+
+            // 3 consecutive misses — position is genuinely closed on HL
+            this.syncMissCount.delete(trade.id);
             const closePrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
             const FEE_SYNC = 0.00045;
             const syncEq = (trade as any).entryEquity || currentEquity;
@@ -2562,10 +2588,10 @@ class TradingEngine {
             const syncAumPnl = syncEq > 0 ? (syncPnl / syncEq) * 100 : 0;
             await storage.updateTrade(trade.id, {
               exitPrice: closePrice, pnl: syncLevPnl, pnlPct: syncAumPnl,
-              status: "closed", closeReason: "Position closed on Hyperliquid (sync)",
+              status: "closed", closeReason: "Position closed on Hyperliquid (sync — 3 consecutive confirmations)",
               closedAt: new Date().toISOString(),
             });
-            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed — no HL position found | P&L: $${syncPnl.toFixed(2)}`, "engine");
+            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed — no HL position (3 consecutive confirms) | P&L: $${syncPnl.toFixed(2)}`, "engine");
             // v10.6: Blacklist TL if sync-closed at a loss
             if (trade.strategy === "breakout_retest" && syncPnl < -0.5) {
               const r = trade.reason || "";
@@ -2577,11 +2603,17 @@ class TradingEngine {
             }
             await storage.createLog({
               type: "trade_close",
-              message: `[SYNC] Auto-closed ${trade.coin} ${trade.side} #${trade.id} — no matching HL position | P&L: $${syncPnl.toFixed(2)}`,
+              message: `[SYNC] Auto-closed ${trade.coin} ${trade.side} #${trade.id} — no matching HL position (3x confirmed) | P&L: $${syncPnl.toFixed(2)}`,
               timestamp: new Date().toISOString(),
             });
           }
         }
+
+        // Cleanup syncMissCount for trades that are no longer open
+        for (const [tid] of this.syncMissCount) {
+          if (!currentOpenIds.has(tid)) this.syncMissCount.delete(tid);
+        }
+
         // Refresh open trades after sync
         openTrades = await storage.getOpenTrades();
       } catch (e) {
@@ -3173,8 +3205,38 @@ class TradingEngine {
     return { resetEquity: equity, resetTimestamp: this.pnlResetTimestamp };
   }
 
-  getLastKnownEquity(): number {
-    return this.lastKnownEquity;
+  /**
+   * v10.9.3: Place SL/TP orders on HL for a synced/imported trade.
+   * Called from the sync-from-hl endpoint after creating the DB entry.
+   */
+  async placeSLTPForSyncedTrade(tradeId: number): Promise<{ slOid: number | null }> {
+    const config = await storage.getConfig();
+    if (!config?.apiSecret || !config?.walletAddress) return { slOid: null };
+    const trade = await storage.getTradeById(tradeId);
+    if (!trade || trade.status !== "open" || !trade.stopLoss) return { slOid: null };
+
+    const asset = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
+    if (!asset) return { slOid: null };
+
+    const executor = createExecutor(config.apiSecret, config.walletAddress);
+
+    // Get actual position size from HL to place correctly sized SL
+    const positions = await executor.getPositions();
+    const hlPos = positions.find((p: any) => p.position?.coin === trade.coin);
+    const posSize = hlPos ? Math.abs(parseFloat(hlPos.position?.szi || "0")) : 0;
+    if (posSize <= 0) {
+      log(`[SYNC-SL] No HL position found for ${trade.coin} trade #${tradeId} — cannot place SL`, "engine");
+      return { slOid: null };
+    }
+
+    const slOid = await this.placeHLStopLoss(executor, trade.coin, trade.side as "long" | "short", trade.stopLoss, posSize, asset.szDecimals);
+    if (slOid) {
+      const existing = this.slOrderOids.get(tradeId) || [];
+      existing.push(slOid);
+      this.slOrderOids.set(tradeId, existing);
+      log(`[SYNC-SL] Placed SL for synced trade #${tradeId} ${trade.coin} ${trade.side} @ $${trade.stopLoss} oid=${slOid}`, "engine");
+    }
+    return { slOid };
   }
 
   async getStatus() {
@@ -3383,3 +3445,4 @@ class TradingEngine {
 }
 
 export const tradingEngine = new TradingEngine();
+export { ALLOWED_ASSETS };

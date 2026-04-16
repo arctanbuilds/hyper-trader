@@ -203,8 +203,18 @@ export async function registerRoutes(
         synced.push({ id: trade.id, coin, side, entryPrice, leverage });
         await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id}`, timestamp: new Date().toISOString() });
       }
+      // v10.9.3: Place SL/TP orders on HL for each synced trade
+      const slResults: any[] = [];
+      for (const s of synced) {
+        try {
+          const slResult = await tradingEngine.placeSLTPForSyncedTrade(s.id);
+          slResults.push({ id: s.id, coin: s.coin, ...slResult });
+        } catch (e: any) {
+          slResults.push({ id: s.id, coin: s.coin, slOid: null, error: e.message });
+        }
+      }
       broadcast({ type: "status", data: await tradingEngine.getStatus() });
-      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid` });
+      res.json({ success: true, synced, slResults, message: `Imported ${synced.length} position(s) from Hyperliquid (SL orders placed)` });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
