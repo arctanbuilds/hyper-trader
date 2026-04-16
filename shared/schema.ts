@@ -70,6 +70,9 @@ export const trades = pgTable("trades", {
   riskRewardRatio: doublePrecision("risk_reward_ratio"),
   // Equity at trade open (for accurate P&L calculation)
   entryEquity: doublePrecision("entry_equity"),
+  // Actual notional position value in USDC (filled size * fill price)
+  // This is the GROUND TRUTH for P&L — never reconstruct from equity*size%*leverage
+  notionalValue: doublePrecision("notional_value"),
   // P&L
   pnl: doublePrecision("pnl"),
   pnlPct: doublePrecision("pnl_pct"),

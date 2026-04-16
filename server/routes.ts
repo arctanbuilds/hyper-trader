@@ -98,13 +98,11 @@ export async function registerRoutes(
       ? await storage.getOpenTrades()
       : await storage.getAllTrades(200);
 
-    // Enrich each trade with dollar P&L and ROI as % of AUM
-    // v10.5.3: Uses entryEquity (stored at trade time) for accurate position sizing
-    // Falls back to current equity for old trades without entryEquity
+    // v11.1: Enrich trades with dollar P&L using notionalValue (ground truth)
+    // Falls back to old equity*size%*leverage formula for legacy trades
     const currentEquity = tradingEngine.getLastKnownEquity();
     const FEE_RATE = 0.00045; // Hyperliquid taker fee per side
     const enriched = trades.map((t: any) => {
-      // Use entryEquity if stored; otherwise extract from reason field ("80% AUM ($54)")
       let eqForTrade = t.entryEquity;
       if (!eqForTrade && t.reason) {
         const capMatch = t.reason.match(/AUM \(\$(\d+)\)/);
@@ -115,12 +113,12 @@ export async function registerRoutes(
         }
       }
       if (!eqForTrade) eqForTrade = currentEquity;
-      const tradeCapUsd = eqForTrade * ((t.size || 10) / 100);
-      const positionValue = tradeCapUsd * (t.leverage || 1);
+      // GROUND TRUTH: use notionalValue if available, else fallback
+      const positionValue = t.notionalValue || (eqForTrade * ((t.size || 10) / 100) * (t.leverage || 1));
+      const marginCap = (t.leverage || 1) > 0 ? positionValue / (t.leverage || 1) : positionValue;
       let pnlUsd: number;
-      const exitPx = t.exitPrice || t.entryPrice; // fallback for open trades without exitPrice
+      const exitPx = t.exitPrice || t.entryPrice;
       if (t.tp1Hit && t.takeProfit1 && t.exitPrice) {
-        // Split: 50% realized at TP1, 50% at exit
         const halfPos = positionValue / 2;
         const tp1Move = t.side === "long"
           ? (t.takeProfit1 - t.entryPrice) / t.entryPrice
@@ -131,14 +129,13 @@ export async function registerRoutes(
         pnlUsd = halfPos * tp1Move + halfPos * tp2Move
           - positionValue * FEE_RATE - halfPos * FEE_RATE - halfPos * FEE_RATE;
       } else if (t.exitPrice) {
-        // No TP1 hit — full position move
         const rawMove = t.side === "long"
           ? (exitPx - t.entryPrice) / t.entryPrice
           : (t.entryPrice - exitPx) / t.entryPrice;
         pnlUsd = positionValue * rawMove - positionValue * FEE_RATE * 2;
       } else {
         // Open trade — use stored pnl (already corrected by monitoring loop)
-        pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
+        pnlUsd = marginCap * ((t.pnl || 0) / 100);
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
@@ -169,7 +166,7 @@ export async function registerRoutes(
       const tradeId = parseInt(req.params.id);
       const trade = await storage.getTradeById(tradeId);
       if (!trade) return res.status(404).json({ error: "Trade not found" });
-      const allowed = ["stopLoss", "takeProfit1", "takeProfit2", "tp1Hit", "status", "closeReason", "exitPrice", "pnl", "pnlPct", "size", "leverage", "entryEquity", "peakPnlPct"];
+      const allowed = ["stopLoss", "takeProfit1", "takeProfit2", "tp1Hit", "status", "closeReason", "exitPrice", "pnl", "pnlPct", "size", "leverage", "entryEquity", "peakPnlPct", "notionalValue"];
       const updates: any = {};
       for (const key of allowed) {
         if (req.body[key] !== undefined) updates[key] = req.body[key];
@@ -205,11 +202,14 @@ export async function registerRoutes(
         const entryPrice = parseFloat(pos.entryPx || "0");
         const leverage = parseInt(pos.leverage?.value || "1");
         const equity = tradingEngine.getLastKnownEquity();
+        // GROUND TRUTH: actual notional = abs(szi) * entryPrice
+        const actualNotional = sz * entryPrice;
         // v11.0: NO SL, TP at +0.5% from entry
         const tp = side === "long" ? entryPrice * 1.005 : entryPrice * 0.995;
         const trade = await storage.createTrade({
           coin, side, entryPrice, size: 80, leverage,
           entryEquity: equity,
+          notionalValue: actualNotional,
           rsiAtEntry: 0, rsi4h: 0, rsi1d: 0,
           ema10: 0, ema21: 0, ema50: 0,
           stopLoss: 0,  // NO SL

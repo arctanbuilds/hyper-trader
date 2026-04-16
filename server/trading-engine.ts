@@ -534,6 +534,7 @@ class TradingEngine {
 
         // Execute market order (IOC)
         let fillPrice = price;
+        let filledSz = 0; // actual filled asset quantity from HL
         if (config.apiSecret && config.walletAddress) {
           try {
             const executor = createExecutor(config.apiSecret, config.walletAddress);
@@ -563,6 +564,7 @@ class TradingEngine {
 
             if (fillPx && parseFloat(totalSz) > 0) {
               fillPrice = parseFloat(fillPx);
+              filledSz = parseFloat(totalSz);
               log(`[PURE_RSI] FILLED: ${asset.coin} ${side} sz=${totalSz} @ $${fillPx}`, "engine");
             } else {
               log(`[PURE_RSI] IOC NOT FILLED: ${asset.coin} ${side}`, "engine");
@@ -578,10 +580,13 @@ class TradingEngine {
 
         // Recalculate TP based on actual fill price
         const actualTP = side === "long" ? fillPrice * 1.005 : fillPrice * 0.995;
+        // Actual notional = filled size * fill price (GROUND TRUTH for P&L)
+        const actualNotional = (filledSz > 0 ? filledSz : assetSize) * fillPrice;
 
         const trade = await storage.createTrade({
           coin: asset.coin, side, entryPrice: fillPrice, size: 80, leverage,
           entryEquity: equity,
+          notionalValue: actualNotional,
           rsiAtEntry: triggerRSI, rsi4h: 0, rsi1d: 0,
           ema10: 0, ema21: 0, ema50: 0,
           stopLoss: 0, // NO SL
@@ -704,8 +709,9 @@ class TradingEngine {
             const closePrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
             const FEE_SYNC = 0.00045;
             const syncEq = (trade as any).entryEquity || currentEquity;
-            const tcap = syncEq * (trade.size / 100);
-            const pv = tcap * trade.leverage;
+            // v11.1: Use notionalValue (ground truth) for P&L
+            const pv = (trade as any).notionalValue || (syncEq * (trade.size / 100) * trade.leverage);
+            const syncMarginCap = trade.leverage > 0 ? pv / trade.leverage : pv;
             let syncPnl: number;
             if (trade.tp1Hit && trade.takeProfit1) {
               const hp = pv / 2;
@@ -716,7 +722,7 @@ class TradingEngine {
               const rm = trade.side === "long" ? (closePrice - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - closePrice) / trade.entryPrice;
               syncPnl = pv * rm - pv * FEE_SYNC * 2;
             }
-            const syncLevPnl = tcap > 0 ? (syncPnl / tcap) * 100 : 0;
+            const syncLevPnl = syncMarginCap > 0 ? (syncPnl / syncMarginCap) * 100 : 0;
             const syncAumPnl = syncEq > 0 ? (syncPnl / syncEq) * 100 : 0;
             await storage.updateTrade(trade.id, {
               exitPrice: closePrice, pnl: syncLevPnl, pnlPct: syncAumPnl,
@@ -751,16 +757,16 @@ class TradingEngine {
       const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
       const szd = ac?.szDecimals ?? 2;
 
-      // v11.0: Simple P&L calculation — full position, no partial closes
+      // v11.1: P&L uses notionalValue (actual filled position) — fallback to old formula for legacy trades
       const FEE_RATE = 0.00045;
       const eqForTrade = (trade as any).entryEquity || currentEquity;
-      const tradeCapUsd = eqForTrade * (trade.size / 100);
-      const positionValue = tradeCapUsd * trade.leverage;
+      const positionValue = (trade as any).notionalValue || (eqForTrade * (trade.size / 100) * trade.leverage);
       const rawMove = trade.side === "long"
         ? (currentPrice - trade.entryPrice) / trade.entryPrice
         : (trade.entryPrice - currentPrice) / trade.entryPrice;
       const pnlUsd = positionValue * rawMove - positionValue * FEE_RATE * 2;
-      const leveragedPnl = tradeCapUsd > 0 ? (pnlUsd / tradeCapUsd) * 100 : 0;
+      const marginCapital = trade.leverage > 0 ? positionValue / trade.leverage : positionValue;
+      const leveragedPnl = marginCapital > 0 ? (pnlUsd / marginCapital) * 100 : 0;
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
       const currentPeak = Math.max(trade.peakPnlPct || 0, leveragedPnl);
 
@@ -821,8 +827,9 @@ class TradingEngine {
     const closedTrades = allTrades.filter(t => t.status === "closed");
     const currentEquity = equity || this.lastKnownEquity || 0;
 
-    const closedPnlOfAum = closedTrades.reduce((s, t) => s + ((t.pnl || 0) * ((t.size || 10) / 100)), 0);
-    const openPnlOfAum = openTrades.reduce((s, t) => s + ((t.pnl || 0) * ((t.size || 10) / 100)), 0);
+    // v11.1: Use pnlPct directly (already correctly computed as % of AUM)
+    const closedPnlOfAum = closedTrades.reduce((s, t) => s + (t.pnlPct || 0), 0);
+    const openPnlOfAum = openTrades.reduce((s, t) => s + (t.pnlPct || 0), 0);
     const totalPnl = closedPnlOfAum + openPnlOfAum;
 
     await storage.createPnlSnapshot({
@@ -861,12 +868,12 @@ class TradingEngine {
         }
       } catch (e) { log(`Close error: ${e}`, "engine"); }
     }
-    // v10.5 FIX: Accurate P&L for manual close (accounts for TP1 partial + fees)
+    // v11.1: P&L uses notionalValue (ground truth) — fallback for legacy trades
     const FEE_RATE_MC = 0.00045;
     const eq = this.lastKnownEquity || 0;
     const eqForClose = (trade as any).entryEquity || eq;
-    const tradeCapUsd = eqForClose * (trade.size / 100);
-    const posValue = tradeCapUsd * trade.leverage;
+    const posValue = (trade as any).notionalValue || (eqForClose * (trade.size / 100) * trade.leverage);
+    const marginCap = trade.leverage > 0 ? posValue / trade.leverage : posValue;
     let pnlUsd: number;
     if (trade.tp1Hit && trade.takeProfit1) {
       const halfPos = posValue / 2;
@@ -884,7 +891,7 @@ class TradingEngine {
         : (trade.entryPrice - currentPrice) / trade.entryPrice;
       pnlUsd = posValue * rawMove - posValue * FEE_RATE_MC * 2;
     }
-    const leveragedPnl = tradeCapUsd > 0 ? (pnlUsd / tradeCapUsd) * 100 : 0;
+    const leveragedPnl = marginCap > 0 ? (pnlUsd / marginCap) * 100 : 0;
     const pnlOfAum = eqForClose > 0 ? (pnlUsd / eqForClose) * 100 : 0;
 
     const updated = await storage.updateTrade(trade.id, {
@@ -942,18 +949,10 @@ class TradingEngine {
     const currentEquity = this.lastKnownEquity || 0;
     const startEq = this.pnlResetEquity || this.startingEquity || currentEquity;
 
-    const closedPnlOfAum = activeClosedTrades.reduce((s, t) => {
-      const leveragedPnl = t.pnl || 0;
-      const posWeight = (t.size || 10) / 100;
-      return s + (leveragedPnl * posWeight);
-    }, 0);
-
-    const openPnlOfAum = openTrades.reduce((s, t) => {
-      const leveragedPnl = t.pnl || 0;
-      const posWeight = (t.size || 10) / 100;
-      return s + (leveragedPnl * posWeight);
-    }, 0);
-
+    // v11.1: Use pnlPct (% of AUM) directly — this is already correctly computed
+    // from notionalValue in the monitoring loop and at close time
+    const closedPnlOfAum = activeClosedTrades.reduce((s, t) => s + (t.pnlPct || 0), 0);
+    const openPnlOfAum = openTrades.reduce((s, t) => s + (t.pnlPct || 0), 0);
     const combinedPnlOfAum = closedPnlOfAum + openPnlOfAum;
 
     // Dollar P&L: % of AUM → actual USDC
@@ -964,12 +963,13 @@ class TradingEngine {
     const drawdownPct = this.dayStartEquity > 0 ? ((this.dayStartEquity - currentEquity) / this.dayStartEquity) * 100 : 0;
     const drawdownUsd = this.dayStartEquity - currentEquity;
 
-    // Per-trade dollar P&L for open positions (uses already-corrected pnl from monitoring loop)
-    // pnl field now accounts for TP1 partial close split + fees (v10.5 fix)
+    // v11.1: Per-trade dollar P&L for open positions using notionalValue
     const openTradesWithUsd = openTrades.map(t => {
-      const tradeCapUsd = currentEquity * ((t.size || 10) / 100);
-      const pnlUsd = tradeCapUsd * ((t.pnl || 0) / 100);
-      const pnlOfAum = currentEquity > 0 ? (pnlUsd / currentEquity) * 100 : 0;
+      const eqForT = (t as any).entryEquity || currentEquity;
+      const posVal = (t as any).notionalValue || (eqForT * ((t.size || 10) / 100) * (t.leverage || 1));
+      const mc = (t.leverage || 1) > 0 ? posVal / (t.leverage || 1) : posVal;
+      const pnlUsd = mc * ((t.pnl || 0) / 100);
+      const pnlOfAum = eqForT > 0 ? (pnlUsd / eqForT) * 100 : 0;
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
 
@@ -984,9 +984,9 @@ class TradingEngine {
     const bbReversionWinRate = bbReversionTrades.length > 0 ? (bbReversionTrades.filter(t => (t.pnl || 0) > 0).length / bbReversionTrades.length) * 100 : 0;
     const breakoutRetestWinRate = breakoutRetestTrades.length > 0 ? (breakoutRetestTrades.filter(t => (t.pnl || 0) > 0).length / breakoutRetestTrades.length) * 100 : 0;
 
-    // Per-strategy P&L: use pnl (leveraged %) * posWeight to get AUM %, then convert to USD
+    // v11.1: Per-strategy P&L: use pnlPct directly (already % of AUM)
     const strategyPnlCalc = (trades: typeof closedTrades) => {
-      const pnlOfAumPct = trades.reduce((s, t) => s + ((t.pnl || 0) * ((t.size || 10) / 100)), 0);
+      const pnlOfAumPct = trades.reduce((s, t) => s + (t.pnlPct || 0), 0);
       const pnlUsd = startEq > 0 ? startEq * (pnlOfAumPct / 100) : 0;
       return { pnlOfAumPct, pnlUsd };
     };
