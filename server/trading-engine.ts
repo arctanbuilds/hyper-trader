@@ -10,7 +10,7 @@
  *   - SHORT when RSI ≥ 85 + price at 2.5+ SD upper BB + near historical RESISTANCE (required)
  *   - S/R confirmation is MANDATORY (not just a confidence boost)
  *   - 80% margin, max leverage
- *   - SL: WIDE — recent swing extreme from 15m candles (capped at 2%, min 0.3%)
+ *   - SL: FIXED 0.5% from entry — moves to BE after TP1, then trails with price
  *   - TP1: 0.3% → BE, TP2: dynamic
  *
  * STRATEGY 2 — TRENDLINE RETEST:
@@ -1881,6 +1881,10 @@ class TradingEngine {
               // Check S/R (soft — boosts confidence but not required)
               const srData = this.latestSRLevels[asset.coin];
               const hasSR = srData && srData.nearestSupport && srData.supportDistance < 0.3;
+              // v10.7: Fixed SL 0.5%, TP1 0.3%, TP2 1%
+              const longSL = price * (1 - 0.005);
+              const longTP1 = price * (1 + 0.003);
+              const longTP2 = price * (1 + 0.01);
               enhancedSignals.push({
                 asset, price, volume24h, change24h, fundingRate: funding, openInterest,
                 rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
@@ -1893,6 +1897,7 @@ class TradingEngine {
                   confidenceScore: hasSR ? 6 : 5,
                   srConfirm: !!hasSR, srBlock: false,
                   srAnalysis: srData || { levels5m: [], levels15m: [], levels1h: [], nearestSupport: null, nearestResistance: null, supportDistance: 99, resistanceDistance: 99 },
+                  suggestedSL: longSL, suggestedTP1: longTP1, suggestedTP2: longTP2,
                 },
               });
               log(`[RSI_CROSS] ${asset.coin} ${tfLabel} RSI=${rsiVal.toFixed(1)} ≤ ${REVERSAL_LONG_RSI} → LONG signal @ $${price} ${hasSR ? '(S/R confirmed)' : ''}`, "engine");
@@ -1908,6 +1913,10 @@ class TradingEngine {
               this.rsiCrossState.set(shortKey, { price, timestamp: Date.now(), rsi: rsiVal });
               const srData = this.latestSRLevels[asset.coin];
               const hasSR = srData && srData.nearestResistance && srData.resistanceDistance < 0.3;
+              // v10.7: Fixed SL 0.5%, TP1 0.3%, TP2 1%
+              const shortSL = price * (1 + 0.005);
+              const shortTP1 = price * (1 - 0.003);
+              const shortTP2 = price * (1 - 0.01);
               enhancedSignals.push({
                 asset, price, volume24h, change24h, fundingRate: funding, openInterest,
                 rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
@@ -1920,6 +1929,7 @@ class TradingEngine {
                   confidenceScore: hasSR ? 6 : 5,
                   srConfirm: !!hasSR, srBlock: false,
                   srAnalysis: srData || { levels5m: [], levels15m: [], levels1h: [], nearestSupport: null, nearestResistance: null, supportDistance: 99, resistanceDistance: 99 },
+                  suggestedSL: shortSL, suggestedTP1: shortTP1, suggestedTP2: shortTP2,
                 },
               });
               log(`[RSI_CROSS] ${asset.coin} ${tfLabel} RSI=${rsiVal.toFixed(1)} ≥ ${REVERSAL_SHORT_RSI} → SHORT signal @ $${price} ${hasSR ? '(S/R confirmed)' : ''}`, "engine");
@@ -1935,10 +1945,9 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan: ${enhancedSignals.length} RSI/BB + ${breakoutRetestSignals.length} breakout/retest signals | ${sessionInfo.session} | AUM: $${equity.toLocaleString()}`,
+        message: `Scan: ${enhancedSignals.length} RSI reversal signals | ${sessionInfo.session} | AUM: $${equity.toLocaleString()}`,
         data: JSON.stringify([
           ...enhancedSignals.slice(0, 5).map(s => `[${s.enhanced.triggerType}] ${s.asset.coin} RSI:${s.enhanced.triggerRSI.toFixed(1)} ${s.enhanced.signal} @${s.enhanced.triggerTF} conf:${s.enhanced.confidenceScore}`),
-          ...breakoutRetestSignals.slice(0, 5).map(s => `[BREAKOUT_RETEST] ${s.asset.coin} ${s.result.signal} TL:${s.result.trendlineType} @${s.result.triggerTF} conf:${s.result.confidenceScore} rej:${s.result.rejectionConfirm}`),
         ]),
         timestamp: new Date().toISOString(),
       });
@@ -1956,13 +1965,9 @@ class TradingEngine {
           const strategyKey = sig.enhanced.triggerType === "bb_rsi_reversion" ? "bb_rsi_reversion" : "extreme_rsi";
           if (openByCoinStrategy.has(`${sig.asset.coin}_${strategyKey}`)) continue;
 
-          // HIGH-QUALITY FILTER: require confidence >= 5/6 for all RSI/BB entries
-          // Data shows conf 4 trades underperform; conf 5+ have much better outcomes
-          if (sig.enhanced.confidenceScore < 5) continue;
-          // v10.5: S/R confirmation REQUIRED for reversals — must be near historical S/R level
-          // LONG must be at support, SHORT must be at resistance. No S/R = no trade.
-          if (!sig.enhanced.srConfirm) continue;
-          // Block trades into strong S/R levels
+          // v10.7: Removed confidence >= 5 filter and S/R hard requirement
+          // RSI cross signals (conf 5+) enter instantly. S/R is soft (boosts confidence only).
+          // Still block trades into strong S/R levels (safety)
           if (sig.enhanced.srBlock) continue;
 
           const side = sig.enhanced.signal as "long" | "short";
@@ -1988,43 +1993,13 @@ class TradingEngine {
             continue;
           }
 
-          // v10.5: WIDE SL for reversals — use swing extreme from 15m candles (matches trendline strategy)
-          // Instead of fixed 0.5%, find the recent swing high/low and place SL beyond it
-          const revSlScanBars = Math.min(20, ohlcv15m.length);
-          const revLastIdx = ohlcv15m.length - 1;
-          let revWideSL: number;
-          if (side === "long") {
-            // SL below: lowest low in recent 15m candles
-            let lowestLow = sig.price;
-            for (let i = revLastIdx; i >= Math.max(0, revLastIdx - revSlScanBars); i--) {
-              if (ohlcv15m[i].low < lowestLow) lowestLow = ohlcv15m[i].low;
-            }
-            revWideSL = lowestLow * 0.999; // tiny buffer below swing low
-          } else {
-            // SL above: highest high in recent 15m candles
-            let highestHigh = sig.price;
-            for (let i = revLastIdx; i >= Math.max(0, revLastIdx - revSlScanBars); i--) {
-              if (ohlcv15m[i].high > highestHigh) highestHigh = ohlcv15m[i].high;
-            }
-            revWideSL = highestHigh * 1.001; // tiny buffer above swing high
-          }
-          // Safety cap: max 2% away
-          const revMaxSlDist = sig.price * 0.02;
-          if (Math.abs(revWideSL - sig.price) > revMaxSlDist) {
-            revWideSL = side === "long" ? sig.price - revMaxSlDist : sig.price + revMaxSlDist;
-          }
-          // Minimum SL distance: at least 0.3% to avoid noise stops
-          const revMinSlDist = sig.price * 0.003;
-          if (Math.abs(revWideSL - sig.price) < revMinSlDist) {
-            revWideSL = side === "long" ? sig.price - revMinSlDist : sig.price + revMinSlDist;
-          }
-          // Override the fixed SL with the wide SL
-          sig.enhanced.suggestedSL = revWideSL;
-          const revSlPct = (Math.abs(revWideSL - sig.price) / sig.price * 100).toFixed(3);
+          // v10.7: Fixed 0.5% SL — no more wide swing SL. TP/SL come from signal.
+          const fixedSL = sig.enhanced.suggestedSL;
+          const revSlPct = (Math.abs(fixedSL - sig.price) / sig.price * 100).toFixed(3);
 
           reasoning.push(`Price: $${displayPrice(sig.price, sig.asset.szDecimals)}`);
           reasoning.push(`TP1: $${displayPrice(sig.enhanced.suggestedTP1, sig.asset.szDecimals)} | TP2: $${displayPrice(sig.enhanced.suggestedTP2, sig.asset.szDecimals)}`);
-          reasoning.push(`SL: $${displayPrice(revWideSL, sig.asset.szDecimals)} (WIDE: ${revSlPct}% swing extreme) → moves to BE after TP1`);
+          reasoning.push(`SL: $${displayPrice(fixedSL, sig.asset.szDecimals)} (FIXED: ${revSlPct}%) → moves to BE after TP1, then trails`);
           reasoning.push(`Session: ${sessionInfo.session} | Funding: ${(sig.fundingRate * 100).toFixed(4)}%`);
 
           // Learning insights — log only, never block trades
@@ -2144,9 +2119,11 @@ class TradingEngine {
       }
 
       // =============================================
-      // EXECUTE BREAKOUT/RETEST ENTRIES (fully separate)
-      // ONE position at a time — 80% margin, max leverage, wait for the right trade
+      // v10.7: BREAKOUT/RETEST STRATEGY DISABLED
+      // TL detection was unreliable — bot took trades on fake trendlines.
+      // Reversal-only mode. Entire block commented out.
       // =============================================
+      /* DISABLED v10.7
       const brOpenCount = openTrades.filter(t => t.strategy === "breakout_retest").length;
       if (canOpenNew && brOpenCount === 0 && breakoutRetestSignals.length > 0) {
         // Sort by confidence descending, pick only the best one
@@ -2295,6 +2272,7 @@ class TradingEngine {
           break; // Only one breakout_retest position at a time
         }
       }
+      */ // END DISABLED v10.7
 
       // =============================================
       // CHECK EXITS — all strategies, isolated logic
@@ -2514,6 +2492,62 @@ class TradingEngine {
           }
         }
 
+        // v10.7: TRAILING SL after TP1 — trail at 0.3% behind peak price
+        // Before TP1: SL stays at original fixed 0.5%
+        // After TP1: SL moves up (long) or down (short) as price improves, trailing by 0.3%
+        if (trade.tp1Hit && !shouldClose) {
+          const TRAIL_DISTANCE = 0.003; // 0.3% trailing distance
+          let trailSL: number;
+          if (trade.side === "long") {
+            // Trail below peak: entry * (1 + peakPnl/leverage) is approx peak price
+            // Simpler: use currentPrice as a moving reference, only tighten SL
+            trailSL = currentPrice * (1 - TRAIL_DISTANCE);
+            // Only move SL UP (tighter), never down
+            if (trailSL > (trade.stopLoss || 0)) {
+              await storage.updateTrade(trade.id, { stopLoss: trailSL });
+              // Update HL SL order
+              if (config.apiSecret && config.walletAddress) {
+                try {
+                  const slExec = createExecutor(config.apiSecret, config.walletAddress);
+                  await this.cancelSLOrders(slExec, trade.id, trade.coin);
+                  const posList = await slExec.getPositions();
+                  const curPos = posList.find((p: any) => p.position?.coin === trade.coin);
+                  if (curPos) {
+                    const remainSz = Math.abs(parseFloat(curPos.position.szi || "0"));
+                    if (remainSz > 0) {
+                      const newOid = await this.placeHLStopLoss(slExec, trade.coin, "long", trailSL, remainSz, szd);
+                      if (newOid) this.slOrderOids.set(trade.id, [newOid]);
+                    }
+                  }
+                } catch (e) { log(`[TRAIL_SL] Error updating trailing SL: ${e}`, "engine"); }
+              }
+              log(`[TRAIL_SL] ${trade.coin} LONG trailing SL moved up: $${displayPrice(trailSL, szd)} (${(TRAIL_DISTANCE * 100).toFixed(1)}% behind price $${displayPrice(currentPrice, szd)})`, "engine");
+            }
+          } else {
+            trailSL = currentPrice * (1 + TRAIL_DISTANCE);
+            // Only move SL DOWN (tighter), never up
+            if (trailSL < (trade.stopLoss || Infinity)) {
+              await storage.updateTrade(trade.id, { stopLoss: trailSL });
+              if (config.apiSecret && config.walletAddress) {
+                try {
+                  const slExec = createExecutor(config.apiSecret, config.walletAddress);
+                  await this.cancelSLOrders(slExec, trade.id, trade.coin);
+                  const posList = await slExec.getPositions();
+                  const curPos = posList.find((p: any) => p.position?.coin === trade.coin);
+                  if (curPos) {
+                    const remainSz = Math.abs(parseFloat(curPos.position.szi || "0"));
+                    if (remainSz > 0) {
+                      const newOid = await this.placeHLStopLoss(slExec, trade.coin, "short", trailSL, remainSz, szd);
+                      if (newOid) this.slOrderOids.set(trade.id, [newOid]);
+                    }
+                  }
+                } catch (e) { log(`[TRAIL_SL] Error updating trailing SL: ${e}`, "engine"); }
+              }
+              log(`[TRAIL_SL] ${trade.coin} SHORT trailing SL moved down: $${displayPrice(trailSL, szd)} (${(TRAIL_DISTANCE * 100).toFixed(1)}% behind price $${displayPrice(currentPrice, szd)})`, "engine");
+            }
+          }
+        }
+
         // TP2 check — close remaining position
         if (!shouldClose) {
           const tp2Hit = (trade.side === "long" && currentPrice >= (trade.takeProfit2 || Infinity)) ||
@@ -2521,11 +2555,11 @@ class TradingEngine {
           if (tp2Hit) { shouldClose = true; closeReason = `[${stratLabel}] TP2 @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`; exitType = "tp2"; }
         }
 
-        // SL check (breakeven after TP1, or original SL before TP1)
+        // SL check (trailing after TP1, or original SL before TP1)
         if (!shouldClose) {
           const activeSL = trade.stopLoss;
-          if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `[${stratLabel}] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
-          if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `[${stratLabel}] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (breakeven)" : ""}`; exitType = trade.tp1Hit ? "sl_breakeven" : "sl"; }
+          if (trade.side === "long" && currentPrice <= (activeSL || 0)) { shouldClose = true; closeReason = `[${stratLabel}] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (trailing)" : ""}`; exitType = trade.tp1Hit ? "sl_trailing" : "sl"; }
+          if (trade.side === "short" && currentPrice >= (activeSL || Infinity)) { shouldClose = true; closeReason = `[${stratLabel}] SL @ $${displayPrice(currentPrice, szd)}${trade.tp1Hit ? " (trailing)" : ""}`; exitType = trade.tp1Hit ? "sl_trailing" : "sl"; }
         }
 
       } else if (strategy === "breakout_retest") {
