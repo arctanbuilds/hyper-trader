@@ -545,13 +545,13 @@ function trendlineAt(tl: Trendline, idx: number): number {
  *
  * A real trendline (from user's chart examples):
  *   1. Must span at least 20 candles on the 5m timeframe
- *   2. Must have at least 3 clear rejections (price touches TL and bounces back)
+ *   2. Must have at least 2 clear rejections (price touches TL and bounces back)
  *   3. The TL must have HELD as support/resistance — no candle body closed beyond it
- *   4. Only on the 4th+ touch or later does it break through
+ *   4. Only on the 3rd+ touch or later does it break through
  *   5. Then we wait for the retest
  *
- * Descending TL: 3+ swing HIGHS forming lower highs, well spaced apart
- * Ascending TL: 3+ swing LOWS forming higher lows, well spaced apart
+ * Descending TL: 2+ swing HIGHS forming lower highs, well spaced apart
+ * Ascending TL: 2+ swing LOWS forming higher lows, well spaced apart
  */
 function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Trendline[] {
   if (candles.length < pivotWindow * 2 + 20) return [];
@@ -613,8 +613,8 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
         if (Math.abs(cleanHighs[c].price - expected) / expected <= tolerancePct) touches++;
       }
 
-      // v10.6: MINIMUM 3 touches (rejections) required — real TLs get tested multiple times
-      if (touches < 3) continue;
+      // v10.6.3: MINIMUM 2 touches (rejections) required — TL can break on 3rd touch
+      if (touches < 2) continue;
 
       // VALIDITY CHECK: no candle body should have CLOSED above the TL between p1 and p2
       // (the TL must have held as resistance until the actual breakout)
@@ -652,8 +652,8 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
         if (Math.abs(cleanLows[c].price - expected) / expected <= tolerancePct) touches++;
       }
 
-      // v10.6: MINIMUM 3 touches (rejections) required
-      if (touches < 3) continue;
+      // v10.6.3: MINIMUM 2 touches (rejections) required — TL can break on 3rd touch
+      if (touches < 2) continue;
 
       // VALIDITY CHECK: no candle body should have CLOSED below the TL between p1 and p2
       let tlHeld = true;
@@ -1280,8 +1280,8 @@ function detectEnhancedRSI(params: {
   // RSI REVERSAL: LONG when RSI ≤ 20 (extreme oversold), SHORT when RSI ≥ 85 (extreme overbought)
   // These are very rare, high-conviction signals — price at BB + extreme RSI = strong mean reversion
   // SL: 0.5%, TP1: 0.3% (move SL→BE), TP2: dynamic (bot determines)
-  const REVERSAL_LONG_RSI = 20;   // RSI must be ≤ this to go LONG
-  const REVERSAL_SHORT_RSI = 85;  // RSI must be ≥ this to go SHORT
+  const REVERSAL_LONG_RSI = 25;   // RSI must be ≤ this to go LONG (v10.6.3: relaxed from 20)
+  const REVERSAL_SHORT_RSI = 80;  // RSI must be ≥ this to go SHORT (v10.6.3: relaxed from 85)
 
   const bb5mStdDist = bb5m.stdDev > 0 ? Math.abs(price - bb5m.middle) / bb5m.stdDev : 0;
   const bb15mStdDist = bb15m.stdDev > 0 ? Math.abs(price - bb15m.middle) / bb15m.stdDev : 0;
@@ -1769,12 +1769,13 @@ class TradingEngine {
 
         if (c1m.length < 15 && c5m.length < 15 && c15m.length < 15 && c1h.length < 15) continue;
 
-        const rsi1m = c1m.length >= 15 ? calculateRSI(c1m) : 50;
-        const rsi5m = c5m.length >= 15 ? calculateRSI(c5m) : 50;
-        const rsi15m = c15m.length >= 15 ? calculateRSI(c15m) : 50;
-        const rsi1h = c1h.length >= 15 ? calculateRSI(c1h) : 50;
-        const rsi4h = c4h.length >= 15 ? calculateRSI(c4h) : 50;
-        const rsi1d = c1d.length >= 15 ? calculateRSI(c1d) : 50;
+        // v10.6.3: Intra-candle RSI — append current live price to closes so RSI reflects real-time movement
+        const rsi1m = c1m.length >= 15 ? calculateRSI([...c1m, price]) : 50;
+        const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
+        const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
+        const rsi1h = c1h.length >= 15 ? calculateRSI([...c1h, price]) : 50;
+        const rsi4h = c4h.length >= 15 ? calculateRSI([...c4h, price]) : 50;
+        const rsi1d = c1d.length >= 15 ? calculateRSI([...c1d, price]) : 50;
         const emaSource = c15m.length >= 50 ? c15m : c1h;
         const ema10 = getLastEMA(emaSource, 10);
         const ema21 = getLastEMA(emaSource, 21);
