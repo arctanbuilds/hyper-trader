@@ -12,8 +12,6 @@ import { cn } from "@/lib/utils";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
-// import { TrendlineChart } from "@/components/TrendlineChart";
-
 // Display-friendly asset names
 const ASSET_DISPLAY: Record<string, string> = {
   "BTC": "Bitcoin",
@@ -23,7 +21,6 @@ const ASSET_DISPLAY: Record<string, string> = {
   "xyz:GOLD": "Gold",
   "xyz:SILVER": "Silver",
   "xyz:CL": "WTI Oil",
-  "xyz:BRENTOIL": "Brent Oil",
   "xyz:SP500": "S&P 500",
   "xyz:EUR": "EUR/USD",
 };

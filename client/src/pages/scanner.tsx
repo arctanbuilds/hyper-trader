@@ -21,7 +21,6 @@ const ASSET_DISPLAY: Record<string, string> = {
   "xyz:GOLD": "Gold",
   "xyz:SILVER": "Silver",
   "xyz:CL": "Oil WTI",
-  "xyz:BRENTOIL": "Oil Brent",
   "xyz:SP500": "S&P 500",
   "xyz:EUR": "EUR/USD",
 };
@@ -30,13 +29,13 @@ function getAssetLabel(coin: string): string {
   return ASSET_DISPLAY[coin] || coin;
 }
 
-// Color based on proximity to trade thresholds (25 long / 85 short)
+// Color based on proximity to trade thresholds (≤20 long / ≥85 short)
 function getRSIColor(rsi: number): string {
-  if (rsi <= 25) return "text-emerald-400 font-bold";
-  if (rsi <= 30) return "text-emerald-500/80";
+  if (rsi <= 20) return "text-emerald-400 font-bold";
+  if (rsi <= 25) return "text-emerald-500/80";
   if (rsi >= 85) return "text-red-400 font-bold";
   if (rsi >= 80) return "text-red-500/80";
-  if (rsi <= 35) return "text-emerald-500/50";
+  if (rsi <= 30) return "text-emerald-500/50";
   if (rsi >= 75) return "text-red-500/50";
   return "text-muted-foreground";
 }

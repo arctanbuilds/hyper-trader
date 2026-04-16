@@ -163,8 +163,28 @@ export async function registerRoutes(
     }
   });
 
+  // ============ PATCH TRADE (fix SL/TP values) ============
+  app.patch("/api/trades/:id", async (req, res) => {
+    try {
+      const tradeId = parseInt(req.params.id);
+      const trade = await storage.getTradeById(tradeId);
+      if (!trade) return res.status(404).json({ error: "Trade not found" });
+      const allowed = ["stopLoss", "takeProfit1", "takeProfit2", "tp1Hit", "status", "closeReason"];
+      const updates: any = {};
+      for (const key of allowed) {
+        if (req.body[key] !== undefined) updates[key] = req.body[key];
+      }
+      const updated = await storage.updateTrade(tradeId, updates);
+      await storage.createLog({ type: "system", message: `Trade #${tradeId} patched: ${JSON.stringify(updates)}`, timestamp: new Date().toISOString() });
+      broadcast({ type: "status", data: await tradingEngine.getStatus() });
+      res.json(updated);
+    } catch (e: any) {
+      res.status(400).json({ error: e.message });
+    }
+  });
+
   // ============ SYNC POSITIONS FROM HL ============
-  // Creates DB entries for HL positions that the bot doesn't know about
+  // v11.0: Creates DB entries for HL positions — NO SL, TP +0.5% from entry
   app.post("/api/trades/sync-from-hl", async (_req, res) => {
     try {
       const config = await storage.getConfig();
@@ -185,36 +205,29 @@ export async function registerRoutes(
         const entryPrice = parseFloat(pos.entryPx || "0");
         const leverage = parseInt(pos.leverage?.value || "1");
         const equity = tradingEngine.getLastKnownEquity();
+        // v11.0: NO SL, TP at +0.5% from entry
+        const tp = side === "long" ? entryPrice * 1.005 : entryPrice * 0.995;
         const trade = await storage.createTrade({
           coin, side, entryPrice, size: 80, leverage,
           entryEquity: equity,
           rsiAtEntry: 0, rsi4h: 0, rsi1d: 0,
           ema10: 0, ema21: 0, ema50: 0,
-          stopLoss: side === "long" ? entryPrice * 0.995 : entryPrice * 1.005,
-          takeProfit1: side === "long" ? entryPrice * 1.003 : entryPrice * 0.997,
-          takeProfit2: side === "long" ? entryPrice * 1.01 : entryPrice * 0.99,
+          stopLoss: 0,  // NO SL
+          takeProfit1: tp,
+          takeProfit2: tp,
           tp1Hit: false,
           confluenceScore: 0, confluenceDetails: "Synced from HL position",
           riskRewardRatio: 0, status: "open",
-          reason: `[SYNC] Imported from HL: ${coin} ${side} ${leverage}x @ $${entryPrice}`,
+          reason: `[SYNC] Imported from HL: ${coin} ${side} ${leverage}x @ $${entryPrice} | NO SL | TP +0.5%`,
           setupType: "bb_rsi_reversion", strategy: "bb_rsi_reversion",
           openedAt: new Date().toISOString(),
         });
-        synced.push({ id: trade.id, coin, side, entryPrice, leverage });
-        await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id}`, timestamp: new Date().toISOString() });
+        synced.push({ id: trade.id, coin, side, entryPrice, leverage, tp });
+        await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id} | NO SL | TP $${tp.toFixed(2)}`, timestamp: new Date().toISOString() });
       }
-      // v10.9.3: Place SL/TP orders on HL for each synced trade
-      const slResults: any[] = [];
-      for (const s of synced) {
-        try {
-          const slResult = await tradingEngine.placeSLTPForSyncedTrade(s.id);
-          slResults.push({ id: s.id, coin: s.coin, ...slResult });
-        } catch (e: any) {
-          slResults.push({ id: s.id, coin: s.coin, slOid: null, error: e.message });
-        }
-      }
+      // v11.0: No SL orders placed on HL — strategy uses no stop loss
       broadcast({ type: "status", data: await tradingEngine.getStatus() });
-      res.json({ success: true, synced, slResults, message: `Imported ${synced.length} position(s) from Hyperliquid (SL orders placed)` });
+      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v11.0: NO SL, TP +0.5%)` });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -391,17 +404,6 @@ export async function registerRoutes(
         }
       }
       res.json(overview);
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  // ============ TRENDLINE VISUALIZATION ============
-  app.get("/api/trendlines", async (req, res) => {
-    try {
-      const coin = (req.query.coin as string) || "BTC";
-      const data = await tradingEngine.getTrendlineData(coin);
-      res.json(data);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
