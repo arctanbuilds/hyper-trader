@@ -301,29 +301,39 @@ export async function registerRoutes(
   // ============ MARKET OVERVIEW ============
   app.get("/api/market/overview", async (_req, res) => {
     try {
-      const response = await fetch("https://api.hyperliquid.xyz/info", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type: "metaAndAssetCtxs" }),
-      });
-      const data: any = await response.json();
-      if (data && data.length === 2) {
-        const universe = data[0]?.universe || [];
-        const ctxs = data[1] || [];
-        const overview = universe.map((asset: any, i: number) => ({
-          name: asset.name,
-          price: ctxs[i]?.midPx || "0",
-          volume24h: ctxs[i]?.dayNtlVlm || "0",
-          funding: ctxs[i]?.funding || "0",
-          openInterest: ctxs[i]?.openInterest || "0",
-          change24h: ctxs[i]?.prevDayPx
-            ? (((parseFloat(ctxs[i].midPx) - parseFloat(ctxs[i].prevDayPx)) / parseFloat(ctxs[i].prevDayPx)) * 100).toFixed(2)
-            : "0",
-        }));
-        res.json(overview);
-      } else {
-        res.json([]);
+      // Fetch both main perps and HIP-3 xyz dex
+      const [mainRes, xyzRes] = await Promise.all([
+        fetch("https://api.hyperliquid.xyz/info", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "metaAndAssetCtxs" }),
+        }),
+        fetch("https://api.hyperliquid.xyz/info", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "metaAndAssetCtxs", dex: "xyz" }),
+        }),
+      ]);
+      const overview: any[] = [];
+      for (const resp of [mainRes, xyzRes]) {
+        const data: any = await resp.json();
+        if (data && data.length === 2) {
+          const universe = data[0]?.universe || [];
+          const ctxs = data[1] || [];
+          for (let i = 0; i < universe.length; i++) {
+            if (!ctxs[i]?.midPx || ctxs[i].midPx === "None") continue;
+            overview.push({
+              name: universe[i].name,
+              price: ctxs[i].midPx || "0",
+              volume24h: ctxs[i].dayNtlVlm || "0",
+              funding: ctxs[i].funding || "0",
+              openInterest: ctxs[i].openInterest || "0",
+              change24h: ctxs[i].prevDayPx
+                ? (((parseFloat(ctxs[i].midPx) - parseFloat(ctxs[i].prevDayPx)) / parseFloat(ctxs[i].prevDayPx)) * 100).toFixed(2)
+                : "0",
+            });
+          }
+        }
       }
+      res.json(overview);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }

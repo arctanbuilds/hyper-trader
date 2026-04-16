@@ -45,10 +45,14 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
   // Cache asset indices to avoid repeated lookups
   const assetIndexCache: Record<string, { index: number; dex: string }> = {};
 
+  // HIP-3 perp_dex_index lookup (from allPerpMetas): xyz = 1
+  // Formula: asset_id = 100000 + perp_dex_index * 10000 + index_in_meta
+  const PERP_DEX_INDEX: Record<string, number> = { "xyz": 1 };
+
   async function getAssetIndex(coin: string): Promise<number> {
     if (assetIndexCache[coin]) return assetIndexCache[coin].index;
 
-    const dex = coin.startsWith("xyz:") ? "xyz" : "";
+    const dex = coin.includes(":") ? coin.split(":")[0] : "";
     const lookupName = coin;
 
     const body: any = { type: "meta" };
@@ -66,8 +70,15 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
     const idx = universe.findIndex((a: any) => a.name === lookupName);
     if (idx === -1) throw new Error(`Asset ${coin} (lookup: ${lookupName}, dex: ${dex || "main"}) not found in ${universe.length} assets`);
     
-    // HIP-3 assets have indices offset by 10000
-    const actualIndex = dex === "xyz" ? 10000 + idx : idx;
+    // HIP-3 assets: 100000 + perp_dex_index * 10000 + index_in_meta
+    // Standard perps: just the index
+    let actualIndex: number;
+    if (dex && PERP_DEX_INDEX[dex] !== undefined) {
+      actualIndex = 100000 + PERP_DEX_INDEX[dex] * 10000 + idx;
+      console.log(`[HL] HIP-3 asset ${coin}: dex=${dex}, perp_dex_index=${PERP_DEX_INDEX[dex]}, idx=${idx}, asset_id=${actualIndex}`);
+    } else {
+      actualIndex = idx;
+    }
     assetIndexCache[coin] = { index: actualIndex, dex };
     return actualIndex;
   }
@@ -156,28 +167,42 @@ export function createExecutor(apiSecret: string, walletAddress: string): Hyperl
     },
 
     async getPositions() {
-      const res = await fetch(HL_INFO_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: "clearinghouseState",
-          user: walletAddress,
+      // Query both main perps and HIP-3 xyz dex positions
+      const [mainRes, xyzRes] = await Promise.all([
+        fetch(HL_INFO_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "clearinghouseState", user: walletAddress }),
         }),
-      });
-      const data: any = await res.json();
-      return data?.assetPositions || [];
+        fetch(HL_INFO_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "clearinghouseState", user: walletAddress, dex: "xyz" }),
+        }),
+      ]);
+      const mainData: any = await mainRes.json();
+      const xyzData: any = await xyzRes.json();
+      const positions = [...(mainData?.assetPositions || []), ...(xyzData?.assetPositions || [])];
+      return positions;
     },
 
     async getOpenOrders() {
-      const res = await fetch(HL_INFO_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: "openOrders",
-          user: walletAddress,
+      // Query both main perps and HIP-3 xyz dex orders
+      const [mainRes, xyzRes] = await Promise.all([
+        fetch(HL_INFO_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "openOrders", user: walletAddress }),
         }),
-      });
-      return await res.json();
+        fetch(HL_INFO_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "openOrders", user: walletAddress, dex: "xyz" }),
+        }),
+      ]);
+      const mainOrders: any = await mainRes.json();
+      const xyzOrders: any = await xyzRes.json();
+      return [...(Array.isArray(mainOrders) ? mainOrders : []), ...(Array.isArray(xyzOrders) ? xyzOrders : [])];
     },
 
     async getAccountValue() {

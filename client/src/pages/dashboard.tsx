@@ -19,10 +19,11 @@ const ASSET_DISPLAY: Record<string, string> = {
   "BTC": "Bitcoin",
   "ETH": "Ethereum",
   "SOL": "Solana",
+  "XRP": "XRP",
   "xyz:GOLD": "Gold",
   "xyz:SILVER": "Silver",
-  "xyz:CL": "Oil WTI",
-  "xyz:BRENTOIL": "Oil Brent",
+  "xyz:CL": "WTI Oil",
+  "xyz:BRENTOIL": "Brent Oil",
   "xyz:SP500": "S&P 500",
   "xyz:EUR": "EUR/USD",
 };

@@ -1,7 +1,7 @@
 /**
- * HyperTrader — Elite Trading Engine v10.5
+ * HyperTrader — Elite Trading Engine v10.8
  *
- * BTC ONLY — fewer trades, higher quality, bigger wins
+ * MULTI-ASSET: Crypto + HIP-3 TradFi (Gold, Silver, Oil, S&P 500, EUR/USD)
  *
  * TWO ACTIVE STRATEGIES:
  *
@@ -51,11 +51,17 @@ interface AssetConfig {
 }
 
 const ALLOWED_ASSETS: AssetConfig[] = [
-  { coin: "BTC",  displayName: "Bitcoin",  dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
-  { coin: "ETH",  displayName: "Ethereum", dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
-  { coin: "SOL",  displayName: "Solana",   dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "XRP",  displayName: "XRP",      dex: "", maxLeverage: 20, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "SPX",  displayName: "S&P 500",  dex: "", maxLeverage: 5,  szDecimals: 1, category: "index",  minNotional: 10 },
+  // === CRYPTO (main perps dex) ===
+  { coin: "BTC",  displayName: "Bitcoin",    dex: "",    maxLeverage: 40, szDecimals: 5, category: "crypto",    minNotional: 10 },
+  { coin: "ETH",  displayName: "Ethereum",   dex: "",    maxLeverage: 25, szDecimals: 4, category: "crypto",    minNotional: 10 },
+  { coin: "SOL",  displayName: "Solana",     dex: "",    maxLeverage: 20, szDecimals: 2, category: "crypto",    minNotional: 10 },
+  { coin: "XRP",  displayName: "XRP",        dex: "",    maxLeverage: 20, szDecimals: 0, category: "crypto",    minNotional: 10 },
+  // === HIP-3 TradFi (xyz perp dex) ===
+  { coin: "xyz:GOLD",     displayName: "Gold",         dex: "xyz", maxLeverage: 25, szDecimals: 4, category: "commodity", minNotional: 10 },
+  { coin: "xyz:SILVER",   displayName: "Silver",       dex: "xyz", maxLeverage: 25, szDecimals: 2, category: "commodity", minNotional: 10 },
+  { coin: "xyz:CL",       displayName: "WTI Oil",      dex: "xyz", maxLeverage: 20, szDecimals: 3, category: "commodity", minNotional: 10, isolatedOnly: true },
+  { coin: "xyz:SP500",    displayName: "S&P 500",      dex: "xyz", maxLeverage: 50, szDecimals: 3, category: "index",     minNotional: 10 },
+  { coin: "xyz:EUR",      displayName: "EUR/USD",      dex: "xyz", maxLeverage: 50, szDecimals: 1, category: "forex",     minNotional: 10, isolatedOnly: true },
 ];
 
 // ============ STRATEGY TYPES ============
@@ -1865,7 +1871,7 @@ class TradingEngine {
       const sessionInfo = getSessionInfo();
       const useSessionFilter = config.useSessionFilter !== false;
 
-      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets | v10.4 REVERSAL+RETEST (1m reaction, wide SL) | Trades today: ${this.dailyTradeCount}`, "engine");
+      log(`Scan #${this.scanCount} — ${sessionInfo.description} | AUM: $${equity.toLocaleString()} | ${ALLOWED_ASSETS.length} assets (${ALLOWED_ASSETS.filter(a=>a.dex==="xyz").length} HIP-3) | v10.8 REVERSAL + HIP-3 TradFi | Trades today: ${this.dailyTradeCount}`, "engine");
 
       // Fetch market data
       const [mainData, xyzData] = await Promise.all([fetchMetaAndAssetCtxs(""), fetchMetaAndAssetCtxs("xyz")]);
@@ -2826,10 +2832,11 @@ class TradingEngine {
               const asset = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
               if (asset) {
                 const [ohlcv5m, ohlcv15m] = await Promise.all([
-                  fetchOHLCV(trade.coin, "5m", 50),
-                  fetchOHLCV(trade.coin, "15m", 35),
+                  fetchCandlesOHLCV(trade.coin, "5m", 50),
+                  fetchCandlesOHLCV(trade.coin, "15m", 35),
                 ]);
-                const bb15m = computeBollingerBands(ohlcv15m);
+                const c15m = ohlcv15m.map(c => c.close);
+                const bb15m = calculateBollingerBands(c15m, 20, 2);
                 const srData = this.latestSRLevels[trade.coin];
                 const srLevels = srData ? [...(srData.levels5m || []), ...(srData.levels15m || []), ...(srData.levels1h || [])] : [];
 
