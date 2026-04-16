@@ -4,7 +4,7 @@
  * MULTI-ASSET: Crypto + HIP-3 TradFi (Gold, Silver, Oil, S&P 500, EUR/USD)
  *
  * PURE RSI STRATEGY:
- *   - LONG when 5m or 15m RSI ≤ 16 → instant market buy
+ *   - LONG when 5m or 15m RSI ≤ 20 → instant market buy
  *   - SHORT when 5m or 15m RSI ≥ 85 → instant market sell
  *   - NO STOP LOSS
  *   - TP: +0.5% from entry (full close)
@@ -1916,12 +1916,12 @@ class TradingEngine {
         // Update dashboard scan row
         let scanSignal: "neutral" | "oversold_long" | "overbought_short" = "neutral";
         let scanDetails = "";
-        const LONG_THRESHOLD = 16;
+        const LONG_THRESHOLD = 20;
         const SHORT_THRESHOLD = 85;
 
         if (rsi5m <= LONG_THRESHOLD || rsi15m <= LONG_THRESHOLD) {
           scanSignal = "oversold_long";
-          scanDetails = `RSI ≤16: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
+          scanDetails = `RSI ≤20: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
         } else if (rsi5m >= SHORT_THRESHOLD || rsi15m >= SHORT_THRESHOLD) {
           scanSignal = "overbought_short";
           scanDetails = `RSI ≥85: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
@@ -2088,7 +2088,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v11.0 PURE RSI (≤16/≥85)`,
+        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v11.0 PURE RSI (≤20/≥85)`,
         timestamp: new Date().toISOString(),
       });
 
