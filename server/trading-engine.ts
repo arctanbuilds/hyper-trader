@@ -702,7 +702,7 @@ function detectBreakoutRetest(
   currentPrice: number,
   tf: string,
   candles1m: OHLCVCandle[],   // 1m OHLCV for reaction confirmation
-  retestTolerance: number = 0.0005,  // 0.05% proximity to trendline — surgical entry AT the TL
+  retestTolerance: number = 0.001,  // 0.1% proximity to trendline
   maxBreakoutAge: number = 30,
 ): BreakoutRetestResult {
   const noResult: BreakoutRetestResult = {
@@ -1280,8 +1280,8 @@ function detectEnhancedRSI(params: {
   // RSI REVERSAL: LONG when RSI ≤ 20 (extreme oversold), SHORT when RSI ≥ 85 (extreme overbought)
   // These are very rare, high-conviction signals — price at BB + extreme RSI = strong mean reversion
   // SL: 0.5%, TP1: 0.3% (move SL→BE), TP2: dynamic (bot determines)
-  const REVERSAL_LONG_RSI = 25;   // RSI must be ≤ this to go LONG (v10.6.3: relaxed from 20)
-  const REVERSAL_SHORT_RSI = 80;  // RSI must be ≥ this to go SHORT (v10.6.3: relaxed from 85)
+  const REVERSAL_LONG_RSI = 20;   // RSI must be ≤ this to go LONG
+  const REVERSAL_SHORT_RSI = 85;  // RSI must be ≥ this to go SHORT
 
   const bb5mStdDist = bb5m.stdDev > 0 ? Math.abs(price - bb5m.middle) / bb5m.stdDev : 0;
   const bb15mStdDist = bb15m.stdDev > 0 ? Math.abs(price - bb15m.middle) / bb15m.stdDev : 0;
