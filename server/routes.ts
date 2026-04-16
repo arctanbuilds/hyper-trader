@@ -350,5 +350,21 @@ export async function registerRoutes(
     }
   });
 
+  // ============ AUTO-START ON DEPLOY ============
+  // If the engine was running before a deploy/restart, auto-resume it
+  (async () => {
+    try {
+      const config = await storage.getConfig();
+      if (config?.isRunning) {
+        console.log("[auto-start] Config shows isRunning=true, resuming engine...");
+        tradingEngine.start();
+      } else {
+        console.log("[auto-start] Engine was stopped before deploy, staying stopped.");
+      }
+    } catch (e) {
+      console.error("[auto-start] Failed to check/resume engine:", e);
+    }
+  })();
+
   return httpServer;
 }
