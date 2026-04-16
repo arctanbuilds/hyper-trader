@@ -1922,8 +1922,6 @@ class TradingEngine {
           if (sig.enhanced.srBlock) continue;
 
           const side = sig.enhanced.signal as "long" | "short";
-          // v10.6.5: LONGS ONLY mode — skip all short signals
-          if (side === "short") continue;
           const reasoning: string[] = [];
           reasoning.push(`[${sig.enhanced.triggerType.toUpperCase()}] Signal: ${side.toUpperCase()} ${sig.asset.displayName}`);
           reasoning.push(`TRIGGER: RSI ${sig.enhanced.triggerRSI.toFixed(1)} on ${sig.enhanced.triggerTF} (${side === "long" ? "oversold" : "overbought"})`);
