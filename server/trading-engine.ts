@@ -2485,7 +2485,7 @@ class TradingEngine {
     const config = await storage.getConfig();
     if (!config) return;
     let openTrades = await storage.getOpenTrades();
-    const mids = await fetchAllMids();
+    const mids: Record<string, string> = (await fetchAllMids()) || {};
 
     const xyzData = await fetchMetaAndAssetCtxs("xyz");
     if (xyzData && xyzData.length >= 2) {
@@ -3052,7 +3052,7 @@ class TradingEngine {
     const trade = await storage.getTradeById(tradeId);
     if (!trade || trade.status !== "open") return null;
     const strategy: StrategyType = (trade.strategy as StrategyType) || "confluence";
-    const mids = await fetchAllMids();
+    const mids: Record<string, string> = (await fetchAllMids()) || {};
     const xyzData = await fetchMetaAndAssetCtxs("xyz");
     if (xyzData && xyzData.length >= 2) {
       const universe = xyzData[0]?.universe || [];
