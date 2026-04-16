@@ -169,7 +169,7 @@ export async function registerRoutes(
       const tradeId = parseInt(req.params.id);
       const trade = await storage.getTradeById(tradeId);
       if (!trade) return res.status(404).json({ error: "Trade not found" });
-      const allowed = ["stopLoss", "takeProfit1", "takeProfit2", "tp1Hit", "status", "closeReason"];
+      const allowed = ["stopLoss", "takeProfit1", "takeProfit2", "tp1Hit", "status", "closeReason", "exitPrice", "pnl", "pnlPct", "size", "leverage", "entryEquity", "peakPnlPct"];
       const updates: any = {};
       for (const key of allowed) {
         if (req.body[key] !== undefined) updates[key] = req.body[key];
