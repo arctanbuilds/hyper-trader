@@ -98,44 +98,39 @@ export async function registerRoutes(
       ? await storage.getOpenTrades()
       : await storage.getAllTrades(200);
 
-    // v11.1: Enrich trades with dollar P&L using notionalValue (ground truth)
-    // Falls back to old equity*size%*leverage formula for legacy trades
+    // v11.2: Use hlPnlUsd directly from Hyperliquid as THE source of truth
+    // Falls back to calculated P&L only for legacy trades without hlPnlUsd
     const currentEquity = tradingEngine.getLastKnownEquity();
-    const FEE_RATE = 0.00045; // Hyperliquid taker fee per side
+    const FEE_RATE = 0.00045;
     const enriched = trades.map((t: any) => {
-      let eqForTrade = t.entryEquity;
-      if (!eqForTrade && t.reason) {
-        const capMatch = t.reason.match(/AUM \(\$(\d+)\)/);
-        if (capMatch) {
-          const capUsd = parseFloat(capMatch[1]);
-          const sizePct = (t.size || 10) / 100;
-          eqForTrade = sizePct > 0 ? capUsd / sizePct : currentEquity;
-        }
-      }
-      if (!eqForTrade) eqForTrade = currentEquity;
-      // GROUND TRUTH: use notionalValue if available, else fallback
-      const positionValue = t.notionalValue || (eqForTrade * ((t.size || 10) / 100) * (t.leverage || 1));
-      const marginCap = (t.leverage || 1) > 0 ? positionValue / (t.leverage || 1) : positionValue;
       let pnlUsd: number;
-      const exitPx = t.exitPrice || t.entryPrice;
-      if (t.tp1Hit && t.takeProfit1 && t.exitPrice) {
-        const halfPos = positionValue / 2;
-        const tp1Move = t.side === "long"
-          ? (t.takeProfit1 - t.entryPrice) / t.entryPrice
-          : (t.entryPrice - t.takeProfit1) / t.entryPrice;
-        const tp2Move = t.side === "long"
-          ? (exitPx - t.entryPrice) / t.entryPrice
-          : (t.entryPrice - exitPx) / t.entryPrice;
-        pnlUsd = halfPos * tp1Move + halfPos * tp2Move
-          - positionValue * FEE_RATE - halfPos * FEE_RATE - halfPos * FEE_RATE;
-      } else if (t.exitPrice) {
-        const rawMove = t.side === "long"
-          ? (exitPx - t.entryPrice) / t.entryPrice
-          : (t.entryPrice - exitPx) / t.entryPrice;
-        pnlUsd = positionValue * rawMove - positionValue * FEE_RATE * 2;
+      let eqForTrade = t.entryEquity || currentEquity;
+
+      if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) {
+        // GROUND TRUTH: P&L straight from Hyperliquid
+        pnlUsd = t.hlPnlUsd;
       } else {
-        // Open trade — use stored pnl (already corrected by monitoring loop)
-        pnlUsd = marginCap * ((t.pnl || 0) / 100);
+        // Legacy fallback for old trades without hlPnlUsd
+        if (!eqForTrade && t.reason) {
+          const capMatch = t.reason.match(/AUM \(\$(\d+)\)/);
+          if (capMatch) {
+            const capUsd = parseFloat(capMatch[1]);
+            const sizePct = (t.size || 10) / 100;
+            eqForTrade = sizePct > 0 ? capUsd / sizePct : currentEquity;
+          }
+        }
+        if (!eqForTrade) eqForTrade = currentEquity;
+        const positionValue = t.notionalValue || (eqForTrade * ((t.size || 10) / 100) * (t.leverage || 1));
+        const marginCap = (t.leverage || 1) > 0 ? positionValue / (t.leverage || 1) : positionValue;
+        const exitPx = t.exitPrice || t.entryPrice;
+        if (t.exitPrice) {
+          const rawMove = t.side === "long"
+            ? (exitPx - t.entryPrice) / t.entryPrice
+            : (t.entryPrice - exitPx) / t.entryPrice;
+          pnlUsd = positionValue * rawMove - positionValue * FEE_RATE * 2;
+        } else {
+          pnlUsd = marginCap * ((t.pnl || 0) / 100);
+        }
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
@@ -166,7 +161,7 @@ export async function registerRoutes(
       const tradeId = parseInt(req.params.id);
       const trade = await storage.getTradeById(tradeId);
       if (!trade) return res.status(404).json({ error: "Trade not found" });
-      const allowed = ["stopLoss", "takeProfit1", "takeProfit2", "tp1Hit", "status", "closeReason", "exitPrice", "pnl", "pnlPct", "size", "leverage", "entryEquity", "peakPnlPct", "notionalValue"];
+      const allowed = ["stopLoss", "takeProfit1", "takeProfit2", "tp1Hit", "status", "closeReason", "exitPrice", "pnl", "pnlPct", "size", "leverage", "entryEquity", "peakPnlPct", "notionalValue", "hlPnlUsd", "hlCloseFee"];
       const updates: any = {};
       for (const key of allowed) {
         if (req.body[key] !== undefined) updates[key] = req.body[key];

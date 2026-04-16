@@ -71,11 +71,13 @@ export const trades = pgTable("trades", {
   // Equity at trade open (for accurate P&L calculation)
   entryEquity: doublePrecision("entry_equity"),
   // Actual notional position value in USDC (filled size * fill price)
-  // This is the GROUND TRUTH for P&L — never reconstruct from equity*size%*leverage
   notionalValue: doublePrecision("notional_value"),
-  // P&L
-  pnl: doublePrecision("pnl"),
-  pnlPct: doublePrecision("pnl_pct"),
+  // P&L — read DIRECTLY from Hyperliquid (never calculated)
+  pnl: doublePrecision("pnl"),        // leveraged % (legacy, kept for backward compat)
+  pnlPct: doublePrecision("pnl_pct"),  // % of AUM (legacy)
+  // v11.2: Actual USD P&L from Hyperliquid — THE source of truth
+  hlPnlUsd: doublePrecision("hl_pnl_usd"),  // unrealizedPnl (open) or closedPnl-fee (closed), directly from HL
+  hlCloseFee: doublePrecision("hl_close_fee"),  // close-side fee from HL fills
   peakPnlPct: doublePrecision("peak_pnl_pct").default(0),
   // Status
   status: text("status").notNull().default("open"), // open, closed, liquidated

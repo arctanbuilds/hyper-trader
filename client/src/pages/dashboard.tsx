@@ -438,6 +438,9 @@ export default function Dashboard() {
                         (trade.pnlUsd || 0) >= 0 ? "text-emerald-400/60" : "text-red-400/60"
                       )}>
                         {fmtUsd(trade.pnlUsd || 0)}
+                        {trade.hlPnlUsd !== null && trade.hlPnlUsd !== undefined && (
+                          <span className="text-[8px] text-muted-foreground ml-1">HL</span>
+                        )}
                       </div>
                       <div className="flex items-center gap-1.5 justify-end">
                         <span className="text-[10px] text-muted-foreground font-mono">

@@ -221,6 +221,49 @@ async function fetchUserState(address: string): Promise<any> {
     return perpsData;
   } catch (e) { log(`UserState error: ${e}`, "engine"); return null; }
 }
+// ============ HL FILLS — GROUND TRUTH P&L ============
+
+// Fetch recent fills for a user (returns all fills since startTime)
+async function fetchUserFills(address: string, startTime?: number): Promise<any[]> {
+  try {
+    const body: any = { type: "userFillsByTime", user: address, startTime: startTime || (Date.now() - 24 * 3600 * 1000) };
+    const res = await fetch(HL_INFO_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    return (await res.json()) as any[];
+  } catch (e) { log(`Fills error: ${e}`, "engine"); return []; }
+}
+
+// Get the realized P&L for a specific coin's close from HL fills
+// Aggregates all close fills for the coin within a time window
+// Returns { closedPnl, totalFee, exitPrice, exitSize } or null if not found
+function extractClosePnlFromFills(fills: any[], coin: string, side: "long" | "short", afterTime: number): {
+  closedPnl: number; totalFee: number; netPnl: number; exitPrice: number; exitSize: number;
+} | null {
+  // Close fills: "Close Long" or "Close Short"
+  const closeDir = side === "long" ? "Close Long" : "Close Short";
+  const closeFills = fills.filter(f =>
+    f.coin === coin && f.dir === closeDir && f.time >= afterTime
+  );
+  if (closeFills.length === 0) return null;
+
+  let closedPnl = 0;
+  let totalFee = 0;
+  let totalSz = 0;
+  let weightedPx = 0;
+  for (const f of closeFills) {
+    closedPnl += parseFloat(f.closedPnl || "0");
+    totalFee += parseFloat(f.fee || "0");
+    const sz = parseFloat(f.sz || "0");
+    totalSz += sz;
+    weightedPx += parseFloat(f.px || "0") * sz;
+  }
+  const exitPrice = totalSz > 0 ? weightedPx / totalSz : 0;
+  // netPnl = closedPnl - totalFee (closedPnl is gross before close-side fee)
+  // Actually HL's closedPnl already accounts for entry fee, so net = closedPnl - closeFee
+  const netPnl = closedPnl - totalFee;
+
+  return { closedPnl, totalFee, netPnl, exitPrice, exitSize: totalSz };
+}
+
 // ============ SESSION ============
 
 function getSessionInfo(): { session: string; isHighVolume: boolean; description: string } {
@@ -662,113 +705,129 @@ class TradingEngine {
     }
     const currentEquity = equity || this.lastKnownEquity || 0;
 
-    // v10.9.3: POSITION SYNC — detect ghost trades (bot thinks open, HL says closed)
-    // ROBUST: Requires 3 CONSECUTIVE "no position" readings before sync-closing.
-    // This prevents false closes from intermittent HL API empty responses.
-    // Also has a 5-minute grace period for newly opened/imported trades.
+    // ============================================================
+    // v11.2: READ ALL P&L DIRECTLY FROM HYPERLIQUID
+    // Open positions: unrealizedPnl from clearinghouseState
+    // Closed positions: closedPnl + fee from userFills
+    // ============================================================
+
+    // Build map of HL positions: coin -> { unrealizedPnl, returnOnEquity, szi, entryPx, ... }
+    const hlPosMap: Map<string, any> = new Map();
+
     if (config.apiSecret && config.walletAddress && openTrades.length > 0) {
       try {
         const syncExec = createExecutor(config.apiSecret, config.walletAddress);
         const hlPositions = await syncExec.getPositions();
-        const hlCoinsWithPos = new Set<string>();
         for (const p of hlPositions) {
-          const sz = Math.abs(parseFloat(p.position?.szi || "0"));
-          if (sz > 0) hlCoinsWithPos.add(p.position.coin);
+          const pos = p.position;
+          const sz = Math.abs(parseFloat(pos?.szi || "0"));
+          if (sz > 0) hlPosMap.set(pos.coin, pos);
         }
 
         // Track which tradeIds we still see as open for cleanup
         const currentOpenIds = new Set(openTrades.map(t => t.id));
 
         for (const trade of openTrades) {
-          // v10.9.3: 5-minute grace period — don't sync-close trades opened less than 5 min ago
+          // 5-minute grace period
           const tradeAge = Date.now() - new Date(trade.openedAt || 0).getTime();
           if (tradeAge < 300_000) {
             log(`[SYNC] Skipping trade #${trade.id} ${trade.coin} — opened ${(tradeAge/1000).toFixed(0)}s ago (5m grace)`, "engine");
-            this.syncMissCount.delete(trade.id); // reset miss count during grace
+            this.syncMissCount.delete(trade.id);
             continue;
           }
 
-          if (hlCoinsWithPos.has(trade.coin)) {
+          if (hlPosMap.has(trade.coin)) {
             // Position confirmed on HL — reset miss count
             if (this.syncMissCount.has(trade.id)) {
               log(`[SYNC] Trade #${trade.id} ${trade.coin} — position confirmed on HL (was at ${this.syncMissCount.get(trade.id)} misses, reset)`, "engine");
               this.syncMissCount.delete(trade.id);
             }
           } else {
-            // No position found — increment consecutive miss counter
             const misses = (this.syncMissCount.get(trade.id) || 0) + 1;
             this.syncMissCount.set(trade.id, misses);
             log(`[SYNC] Trade #${trade.id} ${trade.coin} — no HL position (miss ${misses}/3)`, "engine");
 
-            if (misses < 3) {
-              continue; // Wait for more consecutive misses before acting
+            if (misses < 3) continue;
+
+            // 3 consecutive misses — position genuinely closed on HL
+            // v11.2: Fetch actual P&L from HL fills instead of calculating
+            this.syncMissCount.delete(trade.id);
+            const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
+            const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
+            const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
+
+            const syncEq = (trade as any).entryEquity || currentEquity;
+            let netPnl: number;
+            let exitPrice: number;
+            let closeFee = 0;
+
+            if (hlPnl) {
+              // GROUND TRUTH: P&L straight from Hyperliquid
+              netPnl = hlPnl.netPnl;
+              exitPrice = hlPnl.exitPrice;
+              closeFee = hlPnl.totalFee;
+              log(`[SYNC] Trade #${trade.id} ${trade.coin} — HL fills P&L: gross=$${hlPnl.closedPnl.toFixed(4)} fee=$${hlPnl.totalFee.toFixed(4)} net=$${netPnl.toFixed(4)} exitPx=$${exitPrice.toFixed(2)}`, "engine");
+            } else {
+              // Fallback: no fills found (rare) — estimate from mid price
+              exitPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
+              const pv = (trade as any).notionalValue || (syncEq * (trade.size / 100) * trade.leverage);
+              const rm = trade.side === "long" ? (exitPrice - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - exitPrice) / trade.entryPrice;
+              netPnl = pv * rm - pv * 0.00045 * 2;
+              log(`[SYNC] Trade #${trade.id} ${trade.coin} — no HL fills found, estimated P&L: $${netPnl.toFixed(4)}`, "engine");
             }
 
-            // 3 consecutive misses — position is genuinely closed on HL
-            this.syncMissCount.delete(trade.id);
-            const closePrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
-            const FEE_SYNC = 0.00045;
-            const syncEq = (trade as any).entryEquity || currentEquity;
-            // v11.1: Use notionalValue (ground truth) for P&L
-            const pv = (trade as any).notionalValue || (syncEq * (trade.size / 100) * trade.leverage);
-            const syncMarginCap = trade.leverage > 0 ? pv / trade.leverage : pv;
-            let syncPnl: number;
-            if (trade.tp1Hit && trade.takeProfit1) {
-              const hp = pv / 2;
-              const t1m = trade.side === "long" ? (trade.takeProfit1 - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - trade.takeProfit1) / trade.entryPrice;
-              const t2m = trade.side === "long" ? (closePrice - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - closePrice) / trade.entryPrice;
-              syncPnl = hp * t1m + hp * t2m - pv * FEE_SYNC - hp * FEE_SYNC - hp * FEE_SYNC;
-            } else {
-              const rm = trade.side === "long" ? (closePrice - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - closePrice) / trade.entryPrice;
-              syncPnl = pv * rm - pv * FEE_SYNC * 2;
-            }
-            const syncLevPnl = syncMarginCap > 0 ? (syncPnl / syncMarginCap) * 100 : 0;
-            const syncAumPnl = syncEq > 0 ? (syncPnl / syncEq) * 100 : 0;
+            const pnlOfAum = syncEq > 0 ? (netPnl / syncEq) * 100 : 0;
             await storage.updateTrade(trade.id, {
-              exitPrice: closePrice, pnl: syncLevPnl, pnlPct: syncAumPnl,
-              status: "closed", closeReason: "Position closed on Hyperliquid (sync — 3 consecutive confirmations)",
+              exitPrice, pnl: 0, pnlPct: pnlOfAum,
+              hlPnlUsd: netPnl, hlCloseFee: closeFee,
+              status: "closed", closeReason: `Position closed on HL (sync) | P&L: $${netPnl.toFixed(2)} (from HL)`,
               closedAt: new Date().toISOString(),
             });
-            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed — no HL position (3 consecutive confirms) | P&L: $${syncPnl.toFixed(2)}`, "engine");
-            // v10.6: Blacklist TL if sync-closed at a loss
+            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed | HL P&L: $${netPnl.toFixed(2)}`, "engine");
             await storage.createLog({
               type: "trade_close",
-              message: `[SYNC] Auto-closed ${trade.coin} ${trade.side} #${trade.id} — no matching HL position (3x confirmed) | P&L: $${syncPnl.toFixed(2)}`,
+              message: `[SYNC] Auto-closed ${trade.coin} ${trade.side} #${trade.id} | HL P&L: $${netPnl.toFixed(2)} USDC`,
               timestamp: new Date().toISOString(),
             });
           }
         }
 
-        // Cleanup syncMissCount for trades that are no longer open
+        // Cleanup syncMissCount for trades no longer open
         for (const [tid] of this.syncMissCount) {
           if (!currentOpenIds.has(tid)) this.syncMissCount.delete(tid);
         }
 
-        // Refresh open trades after sync
         openTrades = await storage.getOpenTrades();
       } catch (e) {
         log(`[SYNC] Position sync error: ${e}`, "engine");
       }
     }
 
+    // ============================================================
+    // OPEN TRADE MONITORING: read unrealizedPnl from HL + check TP
+    // ============================================================
     for (const trade of openTrades) {
       const currentPrice = parseFloat(mids[trade.coin] || "0");
       if (currentPrice === 0) continue;
       const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
       const szd = ac?.szDecimals ?? 2;
-
-      // v11.1: P&L uses notionalValue (actual filled position) — fallback to old formula for legacy trades
-      const FEE_RATE = 0.00045;
       const eqForTrade = (trade as any).entryEquity || currentEquity;
-      const positionValue = (trade as any).notionalValue || (eqForTrade * (trade.size / 100) * trade.leverage);
-      const rawMove = trade.side === "long"
-        ? (currentPrice - trade.entryPrice) / trade.entryPrice
-        : (trade.entryPrice - currentPrice) / trade.entryPrice;
-      const pnlUsd = positionValue * rawMove - positionValue * FEE_RATE * 2;
-      const marginCapital = trade.leverage > 0 ? positionValue / trade.leverage : positionValue;
-      const leveragedPnl = marginCapital > 0 ? (pnlUsd / marginCapital) * 100 : 0;
+
+      // v11.2: Read unrealizedPnl directly from HL position
+      const hlPos = hlPosMap.get(trade.coin);
+      let pnlUsd: number;
+      if (hlPos?.unrealizedPnl !== undefined) {
+        // GROUND TRUTH: P&L straight from Hyperliquid
+        pnlUsd = parseFloat(hlPos.unrealizedPnl);
+      } else {
+        // Fallback: calculate (when HL data not available)
+        const positionValue = (trade as any).notionalValue || (eqForTrade * (trade.size / 100) * trade.leverage);
+        const rawMove = trade.side === "long"
+          ? (currentPrice - trade.entryPrice) / trade.entryPrice
+          : (trade.entryPrice - currentPrice) / trade.entryPrice;
+        pnlUsd = positionValue * rawMove - positionValue * 0.00045 * 2;
+      }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
-      const currentPeak = Math.max(trade.peakPnlPct || 0, leveragedPnl);
 
       // v11.0: ONLY exit on TP hit (+0.5%) — NO SL
       let shouldClose = false;
@@ -786,10 +845,9 @@ class TradingEngine {
         if (config.apiSecret && config.walletAddress) {
           try {
             const executor = createExecutor(config.apiSecret, config.walletAddress);
-            const positions = await executor.getPositions();
-            const pos = positions.find((p: any) => p.position?.coin === trade.coin);
+            const pos = hlPos || (await executor.getPositions()).find((p: any) => p.position?.coin === trade.coin)?.position;
             if (pos) {
-              const sz = Math.abs(parseFloat(pos.position.szi || "0"));
+              const sz = Math.abs(parseFloat(pos.szi || "0"));
               const slippage = trade.side === "long" ? 0.99 : 1.01;
               await executor.placeOrder({
                 coin: trade.coin, isBuy: trade.side === "short", sz,
@@ -798,26 +856,65 @@ class TradingEngine {
               });
             }
           } catch (e) { log(`Close error: ${e}`, "engine"); }
-        }
 
-        await storage.updateTrade(trade.id, {
-          exitPrice: currentPrice, pnl: leveragedPnl, pnlPct: pnlOfAum, peakPnlPct: currentPeak,
-          status: "closed", closeReason, closedAt: new Date().toISOString(),
-        });
+          // v11.2: After close, fetch actual P&L from HL fills
+          await new Promise(r => setTimeout(r, 1500)); // wait for fill to appear
+          try {
+            const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
+            const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
+            const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
+            if (hlPnl) {
+              pnlUsd = hlPnl.netPnl;
+              closeReason = `[PURE_RSI] TP +0.5% | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
+              const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
+              await storage.updateTrade(trade.id, {
+                exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: finalPnlOfAum,
+                hlPnlUsd: hlPnl.netPnl, hlCloseFee: hlPnl.totalFee,
+                peakPnlPct: 0, status: "closed", closeReason, closedAt: new Date().toISOString(),
+              });
+              log(`[TP CLOSE] Trade #${trade.id} ${trade.coin} ${trade.side} | HL P&L: $${hlPnl.netPnl.toFixed(2)}`, "engine");
+            } else {
+              // Fill not yet available — store estimate, sync will fix later
+              const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
+              await storage.updateTrade(trade.id, {
+                exitPrice: currentPrice, pnl: 0, pnlPct: finalPnlOfAum,
+                hlPnlUsd: pnlUsd, hlCloseFee: 0,
+                peakPnlPct: 0, status: "closed", closeReason, closedAt: new Date().toISOString(),
+              });
+            }
+          } catch (e) {
+            log(`[TP CLOSE] Fill fetch error: ${e}`, "engine");
+            const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
+            await storage.updateTrade(trade.id, {
+              exitPrice: currentPrice, pnl: 0, pnlPct: finalPnlOfAum,
+              hlPnlUsd: pnlUsd, hlCloseFee: 0,
+              peakPnlPct: 0, status: "closed", closeReason, closedAt: new Date().toISOString(),
+            });
+          }
+        } else {
+          // No API — paper mode
+          const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
+          await storage.updateTrade(trade.id, {
+            exitPrice: currentPrice, pnl: 0, pnlPct: finalPnlOfAum,
+            hlPnlUsd: pnlUsd, hlCloseFee: 0,
+            peakPnlPct: 0, status: "closed", closeReason, closedAt: new Date().toISOString(),
+          });
+        }
 
         await logDecision({
           tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
-          reasoning: `EXIT: ${closeReason} | P&L: ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | ROI/AUM: ${pnlOfAum.toFixed(3)}% | Held: ${trade.openedAt ? Math.round((Date.now() - new Date(trade.openedAt).getTime()) / 60000) : 0}min`,
+          reasoning: `EXIT: ${closeReason} | HL P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${(eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0).toFixed(3)}%`,
           equity: currentEquity, leverage: trade.leverage, strategy: "bb_rsi_reversion",
         });
 
         await storage.createLog({
           type: "trade_close",
-          message: `CLOSED [PURE_RSI] ${trade.side.toUpperCase()} ${trade.coin} | ${leveragedPnl.toFixed(2)}% ($${pnlUsd.toFixed(2)}) | AUM: ${pnlOfAum.toFixed(3)}% | ${closeReason}`,
+          message: `CLOSED [PURE_RSI] ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
           timestamp: new Date().toISOString(),
         });
       } else {
-        await storage.updateTrade(trade.id, { pnl: leveragedPnl, pnlPct: pnlOfAum, peakPnlPct: currentPeak });
+        // Update open trade with HL unrealized P&L
+        await storage.updateTrade(trade.id, { hlPnlUsd: pnlUsd, pnlPct: pnlOfAum });
       }
     }
   }
@@ -826,15 +923,23 @@ class TradingEngine {
     const openTrades = await storage.getOpenTrades();
     const closedTrades = allTrades.filter(t => t.status === "closed");
     const currentEquity = equity || this.lastKnownEquity || 0;
+    const startEq = this.pnlResetEquity || this.startingEquity || currentEquity;
 
-    // v11.1: Use pnlPct directly (already correctly computed as % of AUM)
-    const closedPnlOfAum = closedTrades.reduce((s, t) => s + (t.pnlPct || 0), 0);
-    const openPnlOfAum = openTrades.reduce((s, t) => s + (t.pnlPct || 0), 0);
-    const totalPnl = closedPnlOfAum + openPnlOfAum;
+    // v11.2: Use hlPnlUsd directly for P&L snapshot
+    const closedPnlUsd = closedTrades.reduce((s, t) => {
+      if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
+      return s + (startEq > 0 ? startEq * ((t.pnlPct || 0) / 100) : 0);
+    }, 0);
+    const openPnlUsd = openTrades.reduce((s, t) => {
+      if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
+      return s + (currentEquity > 0 ? currentEquity * ((t.pnlPct || 0) / 100) : 0);
+    }, 0);
+    const totalPnlUsd = closedPnlUsd + openPnlUsd;
+    const totalPnlPct = startEq > 0 ? (totalPnlUsd / startEq) * 100 : 0;
 
     await storage.createPnlSnapshot({
-      totalEquity: currentEquity > 0 ? currentEquity : (this.startingEquity || 0) * (1 + totalPnl / 100),
-      totalPnl, totalPnlPct: totalPnl, openPositions: openTrades.length,
+      totalEquity: currentEquity > 0 ? currentEquity : startEq + totalPnlUsd,
+      totalPnl: totalPnlPct, totalPnlPct, openPositions: openTrades.length,
       timestamp: new Date().toISOString(),
     });
   }
@@ -867,44 +972,63 @@ class TradingEngine {
           });
         }
       } catch (e) { log(`Close error: ${e}`, "engine"); }
+
+      // v11.2: After close, fetch actual P&L from HL fills
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
+        const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
+        const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
+        if (hlPnl) {
+          const eq = this.lastKnownEquity || 0;
+          const eqForClose = (trade as any).entryEquity || eq;
+          const pnlOfAum = eqForClose > 0 ? (hlPnl.netPnl / eqForClose) * 100 : 0;
+          const updated = await storage.updateTrade(trade.id, {
+            exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: pnlOfAum,
+            hlPnlUsd: hlPnl.netPnl, hlCloseFee: hlPnl.totalFee,
+            status: "closed", closeReason: `Manual close | HL P&L: $${hlPnl.netPnl.toFixed(2)}`,
+            closedAt: new Date().toISOString(),
+          });
+          await logDecision({
+            tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: hlPnl.exitPrice,
+            reasoning: `MANUAL CLOSE | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)}) | ROI/AUM: ${pnlOfAum.toFixed(3)}%`,
+            equity: eq, leverage: trade.leverage, strategy,
+          });
+          await storage.createLog({
+            type: "trade_close",
+            message: `Manual close ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
+            timestamp: new Date().toISOString(),
+          });
+          return updated;
+        }
+      } catch (e) { log(`[FORCE_CLOSE] Fill fetch error: ${e}`, "engine"); }
     }
-    // v11.1: P&L uses notionalValue (ground truth) — fallback for legacy trades
+
+    // Fallback: no HL fills available — estimate P&L
     const FEE_RATE_MC = 0.00045;
     const eq = this.lastKnownEquity || 0;
     const eqForClose = (trade as any).entryEquity || eq;
     const posValue = (trade as any).notionalValue || (eqForClose * (trade.size / 100) * trade.leverage);
-    const marginCap = trade.leverage > 0 ? posValue / trade.leverage : posValue;
-    let pnlUsd: number;
-    if (trade.tp1Hit && trade.takeProfit1) {
-      const halfPos = posValue / 2;
-      const tp1Move = trade.side === "long"
-        ? (trade.takeProfit1 - trade.entryPrice) / trade.entryPrice
-        : (trade.entryPrice - trade.takeProfit1) / trade.entryPrice;
-      const tp2Move = trade.side === "long"
-        ? (currentPrice - trade.entryPrice) / trade.entryPrice
-        : (trade.entryPrice - currentPrice) / trade.entryPrice;
-      pnlUsd = halfPos * tp1Move + halfPos * tp2Move
-        - posValue * FEE_RATE_MC - halfPos * FEE_RATE_MC - halfPos * FEE_RATE_MC;
-    } else {
-      const rawMove = trade.side === "long"
-        ? (currentPrice - trade.entryPrice) / trade.entryPrice
-        : (trade.entryPrice - currentPrice) / trade.entryPrice;
-      pnlUsd = posValue * rawMove - posValue * FEE_RATE_MC * 2;
-    }
-    const leveragedPnl = marginCap > 0 ? (pnlUsd / marginCap) * 100 : 0;
+    const rawMove = trade.side === "long"
+      ? (currentPrice - trade.entryPrice) / trade.entryPrice
+      : (trade.entryPrice - currentPrice) / trade.entryPrice;
+    const pnlUsd = posValue * rawMove - posValue * FEE_RATE_MC * 2;
     const pnlOfAum = eqForClose > 0 ? (pnlUsd / eqForClose) * 100 : 0;
 
     const updated = await storage.updateTrade(trade.id, {
-      exitPrice: currentPrice, pnl: leveragedPnl, pnlPct: pnlOfAum, status: "closed",
-      closeReason: "Manual close", closedAt: new Date().toISOString(),
+      exitPrice: currentPrice, pnl: 0, pnlPct: pnlOfAum,
+      hlPnlUsd: pnlUsd, hlCloseFee: 0,
+      status: "closed", closeReason: "Manual close (estimated P&L)",
+      closedAt: new Date().toISOString(),
     });
     await logDecision({
       tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
-      reasoning: `MANUAL CLOSE [${strategy.toUpperCase()}] | P&L: ${leveragedPnl.toFixed(2)}% (pos) | ROI/AUM: ${pnlOfAum.toFixed(3)}% | $${pnlUsd.toFixed(2)}`, equity: eq, leverage: trade.leverage, strategy,
+      reasoning: `MANUAL CLOSE | Est P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${pnlOfAum.toFixed(3)}%`,
+      equity: eq, leverage: trade.leverage, strategy,
     });
     await storage.createLog({
       type: "trade_close",
-      message: `Manual close [${strategy.toUpperCase()}] ${trade.side.toUpperCase()} ${trade.coin} | ROI: ${pnlOfAum.toFixed(3)}% ($${pnlUsd.toFixed(2)})`,
+      message: `Manual close ${trade.side.toUpperCase()} ${trade.coin} | Est P&L: $${pnlUsd.toFixed(2)} USDC`,
       timestamp: new Date().toISOString(),
     });
     return updated;
@@ -941,7 +1065,11 @@ class TradingEngine {
       : allTrades;
     const activeClosedTrades = activeTrades.filter(t => t.status === "closed");
     const allClosedTrades = allTrades.filter(t => t.status === "closed"); // for all-time stats
-    const winTrades = activeClosedTrades.filter(t => (t.pnl || 0) > 0);
+    // v11.2: Win/loss uses hlPnlUsd (ground truth from HL) — falls back to pnlPct for legacy
+    const winTrades = activeClosedTrades.filter(t => {
+      if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return t.hlPnlUsd > 0;
+      return (t.pnlPct || 0) > 0;
+    });
     const winRate = activeClosedTrades.length > 0 ? (winTrades.length / activeClosedTrades.length) * 100 : 0;
     const si = getSessionInfo();
     const stats = await getLearningStats();
@@ -949,55 +1077,71 @@ class TradingEngine {
     const currentEquity = this.lastKnownEquity || 0;
     const startEq = this.pnlResetEquity || this.startingEquity || currentEquity;
 
-    // v11.1: Use pnlPct (% of AUM) directly — this is already correctly computed
-    // from notionalValue in the monitoring loop and at close time
-    const closedPnlOfAum = activeClosedTrades.reduce((s, t) => s + (t.pnlPct || 0), 0);
-    const openPnlOfAum = openTrades.reduce((s, t) => s + (t.pnlPct || 0), 0);
-    const combinedPnlOfAum = closedPnlOfAum + openPnlOfAum;
-
-    // Dollar P&L: % of AUM → actual USDC
-    const closedPnlUsd = startEq > 0 ? startEq * (closedPnlOfAum / 100) : 0;
-    const openPnlUsd = currentEquity > 0 ? currentEquity * (openPnlOfAum / 100) : 0;
+    // v11.2: Use hlPnlUsd directly for USDC P&L totals — THE source of truth
+    // Closed trades: sum hlPnlUsd (net realized P&L from HL)
+    const closedPnlUsd = activeClosedTrades.reduce((s, t) => {
+      if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
+      // Legacy fallback: reconstruct from pnlPct
+      return s + (startEq > 0 ? startEq * ((t.pnlPct || 0) / 100) : 0);
+    }, 0);
+    // Open trades: sum hlPnlUsd (unrealized P&L from HL clearinghouseState)
+    const openPnlUsd = openTrades.reduce((s, t) => {
+      if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
+      // Legacy fallback
+      return s + (currentEquity > 0 ? currentEquity * ((t.pnlPct || 0) / 100) : 0);
+    }, 0);
     const combinedPnlUsd = closedPnlUsd + openPnlUsd;
+
+    // Derive % of AUM from USDC amounts
+    const closedPnlOfAum = startEq > 0 ? (closedPnlUsd / startEq) * 100 : 0;
+    const openPnlOfAum = currentEquity > 0 ? (openPnlUsd / currentEquity) * 100 : 0;
+    const combinedPnlOfAum = startEq > 0 ? (combinedPnlUsd / startEq) * 100 : 0;
+
     // Drawdown from day start
     const drawdownPct = this.dayStartEquity > 0 ? ((this.dayStartEquity - currentEquity) / this.dayStartEquity) * 100 : 0;
     const drawdownUsd = this.dayStartEquity - currentEquity;
 
-    // v11.1: Per-trade dollar P&L for open positions using notionalValue
+    // v11.2: Per-trade P&L for open positions — prefer hlPnlUsd
     const openTradesWithUsd = openTrades.map(t => {
       const eqForT = (t as any).entryEquity || currentEquity;
-      const posVal = (t as any).notionalValue || (eqForT * ((t.size || 10) / 100) * (t.leverage || 1));
-      const mc = (t.leverage || 1) > 0 ? posVal / (t.leverage || 1) : posVal;
-      const pnlUsd = mc * ((t.pnl || 0) / 100);
+      const pnlUsd = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
       const pnlOfAum = eqForT > 0 ? (pnlUsd / eqForT) * 100 : 0;
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
 
     // Per-strategy stats (using post-reset trades only)
-    const closedTrades = activeClosedTrades; // alias for strategy breakdown
+    const closedTrades = activeClosedTrades;
     const confluenceTrades = closedTrades.filter(t => (t.strategy || "confluence") === "confluence");
     const extremeTrades = closedTrades.filter(t => t.strategy === "extreme_rsi");
     const bbReversionTrades = closedTrades.filter(t => t.strategy === "bb_rsi_reversion");
     const breakoutRetestTrades = closedTrades.filter(t => t.strategy === "breakout_retest");
-    const confluenceWinRate = confluenceTrades.length > 0 ? (confluenceTrades.filter(t => (t.pnl || 0) > 0).length / confluenceTrades.length) * 100 : 0;
-    const extremeWinRate = extremeTrades.length > 0 ? (extremeTrades.filter(t => (t.pnl || 0) > 0).length / extremeTrades.length) * 100 : 0;
-    const bbReversionWinRate = bbReversionTrades.length > 0 ? (bbReversionTrades.filter(t => (t.pnl || 0) > 0).length / bbReversionTrades.length) * 100 : 0;
-    const breakoutRetestWinRate = breakoutRetestTrades.length > 0 ? (breakoutRetestTrades.filter(t => (t.pnl || 0) > 0).length / breakoutRetestTrades.length) * 100 : 0;
+    // v11.2: Win rate uses hlPnlUsd
+    const winRateCalc = (trades: typeof closedTrades) => {
+      if (trades.length === 0) return 0;
+      const wins = trades.filter(t => {
+        if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return t.hlPnlUsd > 0;
+        return (t.pnlPct || 0) > 0;
+      });
+      return (wins.length / trades.length) * 100;
+    };
+    const confluenceWinRate = winRateCalc(confluenceTrades);
+    const extremeWinRate = winRateCalc(extremeTrades);
+    const bbReversionWinRate = winRateCalc(bbReversionTrades);
+    const breakoutRetestWinRate = winRateCalc(breakoutRetestTrades);
 
-    // v11.1: Per-strategy P&L: use pnlPct directly (already % of AUM)
+    // v11.2: Per-strategy P&L from hlPnlUsd directly
     const strategyPnlCalc = (trades: typeof closedTrades) => {
-      const pnlOfAumPct = trades.reduce((s, t) => s + (t.pnlPct || 0), 0);
-      const pnlUsd = startEq > 0 ? startEq * (pnlOfAumPct / 100) : 0;
+      const pnlUsd = trades.reduce((s, t) => {
+        if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
+        return s + (startEq > 0 ? startEq * ((t.pnlPct || 0) / 100) : 0);
+      }, 0);
+      const pnlOfAumPct = startEq > 0 ? (pnlUsd / startEq) * 100 : 0;
       return { pnlOfAumPct, pnlUsd };
     };
     const confluenceStats = strategyPnlCalc(confluenceTrades);
     const extremeStats = strategyPnlCalc(extremeTrades);
     const bbReversionStats = strategyPnlCalc(bbReversionTrades);
     const breakoutRetestStats = strategyPnlCalc(breakoutRetestTrades);
-    const confluencePnlUsd = confluenceStats.pnlUsd;
-    const extremePnlUsd = extremeStats.pnlUsd;
-    const bbReversionPnlUsd = bbReversionStats.pnlUsd;
-    const breakoutRetestPnlUsd = breakoutRetestStats.pnlUsd;
 
     return {
       isRunning: config?.isRunning || false,
@@ -1028,12 +1172,11 @@ class TradingEngine {
       openTradesWithUsd,
       // Per-strategy breakdown (post-reset only)
       strategyStats: {
-        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluencePnlUsd.toFixed(4), pnlOfAum: confluenceStats.pnlOfAumPct.toFixed(3), status: "disabled" },
-        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremePnlUsd.toFixed(4), pnlOfAum: extremeStats.pnlOfAumPct.toFixed(3), status: "active" },
-        bb_rsi_reversion: { trades: bbReversionTrades.length, winRate: bbReversionWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "bb_rsi_reversion").length, pnlUsd: bbReversionPnlUsd.toFixed(4), pnlOfAum: bbReversionStats.pnlOfAumPct.toFixed(3), status: "active" },
-        breakout_retest: { trades: breakoutRetestTrades.length, winRate: breakoutRetestWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "breakout_retest").length, pnlUsd: breakoutRetestPnlUsd.toFixed(4), pnlOfAum: breakoutRetestStats.pnlOfAumPct.toFixed(3), status: "active" },
+        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluenceStats.pnlUsd.toFixed(4), pnlOfAum: confluenceStats.pnlOfAumPct.toFixed(3), status: "disabled" },
+        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremeStats.pnlUsd.toFixed(4), pnlOfAum: extremeStats.pnlOfAumPct.toFixed(3), status: "active" },
+        bb_rsi_reversion: { trades: bbReversionTrades.length, winRate: bbReversionWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "bb_rsi_reversion").length, pnlUsd: bbReversionStats.pnlUsd.toFixed(4), pnlOfAum: bbReversionStats.pnlOfAumPct.toFixed(3), status: "active" },
+        breakout_retest: { trades: breakoutRetestTrades.length, winRate: breakoutRetestWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "breakout_retest").length, pnlUsd: breakoutRetestStats.pnlUsd.toFixed(4), pnlOfAum: breakoutRetestStats.pnlOfAumPct.toFixed(3), status: "active" },
       },
-
     };
   }
 }
