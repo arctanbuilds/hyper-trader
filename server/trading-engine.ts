@@ -6,9 +6,10 @@
  * TWO ACTIVE STRATEGIES:
  *
  * STRATEGY 1 — BB_RSI REVERSAL:
- *   - LONG when RSI ≤ 25 + price at 2.5+ SD lower BB + near historical SUPPORT (required)
- *   - SHORT when RSI ≥ 85 + price at 2.5+ SD upper BB + near historical RESISTANCE (required)
- *   - S/R confirmation is MANDATORY (not just a confidence boost)
+ *   - LONG when RSI ≤ 25 (or ≤ 30 with double bottom on RSI+price)
+ *   - SHORT when RSI ≥ 85 (or ≥ 80 with double top on RSI+price)
+ *   - S/R confirmation is soft (boosts confidence, not required)
+ *   - Double bottom/top on 5m RSI loosens thresholds by 5 pts
  *   - 80% margin, max leverage
  *   - SL: FIXED 0.5% from entry — moves to BE after TP1, then trails with price
  *   - TP1: 0.3% → BE, TP2: dynamic
@@ -198,6 +199,166 @@ function calculateRSI(closes: number[], period: number = 14): number {
   }
   if (avgLoss === 0) return 100;
   return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+/**
+ * Calculate full RSI series (for pattern detection like double bottom/top).
+ * Returns array of RSI values aligned with closes (first `period` entries are null).
+ */
+function calculateRSISeries(closes: number[], period: number = 14): (number | null)[] {
+  const result: (number | null)[] = new Array(period + 1).fill(null);
+  if (closes.length < period + 1) return result;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const change = closes[i] - closes[i - 1];
+    if (change > 0) gains += change; else losses += Math.abs(change);
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  result[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+  for (let i = period + 1; i < closes.length; i++) {
+    const change = closes[i] - closes[i - 1];
+    if (change > 0) {
+      avgGain = (avgGain * (period - 1) + change) / period;
+      avgLoss = (avgLoss * (period - 1)) / period;
+    } else {
+      avgGain = (avgGain * (period - 1)) / period;
+      avgLoss = (avgLoss * (period - 1) + Math.abs(change)) / period;
+    }
+    result.push(avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss)));
+  }
+  return result;
+}
+
+/**
+ * v10.7.3: Detect double bottom or double top on RSI + price.
+ * 
+ * Double Bottom (bullish): Two RSI troughs at similar levels in oversold territory,
+ * with price making equal or lower lows. Shows selling exhaustion → reversal likely.
+ * 
+ * Double Top (bearish): Two RSI peaks at similar levels in overbought territory,
+ * with price making equal or higher highs. Shows buying exhaustion → reversal likely.
+ * 
+ * @param closes - 5m close prices (100 bars)
+ * @param rsiSeries - pre-calculated RSI series aligned with closes
+ * @param currentPrice - live price
+ * @param lookback - how many bars back to search (default 30 = 2.5h on 5m)
+ * @returns { hasDoubleBottom, hasDoubleTop, bottomRSI, topRSI, details }
+ */
+function detectDoubleBottomTop(
+  closes: number[],
+  rsiSeries: (number | null)[],
+  currentPrice: number,
+  lookback: number = 30,
+): { hasDoubleBottom: boolean; hasDoubleTop: boolean; bottomRSI: number; topRSI: number; details: string } {
+  const noResult = { hasDoubleBottom: false, hasDoubleTop: false, bottomRSI: 0, topRSI: 100, details: "" };
+  if (rsiSeries.length < lookback || closes.length < lookback) return noResult;
+
+  const len = rsiSeries.length;
+  const startIdx = len - lookback;
+
+  // --- Find RSI troughs (local minima) in the lookback window ---
+  const troughs: { idx: number; rsi: number; price: number }[] = [];
+  const peaks: { idx: number; rsi: number; price: number }[] = [];
+
+  for (let i = startIdx + 1; i < len - 1; i++) {
+    const prev = rsiSeries[i - 1];
+    const curr = rsiSeries[i];
+    const next = rsiSeries[i + 1];
+    if (prev === null || curr === null || next === null) continue;
+
+    // Trough: RSI goes down then up, and RSI is in oversold-ish territory (< 40)
+    if (curr < prev && curr < next && curr < 40) {
+      troughs.push({ idx: i, rsi: curr, price: closes[i] });
+    }
+    // Peak: RSI goes up then down, and RSI is in overbought-ish territory (> 60)
+    if (curr > prev && curr > next && curr > 60) {
+      peaks.push({ idx: i, rsi: curr, price: closes[i] });
+    }
+  }
+
+  let hasDoubleBottom = false;
+  let bottomRSI = 0;
+  let bottomDetails = "";
+
+  // --- Double Bottom: two troughs with similar RSI, separated by at least 5 bars ---
+  // The second trough should be the more recent one (closer to current bar)
+  // RSI tolerance: within 5 points. Price: second low must be within 0.5% of first (or lower)
+  for (let a = 0; a < troughs.length - 1; a++) {
+    for (let b = a + 1; b < troughs.length; b++) {
+      const t1 = troughs[a], t2 = troughs[b];
+      const barGap = t2.idx - t1.idx;
+      if (barGap < 5) continue; // need separation (25 min on 5m)
+      if (barGap > 25) continue; // not too far apart
+
+      const rsiDiff = Math.abs(t1.rsi - t2.rsi);
+      // RSI tolerance: scale with how deep the RSI is
+      // Below 30: allow 5pt tolerance. 30-40: allow 3pt.
+      const avgRSI = (t1.rsi + t2.rsi) / 2;
+      const rsiTolerance = avgRSI < 30 ? 5 : 3;
+      if (rsiDiff > rsiTolerance) continue;
+
+      // Price: second low within 0.5% of first (roughly equal or lower)
+      const priceDiff = Math.abs(t2.price - t1.price) / t1.price;
+      if (priceDiff > 0.005) continue;
+
+      // Between the two troughs, RSI must have bounced up at least 8 points (real valley between them)
+      let maxBetween = 0;
+      for (let k = t1.idx + 1; k < t2.idx; k++) {
+        if (rsiSeries[k] !== null && rsiSeries[k]! > maxBetween) maxBetween = rsiSeries[k]!;
+      }
+      if (maxBetween - Math.min(t1.rsi, t2.rsi) < 8) continue;
+
+      hasDoubleBottom = true;
+      bottomRSI = Math.min(t1.rsi, t2.rsi);
+      bottomDetails = `DB: RSI ${t1.rsi.toFixed(1)}→${maxBetween.toFixed(0)}→${t2.rsi.toFixed(1)} | Price $${t1.price.toFixed(0)}/$${t2.price.toFixed(0)} | gap:${barGap}bars`;
+      break;
+    }
+    if (hasDoubleBottom) break;
+  }
+
+  let hasDoubleTop = false;
+  let topRSI = 100;
+  let topDetails = "";
+
+  // --- Double Top: two peaks with similar RSI, separated by at least 5 bars ---
+  for (let a = 0; a < peaks.length - 1; a++) {
+    for (let b = a + 1; b < peaks.length; b++) {
+      const p1 = peaks[a], p2 = peaks[b];
+      const barGap = p2.idx - p1.idx;
+      if (barGap < 5) continue;
+      if (barGap > 25) continue;
+
+      const rsiDiff = Math.abs(p1.rsi - p2.rsi);
+      const avgRSI = (p1.rsi + p2.rsi) / 2;
+      const rsiTolerance = avgRSI > 75 ? 5 : 3;
+      if (rsiDiff > rsiTolerance) continue;
+
+      const priceDiff = Math.abs(p2.price - p1.price) / p1.price;
+      if (priceDiff > 0.005) continue;
+
+      // Between the two peaks, RSI must have dipped at least 8 points
+      let minBetween = 100;
+      for (let k = p1.idx + 1; k < p2.idx; k++) {
+        if (rsiSeries[k] !== null && rsiSeries[k]! < minBetween) minBetween = rsiSeries[k]!;
+      }
+      if (Math.max(p1.rsi, p2.rsi) - minBetween < 8) continue;
+
+      hasDoubleTop = true;
+      topRSI = Math.max(p1.rsi, p2.rsi);
+      topDetails = `DT: RSI ${p1.rsi.toFixed(1)}→${minBetween.toFixed(0)}→${p2.rsi.toFixed(1)} | Price $${p1.price.toFixed(0)}/$${p2.price.toFixed(0)} | gap:${barGap}bars`;
+      break;
+    }
+    if (hasDoubleTop) break;
+  }
+
+  return {
+    hasDoubleBottom,
+    hasDoubleTop,
+    bottomRSI,
+    topRSI,
+    details: [bottomDetails, topDetails].filter(Boolean).join(" | "),
+  };
 }
 
 function calculateEMA(closes: number[], period: number): number[] {
@@ -1863,28 +2024,43 @@ class TradingEngine {
         }
 
         // --- v10.7: INSTANT RSI CROSS DETECTION ---
-        // Enter the MOMENT RSI crosses below 25 (long) or above 85 (short)
+        // Enter the MOMENT RSI crosses below threshold (long) or above threshold (short)
         // Track cross state per coin+tf to detect the first cross, not stale readings
         const REVERSAL_LONG_RSI = 25;
         const REVERSAL_SHORT_RSI = 85;
+        // v10.7.3: Double bottom/top loosens thresholds
+        const REVERSAL_LONG_RSI_LOOSE = 30;  // with double bottom confirmation
+        const REVERSAL_SHORT_RSI_LOOSE = 80; // with double top confirmation
         const RSI_ENTRY_TOLERANCE = 0.0005; // 0.05% price tolerance for entry
+
+        // v10.7.3: Detect double bottom/top on 5m RSI + price
+        const rsi5mSeries = calculateRSISeries([...c5m, price]);
+        const dbdt = detectDoubleBottomTop([...c5m, price], rsi5mSeries, price, 30);
+        if (dbdt.hasDoubleBottom || dbdt.hasDoubleTop) {
+          log(`[DOUBLE_PATTERN] ${asset.coin} ${dbdt.details}`, "engine");
+        }
 
         for (const [tfLabel, rsiVal] of [["5m", rsi5m], ["15m", rsi15m]] as [string, number][]) {
           const longKey = `${asset.coin}_${tfLabel}_long`;
           const shortKey = `${asset.coin}_${tfLabel}_short`;
 
-          // --- LONG: RSI just crossed below threshold ---
-          if (rsiVal <= REVERSAL_LONG_RSI) {
+          // --- LONG: RSI crossed below threshold ---
+          // v10.7.3: Use loosened threshold (30) if double bottom detected, else strict (25)
+          const effectiveLongThreshold = dbdt.hasDoubleBottom ? REVERSAL_LONG_RSI_LOOSE : REVERSAL_LONG_RSI;
+          if (rsiVal <= effectiveLongThreshold) {
             if (!this.rsiCrossState.has(longKey)) {
               // First cross! Record the price and signal immediately
               this.rsiCrossState.set(longKey, { price, timestamp: Date.now(), rsi: rsiVal });
               // Check S/R (soft — boosts confidence but not required)
               const srData = this.latestSRLevels[asset.coin];
               const hasSR = srData && srData.nearestSupport && srData.supportDistance < 0.3;
+              const hasDB = dbdt.hasDoubleBottom;
               // v10.7: Fixed SL 0.5%, TP1 0.3%, TP2 1%
               const longSL = price * (1 - 0.005);
               const longTP1 = price * (1 + 0.003);
               const longTP2 = price * (1 + 0.01);
+              // Confidence: base 5, +1 for S/R, +1 for double bottom
+              const conf = 5 + (hasSR ? 1 : 0) + (hasDB ? 1 : 0);
               enhancedSignals.push({
                 asset, price, volume24h, change24h, fundingRate: funding, openInterest,
                 rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
@@ -1894,29 +2070,36 @@ class TradingEngine {
                   bollingerConfirm: true, volumeExhaustion: false,
                   adxValue: 0, adxRegime: "" as any,
                   allRSIs: [{ tf: tfLabel, rsi: rsiVal }],
-                  confidenceScore: hasSR ? 6 : 5,
+                  confidenceScore: conf,
                   srConfirm: !!hasSR, srBlock: false,
                   srAnalysis: srData || { levels5m: [], levels15m: [], levels1h: [], nearestSupport: null, nearestResistance: null, supportDistance: 99, resistanceDistance: 99 },
                   suggestedSL: longSL, suggestedTP1: longTP1, suggestedTP2: longTP2,
                 },
               });
-              log(`[RSI_CROSS] ${asset.coin} ${tfLabel} RSI=${rsiVal.toFixed(1)} ≤ ${REVERSAL_LONG_RSI} → LONG signal @ $${price} ${hasSR ? '(S/R confirmed)' : ''}`, "engine");
+              const boosts = [hasSR ? 'S/R' : '', hasDB ? `DB(${dbdt.details})` : ''].filter(Boolean).join('+');
+              log(`[RSI_CROSS] ${asset.coin} ${tfLabel} RSI=${rsiVal.toFixed(1)} ≤ ${effectiveLongThreshold}${hasDB ? '(loosened)' : ''} → LONG signal @ $${price} ${boosts ? `[${boosts}]` : ''}`, "engine");
             }
-          } else {
-            // RSI recovered above threshold — reset cross state
+          } else if (rsiVal > effectiveLongThreshold + 5) {
+            // RSI recovered well above threshold — reset cross state
+            // +5 buffer prevents rapid on/off toggling near the threshold
             this.rsiCrossState.delete(longKey);
           }
 
-          // --- SHORT: RSI just crossed above threshold ---
-          if (rsiVal >= REVERSAL_SHORT_RSI) {
+          // --- SHORT: RSI crossed above threshold ---
+          // v10.7.3: Use loosened threshold (80) if double top detected, else strict (85)
+          const effectiveShortThreshold = dbdt.hasDoubleTop ? REVERSAL_SHORT_RSI_LOOSE : REVERSAL_SHORT_RSI;
+          if (rsiVal >= effectiveShortThreshold) {
             if (!this.rsiCrossState.has(shortKey)) {
               this.rsiCrossState.set(shortKey, { price, timestamp: Date.now(), rsi: rsiVal });
               const srData = this.latestSRLevels[asset.coin];
               const hasSR = srData && srData.nearestResistance && srData.resistanceDistance < 0.3;
+              const hasDT = dbdt.hasDoubleTop;
               // v10.7: Fixed SL 0.5%, TP1 0.3%, TP2 1%
               const shortSL = price * (1 + 0.005);
               const shortTP1 = price * (1 - 0.003);
               const shortTP2 = price * (1 - 0.01);
+              // Confidence: base 5, +1 for S/R, +1 for double top
+              const conf = 5 + (hasSR ? 1 : 0) + (hasDT ? 1 : 0);
               enhancedSignals.push({
                 asset, price, volume24h, change24h, fundingRate: funding, openInterest,
                 rsi1h, rsi4h, rsi1d, ema10, ema21, ema50, rsi1m, rsi5m, rsi15m,
@@ -1926,15 +2109,17 @@ class TradingEngine {
                   bollingerConfirm: true, volumeExhaustion: false,
                   adxValue: 0, adxRegime: "" as any,
                   allRSIs: [{ tf: tfLabel, rsi: rsiVal }],
-                  confidenceScore: hasSR ? 6 : 5,
+                  confidenceScore: conf,
                   srConfirm: !!hasSR, srBlock: false,
                   srAnalysis: srData || { levels5m: [], levels15m: [], levels1h: [], nearestSupport: null, nearestResistance: null, supportDistance: 99, resistanceDistance: 99 },
                   suggestedSL: shortSL, suggestedTP1: shortTP1, suggestedTP2: shortTP2,
                 },
               });
-              log(`[RSI_CROSS] ${asset.coin} ${tfLabel} RSI=${rsiVal.toFixed(1)} ≥ ${REVERSAL_SHORT_RSI} → SHORT signal @ $${price} ${hasSR ? '(S/R confirmed)' : ''}`, "engine");
+              const boosts = [hasSR ? 'S/R' : '', hasDT ? `DT(${dbdt.details})` : ''].filter(Boolean).join('+');
+              log(`[RSI_CROSS] ${asset.coin} ${tfLabel} RSI=${rsiVal.toFixed(1)} ≥ ${effectiveShortThreshold}${hasDT ? '(loosened)' : ''} → SHORT signal @ $${price} ${boosts ? `[${boosts}]` : ''}`, "engine");
             }
-          } else {
+          } else if (rsiVal < effectiveShortThreshold - 5) {
+            // RSI recovered well below threshold — reset cross state
             this.rsiCrossState.delete(shortKey);
           }
         }
