@@ -1997,20 +1997,42 @@ class TradingEngine {
         // Store S/R for dashboard access
         this.latestSRLevels[asset.coin] = srAnalysis;
 
-        // Calculate confluence for dashboard display only (upsertMarketScan)
-        const confluence = calculateConfluence({
-          price, rsi1m, rsi5m, rsi15m, rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
-          fundingRate: funding, change24h, volume24h, config, category: asset.category,
-        });
+        // Determine actual strategy signal for dashboard (matches real entry logic)
+        // LONG: 5m or 15m RSI ≤ 25 (or ≤ 30 with double bottom)
+        // SHORT: 5m or 15m RSI ≥ 85 (or ≥ 80 with double top)
+        // We compute dbdt below, so for scan display use strict thresholds here;
+        // the actual trade entry logic (further down) handles loosened thresholds too
+        let scanSignal: "neutral" | "oversold_long" | "overbought_short" = "neutral";
+        let scanConfScore = 0;
+        let scanDetails = "";
+        const SCAN_LONG = 25;
+        const SCAN_SHORT = 85;
+        const triggerRSIs: string[] = [];
+        for (const [tf, val] of [["5m", rsi5m], ["15m", rsi15m]] as [string, number][]) {
+          if (val <= SCAN_LONG) { scanSignal = "oversold_long"; triggerRSIs.push(`${tf}:${val.toFixed(1)}`); }
+          if (val >= SCAN_SHORT) { scanSignal = "overbought_short"; triggerRSIs.push(`${tf}:${val.toFixed(1)}`); }
+        }
+        if (scanSignal !== "neutral") {
+          scanConfScore = 5; // base
+          scanDetails = `RSI ${scanSignal === "oversold_long" ? "≤25" : "≥85"} on ${triggerRSIs.join(", ")}`;
+          if ((scanSignal === "oversold_long" && rsi4h < 45) || (scanSignal === "overbought_short" && rsi4h > 55)) { scanConfScore++; scanDetails += ` | 4h confirms: ${rsi4h.toFixed(1)}`; }
+          if ((scanSignal === "oversold_long" && rsi1d < 50) || (scanSignal === "overbought_short" && rsi1d > 50)) { scanConfScore++; scanDetails += ` | 1d confirms: ${rsi1d.toFixed(1)}`; }
+        } else {
+          // Show proximity to thresholds for monitoring
+          const closest5m = Math.min(Math.abs(rsi5m - SCAN_LONG), Math.abs(rsi5m - SCAN_SHORT));
+          const closest15m = Math.min(Math.abs(rsi15m - SCAN_LONG), Math.abs(rsi15m - SCAN_SHORT));
+          const minDist = Math.min(closest5m, closest15m);
+          scanDetails = minDist < 10 ? `Nearest trigger: ${minDist.toFixed(1)} pts away` : "Neutral — RSI in range";
+        }
 
         await storage.upsertMarketScan({
-          coin: asset.coin, price, rsi: rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
+          coin: asset.coin, price, rsi5m, rsi15m, rsi: rsi1h, rsi4h, rsi1d, ema10, ema21, ema50,
           volume24h, change24h,
-          signal: confluence.signal === "neutral" ? "neutral" : confluence.signal === "long" ? "oversold_long" : "overbought_short",
+          signal: scanSignal,
           fundingRate: funding, openInterest,
-          confluenceScore: confluence.score,
-          confluenceDetails: confluence.details.join(" | "),
-          riskRewardRatio: confluence.riskRewardRatio,
+          confluenceScore: scanConfScore,
+          confluenceDetails: scanDetails,
+          riskRewardRatio: scanSignal !== "neutral" ? 1.4 : 0,
           timestamp: new Date().toISOString(),
         });
 

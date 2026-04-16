@@ -191,6 +191,8 @@ export async function initDatabase() {
       "ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'confluence'",
       "ALTER TABLE trade_decisions ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'confluence'",
       "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_equity DOUBLE PRECISION",
+      "ALTER TABLE market_scans ADD COLUMN IF NOT EXISTS rsi_5m DOUBLE PRECISION",
+      "ALTER TABLE market_scans ADD COLUMN IF NOT EXISTS rsi_15m DOUBLE PRECISION",
     ];
     for (const q of alterQueries) {
       try { await client.query(q); } catch (e) { /* column may already exist */ }

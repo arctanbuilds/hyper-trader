@@ -109,6 +109,8 @@ export const marketScans = pgTable("market_scans", {
   coin: text("coin").notNull(),
   price: doublePrecision("price").notNull(),
   // Multi-timeframe RSI
+  rsi5m: doublePrecision("rsi_5m"),
+  rsi15m: doublePrecision("rsi_15m"),
   rsi: doublePrecision("rsi"),
   rsi4h: doublePrecision("rsi_4h"),
   rsi1d: doublePrecision("rsi_1d"),
