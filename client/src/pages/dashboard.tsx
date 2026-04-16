@@ -12,7 +12,7 @@ import { cn } from "@/lib/utils";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from "recharts";
-import { TrendlineChart } from "@/components/TrendlineChart";
+// import { TrendlineChart } from "@/components/TrendlineChart";
 
 // Display-friendly asset names
 const ASSET_DISPLAY: Record<string, string> = {
@@ -385,19 +385,7 @@ export default function Dashboard() {
           </CardContent>
         </Card>
 
-        {/* Trendline Scanner */}
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium flex items-center gap-2">
-              <Activity className="w-4 h-4" />
-              Trendline Scanner
-              <span className="text-[10px] text-muted-foreground font-normal">5m candles • live detection</span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <TrendlineChart />
-          </CardContent>
-        </Card>
+
 
         {/* Open Positions */}
         <Card>
