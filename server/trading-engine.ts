@@ -52,9 +52,10 @@ interface AssetConfig {
 
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",  displayName: "Bitcoin",  dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
-  // ETH & SOL disabled — BTC only for higher quality trades (v10.5)
-  // { coin: "ETH",  displayName: "Ethereum", dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
-  // { coin: "SOL",  displayName: "Solana",   dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "ETH",  displayName: "Ethereum", dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
+  { coin: "SOL",  displayName: "Solana",   dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "XRP",  displayName: "XRP",      dex: "", maxLeverage: 20, szDecimals: 0, category: "crypto", minNotional: 10 },
+  { coin: "SPX",  displayName: "S&P 500",  dex: "", maxLeverage: 5,  szDecimals: 1, category: "index",  minNotional: 10 },
 ];
 
 // ============ STRATEGY TYPES ============
