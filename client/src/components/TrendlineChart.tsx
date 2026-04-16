@@ -296,7 +296,7 @@ export function TrendlineChart() {
 
       {data && data.trendlines.length === 0 && !isLoading && (
         <div className="text-center py-4 text-sm text-muted-foreground">
-          No qualifying trendlines detected (need 20+ candles, 3+ touches)
+          No qualifying trendlines detected (need 20+ candles, 2+ touches)
         </div>
       )}
     </div>
