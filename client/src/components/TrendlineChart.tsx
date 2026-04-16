@@ -1,7 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
-import { createChart, IChartApi, ISeriesApi, CandlestickData, LineData, ColorType } from "lightweight-charts";
+import {
+  createChart,
+  CandlestickSeries,
+  LineSeries,
+  createSeriesMarkers,
+  ColorType,
+  type IChartApi,
+  type ISeriesApi,
+  type CandlestickData,
+  type LineData,
+  type SeriesType,
+  type ISeriesMarkersPluginApi,
+  type Time,
+} from "lightweight-charts";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { RefreshCw, TrendingUp, TrendingDown, Ban, Zap } from "lucide-react";
@@ -35,13 +48,16 @@ export function TrendlineChart() {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const tlSeriesRefs = useRef<ISeriesApi<"Line">[]>([]);
-  const markerSeriesRefs = useRef<ISeriesApi<"Line">[]>([]);
+  const tlSeriesRefs = useRef<ISeriesApi<SeriesType>[]>([]);
+  const markerPluginRefs = useRef<ISeriesMarkersPluginApi<Time>[]>([]);
 
   const { data, isLoading, refetch, isFetching } = useQuery<APIResponse>({
     queryKey: ["/api/trendlines"],
-    queryFn: () => apiRequest("GET", "/api/trendlines"),
-    refetchInterval: 30000, // refresh every 30s
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/trendlines");
+      return res.json() as Promise<APIResponse>;
+    },
+    refetchInterval: 30000,
     staleTime: 15000,
   });
 
@@ -77,7 +93,7 @@ export function TrendlineChart() {
 
     chartRef.current = chart;
 
-    const candleSeries = chart.addCandlestickSeries({
+    const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: "#22c55e",
       downColor: "#ef4444",
       borderUpColor: "#22c55e",
@@ -109,19 +125,21 @@ export function TrendlineChart() {
 
     const chart = chartRef.current;
 
+    // Remove old marker plugins
+    for (const mp of markerPluginRefs.current) {
+      try { mp.detach(); } catch {}
+    }
+    markerPluginRefs.current = [];
+
     // Remove old TL series
     for (const s of tlSeriesRefs.current) {
       try { chart.removeSeries(s); } catch {}
     }
-    for (const s of markerSeriesRefs.current) {
-      try { chart.removeSeries(s); } catch {}
-    }
     tlSeriesRefs.current = [];
-    markerSeriesRefs.current = [];
 
     // Set candle data
     if (data.candles.length > 0) {
-      const candleData: CandlestickData[] = data.candles.map(c => ({
+      const candleData: CandlestickData[] = data.candles.map((c: any) => ({
         time: c.time as any,
         open: c.open,
         high: c.high,
@@ -138,7 +156,7 @@ export function TrendlineChart() {
       if (tl.blacklisted) color = "#6b7280"; // grey for blacklisted
       if (tl.broken) color = tl.type === "descending" ? "#06b6d480" : "#f9731680"; // fade if broken
 
-      const lineSeries = chart.addLineSeries({
+      const lineSeries = chart.addSeries(LineSeries, {
         color,
         lineWidth: tl.blacklisted ? 1 : 2,
         lineStyle: tl.blacklisted ? 2 : 0, // dashed if blacklisted
@@ -155,9 +173,9 @@ export function TrendlineChart() {
       lineSeries.setData(lineData);
       tlSeriesRefs.current.push(lineSeries);
 
-      // Draw touch point markers as tiny dots using line series with markers
+      // Draw touch point markers using createSeriesMarkers (v5 API)
       if (tl.touchPoints.length > 0) {
-        const markerSeries = chart.addLineSeries({
+        const markerSeries = chart.addSeries(LineSeries, {
           color: "transparent",
           lineWidth: 0,
           pointMarkersVisible: false,
@@ -166,8 +184,13 @@ export function TrendlineChart() {
           priceLineVisible: false,
         });
 
-        // Use series markers for touch points
-        const markers = tl.touchPoints.map(tp => ({
+        const markerData: LineData[] = tl.touchPoints.map((tp: any) => ({
+          time: tp.time as any,
+          value: tp.price,
+        }));
+        markerSeries.setData(markerData);
+
+        const markers = tl.touchPoints.map((tp: any) => ({
           time: tp.time as any,
           position: tl.type === "descending" ? "aboveBar" as const : "belowBar" as const,
           color: tl.blacklisted ? "#6b7280" : (tl.type === "descending" ? "#06b6d4" : "#f97316"),
@@ -175,19 +198,14 @@ export function TrendlineChart() {
           size: 1,
         }));
 
-        // Set minimal data to place markers
-        const markerData: LineData[] = tl.touchPoints.map(tp => ({
-          time: tp.time as any,
-          value: tp.price,
-        }));
-        markerSeries.setData(markerData);
-        markerSeries.setMarkers(markers);
-        markerSeriesRefs.current.push(markerSeries);
+        const markerPlugin = createSeriesMarkers(markerSeries, markers);
+        markerPluginRefs.current.push(markerPlugin);
+        tlSeriesRefs.current.push(markerSeries);
       }
 
       // Draw breakout marker
       if (tl.broken && tl.breakoutTime && tl.breakoutPrice) {
-        const brkSeries = chart.addLineSeries({
+        const brkSeries = chart.addSeries(LineSeries, {
           color: "transparent",
           lineWidth: 0,
           pointMarkersVisible: false,
@@ -197,7 +215,8 @@ export function TrendlineChart() {
         });
 
         brkSeries.setData([{ time: tl.breakoutTime as any, value: tl.breakoutPrice }]);
-        brkSeries.setMarkers([{
+
+        const brkPlugin = createSeriesMarkers(brkSeries, [{
           time: tl.breakoutTime as any,
           position: tl.type === "descending" ? "aboveBar" as const : "belowBar" as const,
           color: "#facc15", // yellow for breakout
@@ -205,7 +224,8 @@ export function TrendlineChart() {
           size: 2,
           text: "BRK",
         }]);
-        markerSeriesRefs.current.push(brkSeries);
+        markerPluginRefs.current.push(brkPlugin);
+        tlSeriesRefs.current.push(brkSeries);
       }
     }
 
