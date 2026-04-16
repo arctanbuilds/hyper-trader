@@ -39,6 +39,7 @@ export interface IStorage {
   upsertMarketScan(scan: InsertMarketScan): Promise<MarketScan>;
   getLatestScans(): Promise<MarketScan[]>;
   getScansWithSignal(): Promise<MarketScan[]>;
+  deleteScansNotIn(coins: string[]): Promise<void>;
   
   // Trade Decisions (Learning Memory)
   createDecision(decision: InsertTradeDecision): Promise<TradeDecision>;
@@ -178,6 +179,15 @@ export class DatabaseStorage implements IStorage {
   async getScansWithSignal(): Promise<MarketScan[]> {
     const all = await db.select().from(marketScans);
     return all.filter(s => s.signal && s.signal !== "neutral");
+  }
+
+  async deleteScansNotIn(coins: string[]): Promise<void> {
+    const all = await db.select().from(marketScans);
+    for (const scan of all) {
+      if (!coins.includes(scan.coin)) {
+        await db.delete(marketScans).where(eq(marketScans.id, scan.id));
+      }
+    }
   }
 
   // ============ TRADE DECISIONS ============

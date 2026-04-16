@@ -1766,6 +1766,9 @@ class TradingEngine {
       }
     }
 
+    // Clean stale scan rows for coins no longer in ALLOWED_ASSETS
+    await storage.deleteScansNotIn(ALLOWED_ASSETS.map(a => a.coin));
+
     await storage.createLog({
       type: "system",
       message: `Engine v7 started | RSI-ONLY + BB + VOLUME + ADX | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights | SL orders: ON`,
