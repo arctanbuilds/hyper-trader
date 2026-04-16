@@ -595,6 +595,7 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
 
   const trendlines: Trendline[] = [];
   const tolerancePct = 0.0015; // 0.15% tolerance for "touching" the trendline (tighter = cleaner lines)
+  const MIN_PRICE_RANGE_PCT = 0.003; // v10.6.5: TL must span at least 0.3% in price — filters out noise micro-TLs
 
   // Build DESCENDING trendlines from swing highs (lower highs)
   for (let a = 0; a < cleanHighs.length - 1; a++) {
@@ -602,6 +603,7 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
       const p1 = cleanHighs[a], p2 = cleanHighs[b];
       if (p2.price >= p1.price) continue; // must be descending
       if (p2.idx - p1.idx < 20) continue;  // v10.6: minimum 20 candles — real trendlines only
+      if (Math.abs(p2.price - p1.price) / p1.price < MIN_PRICE_RANGE_PCT) continue; // skip micro TLs
 
       const slope = (p2.price - p1.price) / (p2.idx - p1.idx);
 
@@ -643,6 +645,7 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
       const p1 = cleanLows[a], p2 = cleanLows[b];
       if (p2.price <= p1.price) continue; // must be ascending
       if (p2.idx - p1.idx < 20) continue;  // v10.6: minimum 20 candles — real trendlines only
+      if (Math.abs(p2.price - p1.price) / p1.price < MIN_PRICE_RANGE_PCT) continue; // skip micro TLs
 
       const slope = (p2.price - p1.price) / (p2.idx - p1.idx);
       let touches = 2;
