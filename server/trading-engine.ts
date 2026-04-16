@@ -595,7 +595,7 @@ function detectTrendlines(candles: OHLCVCandle[], pivotWindow: number = 3): Tren
 
   const trendlines: Trendline[] = [];
   const tolerancePct = 0.0015; // 0.15% tolerance for "touching" the trendline (tighter = cleaner lines)
-  const MIN_PRICE_RANGE_PCT = 0.003; // v10.6.5: TL must span at least 0.3% in price — filters out noise micro-TLs
+  const MIN_PRICE_RANGE_PCT = 0.008; // v10.6.6: TL must span at least 0.8% in price — only real structural TLs
 
   // Build DESCENDING trendlines from swing highs (lower highs)
   for (let a = 0; a < cleanHighs.length - 1; a++) {
