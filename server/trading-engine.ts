@@ -2989,6 +2989,84 @@ class TradingEngine {
       ),
     };
   }
+  // v10.6.1: Expose detected trendlines + candle data for dashboard visualization
+  async getTrendlineData(coin: string = "BTC") {
+    try {
+      const candles5m = await fetchCandlesOHLCV(coin, "5m", 200);
+      if (candles5m.length < 30) return { candles: [], trendlines: [], breakouts: [] };
+
+      const trendlines = detectTrendlines(candles5m, 3);
+      const price = candles5m[candles5m.length - 1]?.close || 0;
+
+      // For each TL, compute touch points and breakout info
+      const tlData = trendlines.map(tl => {
+        // Find touch points — swing points that are near the TL
+        const touchPoints: { idx: number; price: number; time: number }[] = [];
+        const tolerancePct = 0.0015;
+        for (let i = tl.startIdx; i <= tl.endIdx; i++) {
+          const tlVal = trendlineAt(tl, i);
+          if (tl.type === "descending") {
+            if (Math.abs(candles5m[i].high - tlVal) / tlVal <= tolerancePct) {
+              touchPoints.push({ idx: i, price: candles5m[i].high, time: candles5m[i].time });
+            }
+          } else {
+            if (Math.abs(candles5m[i].low - tlVal) / tlVal <= tolerancePct) {
+              touchPoints.push({ idx: i, price: candles5m[i].low, time: candles5m[i].time });
+            }
+          }
+        }
+
+        // TL line coordinates (start and projected end)
+        const startTime = candles5m[tl.startIdx]?.time || 0;
+        const endIdx = Math.min(tl.endIdx + 30, candles5m.length - 1); // extend 30 bars past end
+        const endTime = candles5m[endIdx]?.time || 0;
+        const startPriceVal = trendlineAt(tl, tl.startIdx);
+        const endPriceVal = trendlineAt(tl, endIdx);
+
+        // Check breakout
+        let breakoutIdx = -1;
+        for (let i = tl.endIdx + 1; i < candles5m.length; i++) {
+          const tlv = trendlineAt(tl, i);
+          if (tl.type === "descending" && candles5m[i].close > tlv * 1.001) { breakoutIdx = i; break; }
+          if (tl.type === "ascending" && candles5m[i].close < tlv * 0.999) { breakoutIdx = i; break; }
+        }
+
+        const isBlacklisted = this.isTLBlacklisted({ type: tl.type, startPrice: tl.startPrice, slope: tl.slope });
+
+        return {
+          type: tl.type,
+          touches: tl.touches,
+          strength: tl.strength,
+          span: tl.endIdx - tl.startIdx,
+          startTime, endTime,
+          startPrice: startPriceVal,
+          endPrice: endPriceVal,
+          touchPoints: touchPoints.slice(0, 10), // limit
+          broken: breakoutIdx !== -1,
+          breakoutTime: breakoutIdx >= 0 ? candles5m[breakoutIdx]?.time : null,
+          breakoutPrice: breakoutIdx >= 0 ? candles5m[breakoutIdx]?.close : null,
+          currentTLValue: trendlineAt(tl, candles5m.length - 1),
+          distFromPrice: price > 0 ? ((price - trendlineAt(tl, candles5m.length - 1)) / price * 100) : 0,
+          blacklisted: isBlacklisted,
+        };
+      });
+
+      return {
+        candles: candles5m.map(c => ({
+          time: c.time,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+        })),
+        trendlines: tlData,
+        currentPrice: price,
+      };
+    } catch (e) {
+      log(`getTrendlineData error: ${e}`, "engine");
+      return { candles: [], trendlines: [], currentPrice: 0 };
+    }
+  }
 }
 
 export const tradingEngine = new TradingEngine();

@@ -329,5 +329,16 @@ export async function registerRoutes(
     }
   });
 
+  // ============ TRENDLINE VISUALIZATION ============
+  app.get("/api/trendlines", async (req, res) => {
+    try {
+      const coin = (req.query.coin as string) || "BTC";
+      const data = await tradingEngine.getTrendlineData(coin);
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   return httpServer;
 }
