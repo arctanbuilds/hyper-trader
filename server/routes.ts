@@ -163,6 +163,53 @@ export async function registerRoutes(
     }
   });
 
+  // ============ SYNC POSITIONS FROM HL ============
+  // Creates DB entries for HL positions that the bot doesn't know about
+  app.post("/api/trades/sync-from-hl", async (_req, res) => {
+    try {
+      const config = await storage.getConfig();
+      if (!config?.apiSecret || !config?.walletAddress) return res.status(400).json({ error: "No API config" });
+      const { createExecutor } = await import("./hyperliquid-executor");
+      const executor = createExecutor(config.apiSecret, config.walletAddress);
+      const hlPositions = await executor.getPositions();
+      const openTrades = await storage.getOpenTrades();
+      const openCoins = new Set(openTrades.map(t => t.coin));
+      const synced: any[] = [];
+      for (const p of hlPositions) {
+        const pos = p.position;
+        const sz = Math.abs(parseFloat(pos?.szi || "0"));
+        if (sz <= 0) continue;
+        const coin = pos.coin;
+        if (openCoins.has(coin)) continue; // already tracked
+        const side = parseFloat(pos.szi) > 0 ? "long" : "short";
+        const entryPrice = parseFloat(pos.entryPx || "0");
+        const leverage = parseInt(pos.leverage?.value || "1");
+        const equity = tradingEngine.getLastKnownEquity();
+        const trade = await storage.createTrade({
+          coin, side, entryPrice, size: 80, leverage,
+          entryEquity: equity,
+          rsiAtEntry: 0, rsi4h: 0, rsi1d: 0,
+          ema10: 0, ema21: 0, ema50: 0,
+          stopLoss: side === "long" ? entryPrice * 0.995 : entryPrice * 1.005,
+          takeProfit1: side === "long" ? entryPrice * 1.003 : entryPrice * 0.997,
+          takeProfit2: side === "long" ? entryPrice * 1.01 : entryPrice * 0.99,
+          tp1Hit: false,
+          confluenceScore: 0, confluenceDetails: "Synced from HL position",
+          riskRewardRatio: 0, status: "open",
+          reason: `[SYNC] Imported from HL: ${coin} ${side} ${leverage}x @ $${entryPrice}`,
+          setupType: "bb_rsi_reversion", strategy: "bb_rsi_reversion",
+          openedAt: new Date().toISOString(),
+        });
+        synced.push({ id: trade.id, coin, side, entryPrice, leverage });
+        await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id}`, timestamp: new Date().toISOString() });
+      }
+      broadcast({ type: "status", data: await tradingEngine.getStatus() });
+      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid` });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ============ P&L RESET ============
   app.post("/api/pnl/reset", async (_req, res) => {
     try {

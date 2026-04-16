@@ -2534,6 +2534,13 @@ class TradingEngine {
           if (sz > 0) hlCoinsWithPos.add(p.position.coin);
         }
         for (const trade of openTrades) {
+          // v10.9.2: Grace period — don't sync-close trades opened less than 60s ago
+          // Prevents false sync-close when HL API returns stale data right after order fill
+          const tradeAge = Date.now() - new Date(trade.openedAt || 0).getTime();
+          if (tradeAge < 60_000) {
+            log(`[SYNC] Skipping trade #${trade.id} ${trade.coin} — opened ${(tradeAge/1000).toFixed(0)}s ago (grace period)`, "engine");
+            continue;
+          }
           if (!hlCoinsWithPos.has(trade.coin)) {
             // Bot thinks this trade is open, but no position exists on Hyperliquid
             const closePrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
@@ -3164,6 +3171,10 @@ class TradingEngine {
     });
     log(`P&L baseline reset — new AUM: $${equity.toFixed(2)}`, "engine");
     return { resetEquity: equity, resetTimestamp: this.pnlResetTimestamp };
+  }
+
+  getLastKnownEquity(): number {
+    return this.lastKnownEquity;
   }
 
   async getStatus() {
