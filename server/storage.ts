@@ -2,7 +2,7 @@ import { db, initDatabase } from "./db";
 import { eq, desc, and, gte, isNull, isNotNull } from "drizzle-orm";
 import {
   botConfig, trades, pnlSnapshots, activityLog, marketScans,
-  tradeDecisions, learningInsights, learningReviews,
+  tradeDecisions, learningInsights, learningReviews, aiweeklyResearch,
   type BotConfig, type InsertBotConfig,
   type Trade, type InsertTrade,
   type PnlSnapshot, type InsertPnlSnapshot,
@@ -11,6 +11,7 @@ import {
   type TradeDecision, type InsertTradeDecision,
   type LearningInsight, type InsertLearningInsight,
   type LearningReview, type InsertLearningReview,
+  type AiweeklyResearch, type InsertAiweeklyResearch,
 } from "@shared/schema";
 
 export interface IStorage {
@@ -61,6 +62,12 @@ export interface IStorage {
   createReview(review: InsertLearningReview): Promise<LearningReview>;
   getRecentReviews(limit?: number): Promise<LearningReview[]>;
   getLastReviewTime(): Promise<string | null>;
+
+  // AIWEEKLY
+  createAiweeklyResearch(data: InsertAiweeklyResearch): Promise<AiweeklyResearch>;
+  updateAiweeklyResearch(id: number, data: Partial<InsertAiweeklyResearch>): Promise<AiweeklyResearch | undefined>;
+  getLatestAiweeklyResearch(): Promise<AiweeklyResearch | undefined>;
+  getAiweeklyResearchByCycleId(cycleId: string): Promise<AiweeklyResearch | undefined>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -282,6 +289,28 @@ export class DatabaseStorage implements IStorage {
     const rows = await db.select().from(learningReviews)
       .orderBy(desc(learningReviews.id)).limit(1);
     return rows.length > 0 ? rows[0].timestamp : null;
+  }
+
+  // ============ AIWEEKLY ============
+
+  async createAiweeklyResearch(data: InsertAiweeklyResearch): Promise<AiweeklyResearch> {
+    const [result] = await db.insert(aiweeklyResearch).values(data).returning();
+    return result;
+  }
+
+  async updateAiweeklyResearch(id: number, data: Partial<InsertAiweeklyResearch>): Promise<AiweeklyResearch | undefined> {
+    const [result] = await db.update(aiweeklyResearch).set(data).where(eq(aiweeklyResearch.id, id)).returning();
+    return result;
+  }
+
+  async getLatestAiweeklyResearch(): Promise<AiweeklyResearch | undefined> {
+    const [result] = await db.select().from(aiweeklyResearch).orderBy(desc(aiweeklyResearch.id)).limit(1);
+    return result;
+  }
+
+  async getAiweeklyResearchByCycleId(cycleId: string): Promise<AiweeklyResearch | undefined> {
+    const [result] = await db.select().from(aiweeklyResearch).where(eq(aiweeklyResearch.cycleId, cycleId)).limit(1);
+    return result;
   }
 }
 

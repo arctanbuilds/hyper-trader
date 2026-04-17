@@ -212,7 +212,34 @@ export const learningInsights = pgTable("learning_insights", {
   updatedAt: text("updated_at").notNull(),
 });
 
+// ============ AIWEEKLY RESEARCH CYCLES ============
+export const aiweeklyResearch = pgTable("aiweekly_research", {
+  id: serial("id").primaryKey(),
+  cycleId: text("cycle_id").notNull(), // unique per research run e.g. "2026-04-17T20:00:00Z"
+  status: text("status").notNull().default("pending"), // pending, researching, voting, executing, complete, failed
+  // Raw research from Sonar
+  sonarResearch: text("sonar_research").default(""), // JSON blob of all research
+  // Model votes (JSON: { longs: string[], shorts: string[], commodities: {...} })
+  sonarPicks: text("sonar_picks").default(""),
+  claudePicks: text("claude_picks").default(""),
+  gptPicks: text("gpt_picks").default(""),
+  // Final consensus picks
+  consensusPicks: text("consensus_picks").default(""), // JSON: { longs, shorts, commodities, confidence }
+  // Execution
+  tradesOpened: integer("trades_opened").default(0),
+  tradesClosed: integer("trades_closed").default(0),
+  cyclePnlUsd: doublePrecision("cycle_pnl_usd").default(0),
+  // Timing
+  researchStartedAt: text("research_started_at"),
+  researchCompletedAt: text("research_completed_at"),
+  positionsOpenedAt: text("positions_opened_at"),
+  positionsClosedAt: text("positions_closed_at"),
+  nextCycleAt: text("next_cycle_at"),
+  createdAt: text("created_at").notNull(),
+});
+
 // Insert schemas
+export const insertAiweeklyResearchSchema = createInsertSchema(aiweeklyResearch).omit({ id: true });
 export const insertBotConfigSchema = createInsertSchema(botConfig).omit({ id: true });
 export const insertTradeSchema = createInsertSchema(trades).omit({ id: true });
 export const insertPnlSnapshotSchema = createInsertSchema(pnlSnapshots).omit({ id: true });
@@ -221,6 +248,10 @@ export const insertMarketScanSchema = createInsertSchema(marketScans).omit({ id:
 export const insertTradeDecisionSchema = createInsertSchema(tradeDecisions).omit({ id: true });
 export const insertLearningInsightSchema = createInsertSchema(learningInsights).omit({ id: true });
 export const insertLearningReviewSchema = createInsertSchema(learningReviews).omit({ id: true });
+
+// Types — AIWEEKLY
+export type AiweeklyResearch = typeof aiweeklyResearch.$inferSelect;
+export type InsertAiweeklyResearch = z.infer<typeof insertAiweeklyResearchSchema>;
 
 // Types
 export type BotConfig = typeof botConfig.$inferSelect;

@@ -5,6 +5,7 @@ import { tradingEngine } from "./trading-engine";
 import { getLearningStats, reviewClosedTrades, generateInsights, run24hReview } from "./learning-engine";
 import { insertBotConfigSchema } from "@shared/schema";
 import { WebSocketServer, WebSocket } from "ws";
+import { AIWEEKLY_STOCKS, AIWEEKLY_COMMODITIES } from "./ai-researcher";
 
 export async function registerRoutes(
   httpServer: Server,
@@ -166,6 +167,7 @@ export async function registerRoutes(
     const stratMap: Record<string, StratBucket> = {
       pure_rsi: makeBucket(),
       hstar: makeBucket(),
+      aiweekly: makeBucket(),
     };
 
     // Sort closed trades by closedAt ascending — only trades opened after v13.4 deploy
@@ -178,7 +180,9 @@ export async function registerRoutes(
 
       // Determine strategy bucket
       let strat = t.strategy || "";
-      if (strat === "bb_rsi_reversion" || strat === "confluence" || strat === "extreme_rsi" || strat === "pure_rsi") {
+      if (strat === "aiweekly") {
+        strat = "aiweekly";
+      } else if (strat === "bb_rsi_reversion" || strat === "confluence" || strat === "extreme_rsi" || strat === "pure_rsi") {
         strat = "pure_rsi";
       } else if (strat !== "hstar") {
         strat = "pure_rsi";
@@ -234,8 +238,9 @@ export async function registerRoutes(
 
     // Also count open trades (all open, not just post-v13.4)
     const openTrades = allTrades.filter((t: any) => t.status === "open");
-    const openPureRsi = openTrades.filter((t: any) => (t.strategy || "") !== "hstar").length;
+    const openPureRsi = openTrades.filter((t: any) => (t.strategy || "") !== "hstar" && (t.strategy || "") !== "aiweekly").length;
     const openHstar = openTrades.filter((t: any) => t.strategy === "hstar").length;
+    const openAiweekly = openTrades.filter((t: any) => t.strategy === "aiweekly").length;
 
     // Race runtime
     const raceStartMs = new Date(V134_RACE_START).getTime();
@@ -243,7 +248,7 @@ export async function registerRoutes(
 
     const result = Object.entries(stratMap).map(([name, data]) => ({
       strategy: name,
-      label: name === "hstar" ? "H\u2605\u2605 (2:1 R:R)" : "PURE RSI (Conservative)",
+      label: name === "hstar" ? "H\u2605\u2605 (2:1 R:R)" : name === "aiweekly" ? "AIWEEKLY (3-Model AI)" : "PURE RSI (Conservative)",
       totalTrades: data.trades.length,
       wins: data.wins,
       losses: data.losses,
@@ -258,7 +263,7 @@ export async function registerRoutes(
       profitFactor: data.grossLoss > 0 ? parseFloat((data.grossProfit / data.grossLoss).toFixed(2)) : data.grossProfit > 0 ? 999 : 0,
       bestWinStreak: data.streakBest,
       worstLossStreak: data.streakWorst,
-      openPositions: name === "hstar" ? openHstar : openPureRsi,
+      openPositions: name === "hstar" ? openHstar : name === "aiweekly" ? openAiweekly : openPureRsi,
       cumPnlSeries: data.cumPnlSeries,
     }));
 
@@ -577,6 +582,34 @@ export async function registerRoutes(
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
+  });
+
+  // ============ AIWEEKLY STRATEGY ============
+  app.get("/api/aiweekly/status", async (_req, res) => {
+    const latest = await storage.getLatestAiweeklyResearch();
+    const openTrades = await storage.getOpenTrades();
+    const aiweeklyTrades = openTrades.filter((t: any) => t.strategy === "aiweekly");
+    const allTrades = await storage.getAllTrades(500);
+    const aiweeklyClosed = allTrades.filter((t: any) => t.strategy === "aiweekly" && t.status === "closed");
+
+    const totalPnl = aiweeklyClosed.reduce((s: number, t: any) => s + (t.hlPnlUsd || 0), 0);
+    const wins = aiweeklyClosed.filter((t: any) => (t.hlPnlUsd || 0) > 0).length;
+
+    res.json({
+      hasApiKey: !!process.env.PERPLEXITY_API_KEY,
+      latestCycle: latest || null,
+      openPositions: aiweeklyTrades.length,
+      totalClosed: aiweeklyClosed.length,
+      totalPnlUsd: parseFloat(totalPnl.toFixed(2)),
+      winRate: aiweeklyClosed.length > 0 ? parseFloat(((wins / aiweeklyClosed.length) * 100).toFixed(1)) : 0,
+      stocks: AIWEEKLY_STOCKS.map(s => s.coin),
+      commodities: AIWEEKLY_COMMODITIES.map(c => c.coin),
+    });
+  });
+
+  app.post("/api/aiweekly/trigger", async (_req, res) => {
+    const result = await tradingEngine.triggerAiweeklyResearch();
+    res.json(result);
   });
 
   // ============ AUTO-START ON DEPLOY ============

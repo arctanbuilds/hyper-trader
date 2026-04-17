@@ -1,7 +1,7 @@
 /**
- * HyperTrader — Trading Engine v13.4
+ * HyperTrader — Trading Engine v13.5
  *
- * DUAL STRATEGY ENGINE:
+ * TRIPLE STRATEGY ENGINE:
  *
  * Strategy A — PURE_RSI (conservative):
  *   - LONG when 5m or 15m RSI ≤ 20 | SHORT when ≥ 81
@@ -16,7 +16,12 @@
  *   - Consecutive-loss sizing: half after 2 losses, quarter after 3
  *   - Skips coins already held by PURE_RSI
  *
- * 12 assets, scan every 5 seconds
+ * Strategy C — AIWEEKLY (3-model AI consensus, swing trading):
+ *   - Runs every 72 hours — Sonar research + Claude + GPT votes
+ *   - Trades HL xyz stocks & commodities on ≥2/3 model consensus
+ *   - TP +5%, SL -1% (5:1 R:R), 5x leverage, $100 fixed allocation
+ *
+ * 12 assets (crypto) + xyz stocks/commodities, scan every 5 seconds
  * Bug fixes: cancel all orders on close, orphan position detector
  */
 
@@ -26,6 +31,7 @@ import { storage } from "./storage";
 import { log } from "./index";
 import { createExecutor } from "./hyperliquid-executor";
 import { logDecision, reviewClosedTrades, generateInsights, getLearningStats, run24hReview } from "./learning-engine";
+import { runFullResearch, AIWEEKLY_STOCKS, AIWEEKLY_COMMODITIES, type ConsensusResult } from "./ai-researcher";
 
 // ============ ASSET CONFIGURATION ============
 
@@ -56,7 +62,14 @@ const ALLOWED_ASSETS: AssetConfig[] = [
 ];
 
 // ============ STRATEGY TYPES ============
-type StrategyType = "confluence" | "extreme_rsi" | "bb_rsi_reversion" | "breakout_retest";
+type StrategyType = "confluence" | "extreme_rsi" | "bb_rsi_reversion" | "breakout_retest" | "aiweekly";
+
+// ============ AIWEEKLY STRATEGY CONSTANTS ============
+const AIWEEKLY_CYCLE_HOURS = 72; // every 3 days
+const AIWEEKLY_TP_PCT = 0.05;    // +5% take profit
+const AIWEEKLY_SL_PCT = 0.01;    // -1% stop loss (5:1 R:R)
+const AIWEEKLY_ALLOCATION = 100;  // $100 fixed allocation
+const AIWEEKLY_LEVERAGE = 5;      // moderate leverage for swing trades
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -309,6 +322,9 @@ class TradingEngine {
   private hstarConsecutiveLosses: number = 0;
   // v13.4: Separate RSI cross state for HSTAR (different thresholds)
   private hstarCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
+  // v13.5: AIWEEKLY — AI consensus strategy
+  private aiweeklyLastCycleTime: number = 0;
+  private aiweeklyIsRunning: boolean = false;
 
   private resetLossTrackers() {
     this.drawdownPaused = false;
@@ -405,10 +421,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v13.4 started | DUAL: PURE_RSI (≤20/≥81, 2 slots) + HSTAR (≤25/≥75, 4 slots) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v13.5 started | TRIPLE: PURE_RSI (≤20/≥81, 2 slots) + HSTAR (≤25/≥75, 4 slots) + AIWEEKLY (72h cycle, AI consensus) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v13.4 started — DUAL: PURE_RSI + HSTAR — ${ALLOWED_ASSETS.length} assets — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v13.5 started — TRIPLE: PURE_RSI + HSTAR + AIWEEKLY — ${ALLOWED_ASSETS.length} assets — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
   async stop() {
@@ -500,10 +516,16 @@ class TradingEngine {
         });
       }
 
+      // === AIWEEKLY: Check if it's time for a new research cycle (every 72 hours) ===
+      await this.checkAiweeklyCycle(config, equity);
+
+      // === AIWEEKLY: Check exit conditions for open aiweekly positions ===
+      await this.checkAiweeklyExits(config, equity);
+
       // Drawdown check removed — user disabled all exposure reduction
       const canOpenNew = true;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | BTC+ETH | v13.0 PURE RSI | Trades today: ${this.dailyTradeCount}`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v13.5 TRIPLE: PURE_RSI + HSTAR + AIWEEKLY | Trades today: ${this.dailyTradeCount}`, "engine");
 
       // Fetch market data (crypto only)
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -634,9 +656,12 @@ class TradingEngine {
 
         log(`[PURE_RSI] ${asset.coin} ${triggerTF} RSI=${triggerRSI.toFixed(1)} → ${side.toUpperCase()} @ $${price} | TP: $${tp.toFixed(2)} (+0.43%) | SL: $${sl.toFixed(2)} (-0.5%)`, "engine");
 
-        // Position sizing — 50% margin for PURE_RSI (2 slots = 25% each)
+        // Position sizing — 50% of remaining equity for PURE_RSI (2 slots = 25% each)
+        // v13.5: AIWEEKLY gets $100 fixed, remaining split 50/50
         const leverage = asset.maxLeverage;
-        const capitalForTrade = (equity * 0.50) / maxPosPureRsi;
+        const aiweeklyReserve = Math.min(AIWEEKLY_ALLOCATION, equity * 0.15);
+        const remainingEquity = equity - aiweeklyReserve;
+        const capitalForTrade = (remainingEquity * 0.50) / maxPosPureRsi;
         const notionalSize = capitalForTrade * leverage;
         const assetSize = notionalSize / price;
 
@@ -855,7 +880,9 @@ class TradingEngine {
         if (this.hstarConsecutiveLosses >= 3) sizeMult = 0.25;
         else if (this.hstarConsecutiveLosses >= 2) sizeMult = 0.5;
 
-        const hCapital = ((equity * 0.50) / maxPosHstar) * sizeMult;
+        const hAiweeklyReserve = Math.min(AIWEEKLY_ALLOCATION, equity * 0.15);
+        const hRemainingEquity = equity - hAiweeklyReserve;
+        const hCapital = ((hRemainingEquity * 0.50) / maxPosHstar) * sizeMult;
         const hNotional = hCapital * hLeverage;
         const hAssetSize = hNotional / price;
 
@@ -983,7 +1010,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v13.4 DUAL (PURE_RSI + HSTAR) ${ALLOWED_ASSETS.length} assets`,
+        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v13.5 TRIPLE (PURE_RSI + HSTAR + AIWEEKLY) ${ALLOWED_ASSETS.length} assets`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1346,6 +1373,418 @@ class TradingEngine {
       timestamp: new Date().toISOString(),
     });
   }
+  // ============ AIWEEKLY STRATEGY ============
+
+  private async checkAiweeklyCycle(config: any, equity: number) {
+    if (this.aiweeklyIsRunning) return;
+
+    const now = Date.now();
+    const cycleMs = AIWEEKLY_CYCLE_HOURS * 3600 * 1000;
+
+    // Check if enough time has passed since last cycle
+    if (this.aiweeklyLastCycleTime > 0 && (now - this.aiweeklyLastCycleTime) < cycleMs) return;
+
+    // Check if we have a PERPLEXITY_API_KEY
+    const pplxKey = process.env.PERPLEXITY_API_KEY;
+    if (!pplxKey) {
+      if (this.scanCount % 100 === 1) log("[AIWEEKLY] No PERPLEXITY_API_KEY set — skipping", "engine");
+      return;
+    }
+
+    // Check if previous cycle's positions are still open
+    const openTrades = await storage.getOpenTrades();
+    const aiweeklyOpen = openTrades.filter(t => t.strategy === "aiweekly");
+    if (aiweeklyOpen.length > 0) {
+      // Don't start new cycle while old positions are still open
+      return;
+    }
+
+    this.aiweeklyIsRunning = true;
+    log("=== AIWEEKLY CYCLE STARTING ===", "engine");
+
+    try {
+      const cycleId = new Date().toISOString();
+
+      // Create research record
+      const research = await storage.createAiweeklyResearch({
+        cycleId,
+        status: "researching",
+        researchStartedAt: cycleId,
+        createdAt: cycleId,
+      });
+
+      await storage.createLog({
+        type: "aiweekly",
+        message: `[AIWEEKLY] Research cycle #${research.id} starting — 3-model consensus (Sonar + Claude + GPT)`,
+        timestamp: cycleId,
+      });
+
+      // Run full 3-model research
+      const consensus = await runFullResearch(pplxKey);
+
+      // Save research results
+      await storage.updateAiweeklyResearch(research.id, {
+        status: "executing",
+        sonarResearch: "completed",
+        sonarPicks: JSON.stringify(consensus.sonarPicks),
+        claudePicks: JSON.stringify(consensus.claudePicks),
+        gptPicks: JSON.stringify(consensus.gptPicks),
+        consensusPicks: JSON.stringify(consensus),
+        researchCompletedAt: new Date().toISOString(),
+      });
+
+      log(`[AIWEEKLY] Research complete: ${consensus.longs.length}L / ${consensus.shorts.length}S / ${consensus.commodities.length} commodities`, "engine");
+
+      // Execute trades
+      const totalPositions = consensus.longs.length + consensus.shorts.length + consensus.commodities.length;
+      if (totalPositions === 0) {
+        log("[AIWEEKLY] No consensus picks — skipping execution", "engine");
+        await storage.updateAiweeklyResearch(research.id, {
+          status: "complete",
+          tradesOpened: 0,
+          nextCycleAt: new Date(Date.now() + AIWEEKLY_CYCLE_HOURS * 3600000).toISOString(),
+        });
+        this.aiweeklyLastCycleTime = Date.now();
+        this.aiweeklyIsRunning = false;
+        return;
+      }
+
+      const capitalPerPosition = Math.min(AIWEEKLY_ALLOCATION, equity * 0.15) / totalPositions;
+      let tradesOpened = 0;
+
+      // Open stock longs
+      for (const pick of consensus.longs) {
+        const asset = AIWEEKLY_STOCKS.find(s => s.coin === pick.coin);
+        if (!asset) continue;
+        const opened = await this.openAiweeklyPosition(config, asset.coin, "long", capitalPerPosition, asset.maxLev, asset.szDec, equity, pick.votes, pick.models);
+        if (opened) tradesOpened++;
+      }
+
+      // Open stock shorts
+      for (const pick of consensus.shorts) {
+        const asset = AIWEEKLY_STOCKS.find(s => s.coin === pick.coin);
+        if (!asset) continue;
+        const opened = await this.openAiweeklyPosition(config, asset.coin, "short", capitalPerPosition, asset.maxLev, asset.szDec, equity, pick.votes, pick.models);
+        if (opened) tradesOpened++;
+      }
+
+      // Open commodity positions
+      for (const pick of consensus.commodities) {
+        const asset = AIWEEKLY_COMMODITIES.find(c => c.coin === pick.coin);
+        if (!asset) continue;
+        const opened = await this.openAiweeklyPosition(config, pick.coin, pick.side, capitalPerPosition, asset.maxLev, asset.szDec, equity, pick.votes, pick.models);
+        if (opened) tradesOpened++;
+      }
+
+      await storage.updateAiweeklyResearch(research.id, {
+        status: "complete",
+        tradesOpened,
+        positionsOpenedAt: new Date().toISOString(),
+        nextCycleAt: new Date(Date.now() + AIWEEKLY_CYCLE_HOURS * 3600000).toISOString(),
+      });
+
+      this.aiweeklyLastCycleTime = Date.now();
+
+      await storage.createLog({
+        type: "aiweekly",
+        message: `[AIWEEKLY] Cycle complete: ${tradesOpened} positions opened | $${capitalPerPosition.toFixed(1)}/position | Next cycle in ${AIWEEKLY_CYCLE_HOURS}h`,
+        timestamp: new Date().toISOString(),
+      });
+
+      log(`[AIWEEKLY] Opened ${tradesOpened} positions, $${capitalPerPosition.toFixed(1)} each`, "engine");
+    } catch (err) {
+      log(`[AIWEEKLY] Research cycle error: ${err}`, "engine");
+      await storage.createLog({
+        type: "aiweekly_error",
+        message: `[AIWEEKLY] Cycle failed: ${err}`,
+        timestamp: new Date().toISOString(),
+      });
+    } finally {
+      this.aiweeklyIsRunning = false;
+    }
+  }
+
+  private async openAiweeklyPosition(
+    config: any, coin: string, side: "long" | "short",
+    capital: number, maxLev: number, szDec: number,
+    equity: number, votes: number, models: string[],
+  ): Promise<boolean> {
+    try {
+      const leverage = Math.min(AIWEEKLY_LEVERAGE, maxLev);
+      const notionalSize = capital * leverage;
+
+      // Fetch current price for xyz assets
+      const xyzData = await fetchMetaAndAssetCtxs("xyz");
+      let price = 0;
+      if (xyzData && xyzData.length >= 2) {
+        const universe = xyzData[0]?.universe || [];
+        const ctxs = xyzData[1] || [];
+        const coinName = coin.replace("xyz:", "");
+        const idx = universe.findIndex((a: any) => a.name === coinName);
+        if (idx >= 0 && ctxs[idx]?.midPx) {
+          price = parseFloat(ctxs[idx].midPx);
+        }
+      }
+
+      if (price <= 0) {
+        log(`[AIWEEKLY] Cannot get price for ${coin} — skipping`, "engine");
+        return false;
+      }
+
+      const assetSize = notionalSize / price;
+      const tp = side === "long" ? price * (1 + AIWEEKLY_TP_PCT) : price * (1 - AIWEEKLY_TP_PCT);
+      const sl = side === "long" ? price * (1 - AIWEEKLY_SL_PCT) : price * (1 + AIWEEKLY_SL_PCT);
+
+      let fillPrice = price;
+      let filledSz = 0;
+
+      if (config.apiSecret && config.walletAddress) {
+        const executor = createExecutor(config.apiSecret, config.walletAddress);
+        const isCross = true;
+        await executor.setLeverage(coin, leverage, isCross);
+
+        const slippageMult = side === "long" ? 1.01 : 0.99;
+        const orderPrice = price * slippageMult;
+        const roundedSize = parseFloat(formatHLSize(assetSize, szDec));
+        if (roundedSize <= 0) {
+          log(`[AIWEEKLY] SKIP ${coin}: Rounded size is 0`, "engine");
+          return false;
+        }
+
+        const orderResult = await executor.placeOrder({
+          coin, isBuy: side === "long", sz: roundedSize,
+          limitPx: parseFloat(formatHLPrice(orderPrice, szDec)),
+          orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
+        });
+
+        log(`[HL RAW] ${coin} aiweekly response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
+        const status = orderResult?.response?.data?.statuses?.[0];
+        const fillPx = status?.filled?.avgPx;
+        const totalSz = status?.filled?.totalSz;
+        const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
+
+        if (errorMsg) {
+          log(`[AIWEEKLY] ORDER REJECTED: ${coin} — ${errorMsg}`, "engine");
+          return false;
+        }
+
+        if (fillPx && parseFloat(totalSz) > 0) {
+          fillPrice = parseFloat(fillPx);
+          filledSz = parseFloat(totalSz);
+        } else {
+          log(`[AIWEEKLY] IOC NOT FILLED: ${coin} ${side}`, "engine");
+          return false;
+        }
+      }
+
+      const actualTP = side === "long" ? fillPrice * (1 + AIWEEKLY_TP_PCT) : fillPrice * (1 - AIWEEKLY_TP_PCT);
+      const actualSL = side === "long" ? fillPrice * (1 - AIWEEKLY_SL_PCT) : fillPrice * (1 + AIWEEKLY_SL_PCT);
+      const actualNotional = (filledSz > 0 ? filledSz : assetSize) * fillPrice;
+      const confidenceLabel = votes === 3 ? "3/3 UNANIMOUS" : "2/3 CONSENSUS";
+
+      const trade = await storage.createTrade({
+        coin, side, entryPrice: fillPrice, size: 80, leverage,
+        entryEquity: equity,
+        notionalValue: actualNotional,
+        rsiAtEntry: 0, rsi4h: 0, rsi1d: 0,
+        ema10: 0, ema21: 0, ema50: 0,
+        stopLoss: actualSL,
+        takeProfit1: actualTP,
+        takeProfit2: actualTP,
+        tp1Hit: false,
+        confluenceScore: votes,
+        confluenceDetails: `AIWEEKLY ${confidenceLabel}: ${models.join("+")}`,
+        riskRewardRatio: 5.0,
+        status: "open",
+        reason: `[AIWEEKLY] ${side.toUpperCase()} ${coin} | ${confidenceLabel} | TP +5% | SL -1% | ${leverage}x | $${capital.toFixed(1)}`,
+        setupType: "aiweekly",
+        strategy: "aiweekly",
+        openedAt: new Date().toISOString(),
+      });
+
+      // Place SL order on HL
+      if (config.apiSecret && config.walletAddress && filledSz > 0) {
+        try {
+          const executor = createExecutor(config.apiSecret, config.walletAddress);
+          const slTriggerPx = parseFloat(formatHLPrice(actualSL, szDec));
+          const slFillPx = side === "long"
+            ? parseFloat(formatHLPrice(actualSL * 0.98, szDec))
+            : parseFloat(formatHLPrice(actualSL * 1.02, szDec));
+          await executor.placeOrder({
+            coin, isBuy: side === "short", sz: filledSz,
+            limitPx: slFillPx,
+            orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+            reduceOnly: true,
+          });
+          log(`[AIWEEKLY SL] ${coin} SL placed @ $${slTriggerPx} (-1%)`, "engine");
+        } catch (slErr) {
+          log(`[AIWEEKLY SL] FAILED ${coin}: ${slErr}`, "engine");
+        }
+      }
+
+      await logDecision({
+        tradeId: trade.id, coin, action: "entry", side, price: fillPrice,
+        reasoning: `AIWEEKLY: ${side.toUpperCase()} ${coin} | ${confidenceLabel} (${models.join("|")}) | TP +5% $${actualTP.toFixed(2)} | SL -1% $${actualSL.toFixed(2)} | ${leverage}x | $${capital.toFixed(1)} capital`,
+        equity, leverage, positionSizeUsd: capital, strategy: "aiweekly" as any,
+      });
+
+      await storage.createLog({
+        type: "trade_open",
+        message: `[AIWEEKLY] ${side.toUpperCase()} ${coin} @ $${displayPrice(fillPrice, szDec)} | ${leverage}x | ${confidenceLabel} | TP +5% | SL -1% | $${capital.toFixed(1)}`,
+        timestamp: new Date().toISOString(),
+      });
+
+      log(`[AIWEEKLY] Opened ${side.toUpperCase()} ${coin} @ $${fillPrice} | ${confidenceLabel}`, "engine");
+      return true;
+    } catch (err) {
+      log(`[AIWEEKLY] Failed to open ${coin}: ${err}`, "engine");
+      return false;
+    }
+  }
+
+  private async checkAiweeklyExits(config: any, equity: number) {
+    const openTrades = await storage.getOpenTrades();
+    const aiweeklyTrades = openTrades.filter(t => t.strategy === "aiweekly");
+    if (aiweeklyTrades.length === 0) return;
+
+    // Fetch xyz prices
+    const xyzData = await fetchMetaAndAssetCtxs("xyz");
+    const xyzPriceMap: Record<string, number> = {};
+    if (xyzData && xyzData.length >= 2) {
+      const universe = xyzData[0]?.universe || [];
+      const ctxs = xyzData[1] || [];
+      for (let i = 0; i < universe.length; i++) {
+        if (ctxs[i]?.midPx && ctxs[i].midPx !== "None") {
+          xyzPriceMap[`xyz:${universe[i].name}`] = parseFloat(ctxs[i].midPx);
+        }
+      }
+    }
+
+    for (const trade of aiweeklyTrades) {
+      const currentPrice = xyzPriceMap[trade.coin];
+      if (!currentPrice) continue;
+
+      const priceDelta = trade.side === "long"
+        ? (currentPrice - trade.entryPrice) / trade.entryPrice
+        : (trade.entryPrice - currentPrice) / trade.entryPrice;
+
+      const asset = [...AIWEEKLY_STOCKS, ...AIWEEKLY_COMMODITIES].find(a => a.coin === trade.coin);
+      const szd = asset?.szDec ?? 3;
+
+      // Get HL position for unrealized P&L
+      let hlPos: any = null;
+      if (config.apiSecret && config.walletAddress) {
+        try {
+          const executor = createExecutor(config.apiSecret, config.walletAddress);
+          const positions = await executor.getPositions();
+          const coinName = trade.coin.replace("xyz:", "");
+          hlPos = positions.find((p: any) => p.position?.coin === coinName || p.position?.coin === trade.coin)?.position;
+        } catch {}
+      }
+
+      let pnlUsd = 0;
+      if (hlPos) {
+        pnlUsd = parseFloat(hlPos.unrealizedPnl || "0");
+      } else {
+        const notional = trade.notionalValue || 0;
+        pnlUsd = notional * priceDelta;
+      }
+
+      const eqForTrade = trade.entryEquity || equity;
+      const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
+
+      const tpHit = priceDelta >= AIWEEKLY_TP_PCT;
+      const slHit = priceDelta <= -AIWEEKLY_SL_PCT;
+
+      if (tpHit || slHit) {
+        const exitLabel = tpHit ? "TP +5%" : "SL -1%";
+        const closeReason = `[AIWEEKLY] ${exitLabel} @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+
+        // Close on HL
+        if (config.apiSecret && config.walletAddress) {
+          try {
+            const executor = createExecutor(config.apiSecret, config.walletAddress);
+            // Cancel open orders first
+            const openOrders = await executor.getOpenOrders();
+            const coinOrders = openOrders.filter((o: any) => o.coin === trade.coin || o.coin === trade.coin.replace("xyz:", ""));
+            for (const order of coinOrders) {
+              await executor.cancelOrder(order.coin, order.oid);
+            }
+
+            if (hlPos) {
+              const sz = Math.abs(parseFloat(hlPos.szi || "0"));
+              const slippage = trade.side === "long" ? 0.99 : 1.01;
+              await executor.placeOrder({
+                coin: trade.coin, isBuy: trade.side === "short", sz,
+                limitPx: parseFloat(formatHLPrice(currentPrice * slippage, szd)),
+                orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
+              });
+            }
+          } catch (e) { log(`[AIWEEKLY] Close error: ${e}`, "engine"); }
+
+          // Fetch actual P&L from fills
+          await new Promise(r => setTimeout(r, 1500));
+          try {
+            const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
+            const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
+            const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
+            if (hlPnl) {
+              pnlUsd = hlPnl.netPnl;
+              const finalReason = `[AIWEEKLY] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
+              const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
+              await storage.updateTrade(trade.id, {
+                exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: finalPnlOfAum,
+                hlPnlUsd: hlPnl.netPnl, hlCloseFee: hlPnl.totalFee,
+                status: "closed", closeReason: finalReason, closedAt: new Date().toISOString(),
+              });
+              log(`[AIWEEKLY CLOSE] Trade #${trade.id} ${trade.coin} | ${exitLabel} | $${hlPnl.netPnl.toFixed(2)}`, "engine");
+
+              await storage.createLog({
+                type: "trade_close",
+                message: `[AIWEEKLY] ${exitLabel} ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
+                timestamp: new Date().toISOString(),
+              });
+              continue;
+            }
+          } catch {}
+        }
+
+        // Fallback close without HL fills
+        const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
+        await storage.updateTrade(trade.id, {
+          exitPrice: currentPrice, pnl: 0, pnlPct: finalPnlOfAum,
+          hlPnlUsd: pnlUsd, hlCloseFee: 0,
+          status: "closed", closeReason, closedAt: new Date().toISOString(),
+        });
+
+        await storage.createLog({
+          type: "trade_close",
+          message: `[AIWEEKLY] ${exitLabel} ${trade.side.toUpperCase()} ${trade.coin} | $${pnlUsd.toFixed(2)} USDC`,
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        // Update unrealized P&L
+        await storage.updateTrade(trade.id, { hlPnlUsd: pnlUsd, pnlPct: pnlOfAum });
+      }
+    }
+  }
+
+  // Public method to trigger AIWEEKLY research manually
+  async triggerAiweeklyResearch(): Promise<{ success: boolean; message: string }> {
+    const pplxKey = process.env.PERPLEXITY_API_KEY;
+    if (!pplxKey) return { success: false, message: "No PERPLEXITY_API_KEY set" };
+    if (this.aiweeklyIsRunning) return { success: false, message: "Research already in progress" };
+
+    // Force cycle by resetting last cycle time
+    this.aiweeklyLastCycleTime = 0;
+    const config = await storage.getConfig();
+    const equity = this.lastKnownEquity || 0;
+
+    // Run in background
+    this.checkAiweeklyCycle(config, equity);
+    return { success: true, message: "AIWEEKLY research triggered" };
+  }
+
   async forceCloseTrade(tradeId: number) {
     const trade = await storage.getTradeById(tradeId);
     if (!trade || trade.status !== "open") return null;

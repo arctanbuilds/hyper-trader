@@ -91,6 +91,17 @@ export default function Dashboard() {
   const raceHours = strategyData?.raceHours || 0;
   const raceStartedAt = strategyData?.raceStartedAt || "";
 
+  const { data: aiweeklyStatus } = useQuery<any>({
+    queryKey: ["/api/aiweekly/status"],
+    queryFn: () => apiRequest("GET", "/api/aiweekly/status").then(r => r.json()),
+    refetchInterval: 30000,
+  });
+
+  const triggerAiweekly = useMutation({
+    mutationFn: () => apiRequest("POST", "/api/aiweekly/trigger"),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/aiweekly/status"] }),
+  });
+
   const triggerScan = useMutation({
     mutationFn: () => apiRequest("POST", "/api/bot/scan"),
     onSuccess: () => {
@@ -240,32 +251,35 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* ========== HEAD-TO-HEAD STRATEGY RACE ========== */}
+      {/* ========== TRIPLE STRATEGY RACE ========== */}
       {(() => {
         const pureRsi = strategies.find((s: any) => s.strategy === "pure_rsi");
         const hstar = strategies.find((s: any) => s.strategy === "hstar");
+        const aiweeklyStrat = strategies.find((s: any) => s.strategy === "aiweekly");
         const raceDays = raceHours >= 24 ? `${(raceHours / 24).toFixed(1)}d` : `${raceHours.toFixed(1)}h`;
         const raceStart = raceStartedAt ? new Date(raceStartedAt).toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
 
         // Determine leader
         const prPnl = pureRsi?.totalPnlUsd || 0;
         const hsPnl = hstar?.totalPnlUsd || 0;
-        const leader = prPnl === hsPnl ? "tie" : prPnl > hsPnl ? "pure_rsi" : "hstar";
+        const awPnl = aiweeklyStrat?.totalPnlUsd || 0;
+        const maxPnl = Math.max(prPnl, hsPnl, awPnl);
+        const leader = maxPnl === 0 ? "tie" : prPnl === maxPnl ? "pure_rsi" : hsPnl === maxPnl ? "hstar" : "aiweekly";
 
-        // Helper for stat rows
-        const StatRow = ({ label, prVal, hsVal, fmt, higherBetter = true }: { label: string; prVal: number; hsVal: number; fmt: (v: number) => string; higherBetter?: boolean }) => {
-          const prWins = higherBetter ? prVal > hsVal : prVal < hsVal;
-          const hsWins = higherBetter ? hsVal > prVal : hsVal < prVal;
-          const tie = prVal === hsVal;
+        // 3-col stat row helper
+        const Stat3Row = ({ label, prVal, hsVal, awVal, fmt, higherBetter = true }: {
+          label: string; prVal: number; hsVal: number; awVal: number;
+          fmt: (v: number) => string; higherBetter?: boolean;
+        }) => {
+          const best = higherBetter ? Math.max(prVal, hsVal, awVal) : Math.min(prVal, hsVal, awVal);
+          const allSame = prVal === hsVal && hsVal === awVal;
           return (
-            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 py-1 border-b border-border/30 last:border-0">
-              <span className={cn("text-xs font-mono text-right", prWins && !tie ? "text-blue-400 font-semibold" : "text-muted-foreground")}>
-                {fmt(prVal)} {prWins && !tie && "\u25C0"}
-              </span>
-              <span className="text-[10px] text-muted-foreground text-center w-20 truncate">{label}</span>
-              <span className={cn("text-xs font-mono text-left", hsWins && !tie ? "text-amber-400 font-semibold" : "text-muted-foreground")}>
-                {hsWins && !tie && "\u25B6"} {fmt(hsVal)}
-              </span>
+            <div className="grid grid-cols-[1fr_auto_1fr_auto_1fr] items-center gap-1 py-1 border-b border-border/30 last:border-0">
+              <span className={cn("text-xs font-mono text-right", !allSame && prVal === best ? "text-blue-400 font-semibold" : "text-muted-foreground")}>{fmt(prVal)}</span>
+              <span className="text-[9px] text-muted-foreground text-center w-16 truncate">{label}</span>
+              <span className={cn("text-xs font-mono text-center", !allSame && hsVal === best ? "text-amber-400 font-semibold" : "text-muted-foreground")}>{fmt(hsVal)}</span>
+              <span className="text-[9px] text-muted-foreground text-center w-4">|</span>
+              <span className={cn("text-xs font-mono text-left", !allSame && awVal === best ? "text-emerald-400 font-semibold" : "text-muted-foreground")}>{fmt(awVal)}</span>
             </div>
           );
         };
@@ -275,59 +289,68 @@ export default function Dashboard() {
             <CardHeader className="pb-2">
               <div className="flex items-center justify-between">
                 <div>
-                  <CardTitle className="text-sm font-medium">Strategy Race: PURE RSI vs H★★</CardTitle>
-                  <p className="text-[10px] text-muted-foreground">Head-to-head since v13.4 deploy{raceStart ? ` (${raceStart})` : ""} — {raceDays} elapsed</p>
+                  <CardTitle className="text-sm font-medium">Strategy Race: PURE RSI vs H★★ vs AIWEEKLY</CardTitle>
+                  <p className="text-[10px] text-muted-foreground">Triple strategy since v13.5{raceStart ? ` (${raceStart})` : ""} — {raceDays} elapsed</p>
                 </div>
                 <Badge variant="outline" className={cn(
                   "text-[10px] px-2 py-0.5",
                   leader === "pure_rsi" ? "bg-blue-500/10 text-blue-400 border-blue-500/30" :
                   leader === "hstar" ? "bg-amber-500/10 text-amber-400 border-amber-500/30" :
+                  leader === "aiweekly" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" :
                   "bg-zinc-500/10 text-zinc-400 border-zinc-500/30"
                 )}>
-                  {leader === "pure_rsi" ? "PURE RSI leads" : leader === "hstar" ? "H★★ leads" : "Tied"}
+                  {leader === "pure_rsi" ? "PURE RSI leads" : leader === "hstar" ? "H★★ leads" : leader === "aiweekly" ? "AIWEEKLY leads" : "Tied"}
                 </Badge>
               </div>
             </CardHeader>
             <CardContent>
               <div className="space-y-4">
                 {/* Column headers */}
-                <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
-                  <div className="flex items-center justify-end gap-2">
-                    <div className="w-2.5 h-2.5 rounded-full bg-blue-400" />
+                <div className="grid grid-cols-[1fr_auto_1fr_auto_1fr] items-center gap-1">
+                  <div className="flex items-center justify-end gap-1.5">
+                    <div className="w-2 h-2 rounded-full bg-blue-400" />
                     <span className="text-xs font-semibold text-blue-400">PURE RSI</span>
                   </div>
-                  <span className="text-[10px] text-muted-foreground text-center w-20">vs</span>
-                  <div className="flex items-center gap-2">
-                    <div className="w-2.5 h-2.5 rounded-full bg-amber-400" />
+                  <span className="text-[9px] text-muted-foreground text-center w-16">vs</span>
+                  <div className="flex items-center justify-center gap-1.5">
+                    <div className="w-2 h-2 rounded-full bg-amber-400" />
                     <span className="text-xs font-semibold text-amber-400">H★★</span>
+                  </div>
+                  <span className="text-[9px] text-muted-foreground text-center w-4">|</span>
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-2 h-2 rounded-full bg-emerald-400" />
+                    <span className="text-xs font-semibold text-emerald-400">AI</span>
                   </div>
                 </div>
 
                 {/* Stats comparison */}
                 <div>
-                  <StatRow label="Total P&L" prVal={prPnl} hsVal={hsPnl} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)} USDC`} />
-                  <StatRow label="P&L % AUM" prVal={pureRsi?.totalPnlPct || 0} hsVal={hstar?.totalPnlPct || 0} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`} />
-                  <StatRow label="Trades" prVal={pureRsi?.totalTrades || 0} hsVal={hstar?.totalTrades || 0} fmt={v => `${v}`} />
-                  <StatRow label="Win Rate" prVal={pureRsi?.winRate || 0} hsVal={hstar?.winRate || 0} fmt={v => `${v.toFixed(1)}%`} />
-                  <StatRow label="Avg/Trade" prVal={pureRsi?.avgPnlPerTrade || 0} hsVal={hstar?.avgPnlPerTrade || 0} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}`} />
-                  <StatRow label="Best Trade" prVal={pureRsi?.bestTradeUsd || 0} hsVal={hstar?.bestTradeUsd || 0} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}`} />
-                  <StatRow label="Worst Trade" prVal={pureRsi?.worstTradeUsd || 0} hsVal={hstar?.worstTradeUsd || 0} fmt={v => `${v.toFixed(2)}`} higherBetter={false} />
-                  <StatRow label="Max DD" prVal={pureRsi?.maxDrawdownUsd || 0} hsVal={hstar?.maxDrawdownUsd || 0} fmt={v => `-$${v.toFixed(2)}`} higherBetter={false} />
-                  <StatRow label="Max DD %" prVal={pureRsi?.maxDrawdownPct || 0} hsVal={hstar?.maxDrawdownPct || 0} fmt={v => `-${v.toFixed(2)}%`} higherBetter={false} />
-                  <StatRow label="Profit Factor" prVal={pureRsi?.profitFactor || 0} hsVal={hstar?.profitFactor || 0} fmt={v => v >= 999 ? "\u221E" : `${v.toFixed(2)}`} />
-                  <StatRow label="Win Streak" prVal={pureRsi?.bestWinStreak || 0} hsVal={hstar?.bestWinStreak || 0} fmt={v => `${v}`} />
-                  <StatRow label="Loss Streak" prVal={pureRsi?.worstLossStreak || 0} hsVal={hstar?.worstLossStreak || 0} fmt={v => `${v}`} higherBetter={false} />
+                  <Stat3Row label="Total P&L" prVal={prPnl} hsVal={hsPnl} awVal={awPnl} fmt={v => `${v >= 0 ? "+" : ""}$${v.toFixed(2)}`} />
+                  <Stat3Row label="P&L % AUM" prVal={pureRsi?.totalPnlPct || 0} hsVal={hstar?.totalPnlPct || 0} awVal={aiweeklyStrat?.totalPnlPct || 0} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`} />
+                  <Stat3Row label="Trades" prVal={pureRsi?.totalTrades || 0} hsVal={hstar?.totalTrades || 0} awVal={aiweeklyStrat?.totalTrades || 0} fmt={v => `${v}`} />
+                  <Stat3Row label="Win Rate" prVal={pureRsi?.winRate || 0} hsVal={hstar?.winRate || 0} awVal={aiweeklyStrat?.winRate || 0} fmt={v => `${v.toFixed(1)}%`} />
+                  <Stat3Row label="Avg/Trade" prVal={pureRsi?.avgPnlPerTrade || 0} hsVal={hstar?.avgPnlPerTrade || 0} awVal={aiweeklyStrat?.avgPnlPerTrade || 0} fmt={v => `${v >= 0 ? "+" : ""}$${v.toFixed(2)}`} />
+                  <Stat3Row label="Best Trade" prVal={pureRsi?.bestTradeUsd || 0} hsVal={hstar?.bestTradeUsd || 0} awVal={aiweeklyStrat?.bestTradeUsd || 0} fmt={v => `+$${v.toFixed(2)}`} />
+                  <Stat3Row label="Worst" prVal={pureRsi?.worstTradeUsd || 0} hsVal={hstar?.worstTradeUsd || 0} awVal={aiweeklyStrat?.worstTradeUsd || 0} fmt={v => `$${v.toFixed(2)}`} higherBetter={false} />
+                  <Stat3Row label="Max DD" prVal={pureRsi?.maxDrawdownUsd || 0} hsVal={hstar?.maxDrawdownUsd || 0} awVal={aiweeklyStrat?.maxDrawdownUsd || 0} fmt={v => `-$${v.toFixed(2)}`} higherBetter={false} />
+                  <Stat3Row label="Profit F" prVal={pureRsi?.profitFactor || 0} hsVal={hstar?.profitFactor || 0} awVal={aiweeklyStrat?.profitFactor || 0} fmt={v => v >= 999 ? "∞" : v.toFixed(2)} />
+                  <Stat3Row label="Win Streak" prVal={pureRsi?.bestWinStreak || 0} hsVal={hstar?.bestWinStreak || 0} awVal={aiweeklyStrat?.bestWinStreak || 0} fmt={v => `${v}`} />
+                  <Stat3Row label="Loss Streak" prVal={pureRsi?.worstLossStreak || 0} hsVal={hstar?.worstLossStreak || 0} awVal={aiweeklyStrat?.worstLossStreak || 0} fmt={v => `${v}`} higherBetter={false} />
                 </div>
 
                 {/* W/L breakdown */}
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-3 gap-2">
                   <div className="text-center p-2 rounded bg-blue-500/5 border border-blue-500/20">
-                    <div className="text-lg font-semibold font-mono text-blue-400">{pureRsi?.wins || 0}W / {pureRsi?.losses || 0}L</div>
-                    <div className="text-[10px] text-muted-foreground">{pureRsi?.openPositions || 0} open</div>
+                    <div className="text-base font-semibold font-mono text-blue-400">{pureRsi?.wins || 0}W / {pureRsi?.losses || 0}L</div>
+                    <div className="text-[9px] text-muted-foreground">{pureRsi?.openPositions || 0} open</div>
                   </div>
                   <div className="text-center p-2 rounded bg-amber-500/5 border border-amber-500/20">
-                    <div className="text-lg font-semibold font-mono text-amber-400">{hstar?.wins || 0}W / {hstar?.losses || 0}L</div>
-                    <div className="text-[10px] text-muted-foreground">{hstar?.openPositions || 0} open</div>
+                    <div className="text-base font-semibold font-mono text-amber-400">{hstar?.wins || 0}W / {hstar?.losses || 0}L</div>
+                    <div className="text-[9px] text-muted-foreground">{hstar?.openPositions || 0} open</div>
+                  </div>
+                  <div className="text-center p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                    <div className="text-base font-semibold font-mono text-emerald-400">{aiweeklyStrat?.wins || 0}W / {aiweeklyStrat?.losses || 0}L</div>
+                    <div className="text-[9px] text-muted-foreground">{aiweeklyStrat?.openPositions || 0} open</div>
                   </div>
                 </div>
               </div>
@@ -405,28 +428,32 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Cumulative P&L Race</CardTitle>
-            <p className="text-[10px] text-muted-foreground">PURE RSI vs H★★ — since v13.4 deploy</p>
+            <p className="text-[10px] text-muted-foreground">PURE RSI vs H★★ vs AIWEEKLY — since v13.5 deploy</p>
           </CardHeader>
           <CardContent>
             {(() => {
               const pureRsi = strategies.find((s: any) => s.strategy === "pure_rsi");
               const hstar = strategies.find((s: any) => s.strategy === "hstar");
+              const aiweeklyStrat = strategies.find((s: any) => s.strategy === "aiweekly");
 
               // Build time-based merged series using actual timestamps
-              const allEvents: { ts: number; pure_rsi: number; hstar: number; label: string }[] = [];
-              let prCum = 0, hsCum = 0;
+              const allEvents: { ts: number; pure_rsi: number; hstar: number; aiweekly: number; label: string }[] = [];
+              let prCum = 0, hsCum = 0, awCum = 0;
               const prSeries = (pureRsi?.cumPnlSeries || []).map((p: any) => ({ ...p, strat: "pr" }));
               const hsSeries = (hstar?.cumPnlSeries || []).map((p: any) => ({ ...p, strat: "hs" }));
-              const merged = [...prSeries, ...hsSeries].sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+              const awSeries = (aiweeklyStrat?.cumPnlSeries || []).map((p: any) => ({ ...p, strat: "aw" }));
+              const merged = [...prSeries, ...hsSeries, ...awSeries].sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
               for (const evt of merged) {
                 if (evt.strat === "pr") prCum = evt.cumPnl;
-                else hsCum = evt.cumPnl;
+                else if (evt.strat === "hs") hsCum = evt.cumPnl;
+                else awCum = evt.cumPnl;
                 const d = new Date(evt.timestamp);
                 allEvents.push({
                   ts: d.getTime(),
                   pure_rsi: prCum,
                   hstar: hsCum,
+                  aiweekly: awCum,
                   label: `${d.getMonth()+1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
                 });
               }
@@ -449,20 +476,21 @@ export default function Dashboard() {
                       }}
                       formatter={(value: number, name: string) => [
                         `${value >= 0 ? "+" : ""}$${value.toFixed(2)}`,
-                        name === "pure_rsi" ? "PURE RSI" : "H★★"
+                        name === "pure_rsi" ? "PURE RSI" : name === "hstar" ? "H★★" : "AIWEEKLY"
                       ]}
                     />
                     <Legend
-                      formatter={(value: string) => value === "pure_rsi" ? "PURE RSI" : "H★★"}
+                      formatter={(value: string) => value === "pure_rsi" ? "PURE RSI" : value === "hstar" ? "H★★" : "AIWEEKLY"}
                       wrapperStyle={{ fontSize: "11px" }}
                     />
                     <Line type="monotone" dataKey="pure_rsi" stroke="hsl(210, 70%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
                     <Line type="monotone" dataKey="hstar" stroke="hsl(40, 90%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
+                    <Line type="monotone" dataKey="aiweekly" stroke="hsl(145, 65%, 50%)" strokeWidth={2} dot={{ r: 2 }} />
                   </LineChart>
                 </ResponsiveContainer>
               ) : (
                 <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
-                  Chart builds as trades close from both strategies
+                  Chart builds as trades close from all three strategies
                 </div>
               );
             })()}
@@ -503,6 +531,11 @@ export default function Dashboard() {
                         {trade.strategy === "hstar" && (
                           <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">
                             H★★
+                          </Badge>
+                        )}
+                        {trade.strategy === "aiweekly" && (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                            AI 🤖
                           </Badge>
                         )}
                         {(trade.strategy === "extreme_rsi" || trade.strategy === "confluence" || (!trade.strategy && trade.confluenceScore != null)) && (
@@ -618,6 +651,74 @@ export default function Dashboard() {
         </CardContent>
       </Card>
 
+      {/* ========== AIWEEKLY AI STATUS ========== */}
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-sm font-medium">AIWEEKLY — 3-Model AI Strategy</CardTitle>
+              <p className="text-[10px] text-muted-foreground">Sonar research + Claude + GPT consensus — stocks & commodities on Hyperliquid xyz</p>
+            </div>
+            <div className="flex items-center gap-2">
+              {aiweeklyStatus?.hasApiKey ? (
+                <Badge variant="outline" className="text-[9px] px-1.5 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                  API key set
+                </Badge>
+              ) : (
+                <Badge variant="outline" className="text-[9px] px-1.5 py-0 bg-red-500/10 text-red-400 border-red-500/30">
+                  No PERPLEXITY_API_KEY
+                </Badge>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => triggerAiweekly.mutate()}
+                disabled={triggerAiweekly.isPending || !aiweeklyStatus?.hasApiKey}
+                className="text-[10px] h-6 px-2"
+              >
+                {triggerAiweekly.isPending ? "Running..." : "Trigger Now"}
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
+            <div className="p-2 rounded bg-muted/40 border border-border/50">
+              <div className="text-[10px] text-muted-foreground mb-0.5">Open Positions</div>
+              <div className="text-sm font-semibold font-mono text-emerald-400">{aiweeklyStatus?.openPositions ?? 0}</div>
+            </div>
+            <div className="p-2 rounded bg-muted/40 border border-border/50">
+              <div className="text-[10px] text-muted-foreground mb-0.5">Closed Trades</div>
+              <div className="text-sm font-semibold font-mono">{aiweeklyStatus?.totalClosed ?? 0}</div>
+            </div>
+            <div className="p-2 rounded bg-muted/40 border border-border/50">
+              <div className="text-[10px] text-muted-foreground mb-0.5">Total P&L</div>
+              <div className={cn("text-sm font-semibold font-mono", (aiweeklyStatus?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400")}>
+                {(aiweeklyStatus?.totalPnlUsd || 0) >= 0 ? "+" : ""}{(aiweeklyStatus?.totalPnlUsd || 0).toFixed(2)} USDC
+              </div>
+            </div>
+            <div className="p-2 rounded bg-muted/40 border border-border/50">
+              <div className="text-[10px] text-muted-foreground mb-0.5">Win Rate</div>
+              <div className="text-sm font-semibold font-mono">{aiweeklyStatus?.winRate ?? 0}%</div>
+            </div>
+          </div>
+          {aiweeklyStatus?.latestCycle && (
+            <div className="text-[10px] text-muted-foreground space-y-0.5">
+              <div>Last cycle: <span className="text-foreground">{new Date(aiweeklyStatus.latestCycle.createdAt).toLocaleString()}</span> — status: <span className={cn("font-medium", aiweeklyStatus.latestCycle.status === "complete" ? "text-emerald-400" : aiweeklyStatus.latestCycle.status === "researching" ? "text-amber-400" : "text-muted-foreground")}>{aiweeklyStatus.latestCycle.status}</span></div>
+              {aiweeklyStatus.latestCycle.nextCycleAt && (
+                <div>Next cycle: <span className="text-foreground">{new Date(aiweeklyStatus.latestCycle.nextCycleAt).toLocaleString()}</span></div>
+              )}
+              {aiweeklyStatus.latestCycle.tradesOpened != null && (
+                <div>Positions opened: <span className="text-foreground font-medium">{aiweeklyStatus.latestCycle.tradesOpened}</span> | TP +5% | SL -1% | 5x leverage | $100 allocation</div>
+              )}
+            </div>
+          )}
+          {!aiweeklyStatus?.latestCycle && (
+            <div className="text-[10px] text-muted-foreground">No research cycles run yet. Cycles run automatically every 72h when PERPLEXITY_API_KEY is set.</div>
+          )}
+        </CardContent>
+      </Card>
+
       {/* Recent Activity */}
       <Card>
         <CardHeader className="pb-2">
@@ -641,6 +742,8 @@ export default function Dashboard() {
                   log.type === "circuit_breaker" && "bg-orange-500",
                   log.type === "learning" && "bg-cyan-500",
                   log.type === "learning_24h" && "bg-cyan-400",
+                  log.type === "aiweekly" && "bg-emerald-500",
+                  log.type === "aiweekly_error" && "bg-red-400",
                 )} />
                 <div className="flex-1 min-w-0">
                   <p className="text-xs truncate">{log.message}</p>
