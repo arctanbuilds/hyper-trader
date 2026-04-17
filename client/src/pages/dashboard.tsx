@@ -52,6 +52,12 @@ export default function Dashboard() {
     refetchInterval: 10000,
   });
 
+  const { data: closedTrades = [] } = useQuery({
+    queryKey: ["/api/trades", "closed"],
+    queryFn: () => apiRequest("GET", "/api/trades?status=closed").then(r => r.json()),
+    refetchInterval: 15000,
+  });
+
   const { data: pnlData = [] } = useQuery({
     queryKey: ["/api/pnl"],
     queryFn: () => apiRequest("GET", "/api/pnl").then(r => r.json()),
@@ -498,6 +504,73 @@ export default function Dashboard() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Trade History */}
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm font-medium">Trade History</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {(closedTrades as any[]).length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-border text-muted-foreground">
+                    <th className="text-left py-1.5 px-1 font-medium">Date/Time</th>
+                    <th className="text-left py-1.5 px-1 font-medium">Asset</th>
+                    <th className="text-left py-1.5 px-1 font-medium">Side</th>
+                    <th className="text-right py-1.5 px-1 font-medium">Entry</th>
+                    <th className="text-right py-1.5 px-1 font-medium">Exit</th>
+                    <th className="text-right py-1.5 px-1 font-medium">P&L (USDC)</th>
+                    <th className="text-left py-1.5 px-1 font-medium">Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(closedTrades as any[]).sort((a: any, b: any) => (b.closedAt || "").localeCompare(a.closedAt || "")).slice(0, 30).map((trade: any) => {
+                    const net = (trade.hlPnlUsd || 0) - (trade.hlCloseFee || 0);
+                    const openDate = trade.openedAt ? new Date(trade.openedAt) : null;
+                    const closeDate = trade.closedAt ? new Date(trade.closedAt) : null;
+                    const reason = (trade.closeReason || "").replace(/\[PURE_RSI\]\s*/g, "").replace(/\s*\|\s*HL P&L.*$/g, "").replace(/Position closed on HL \(sync\)\s*\|?\s*/g, "Sync").replace(/P&L:.*$/g, "").trim();
+                    return (
+                      <tr key={trade.id} className="border-b border-border/30 hover:bg-muted/30">
+                        <td className="py-1.5 px-1 font-mono text-muted-foreground whitespace-nowrap">
+                          <div>{openDate ? openDate.toLocaleDateString([], { month: "short", day: "numeric" }) : "-"}</div>
+                          <div className="text-[10px]">
+                            {openDate ? openDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}
+                            {closeDate ? " → " + closeDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}
+                          </div>
+                        </td>
+                        <td className="py-1.5 px-1 font-medium">{getAssetLabel(trade.coin)}</td>
+                        <td className="py-1.5 px-1">
+                          <Badge
+                            variant={trade.side === "long" ? "default" : "destructive"}
+                            className="text-[9px] px-1 py-0 uppercase"
+                          >
+                            {trade.side}
+                          </Badge>
+                        </td>
+                        <td className="py-1.5 px-1 text-right font-mono">${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}</td>
+                        <td className="py-1.5 px-1 text-right font-mono">${trade.exitPrice?.toFixed(trade.exitPrice < 10 ? 4 : 2)}</td>
+                        <td className={cn(
+                          "py-1.5 px-1 text-right font-mono font-medium",
+                          net >= 0 ? "text-emerald-400" : "text-red-400"
+                        )}>
+                          {net >= 0 ? "+" : ""}{net.toFixed(2)}
+                        </td>
+                        <td className="py-1.5 px-1 text-muted-foreground truncate max-w-[120px]">{reason || "-"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="h-[100px] flex items-center justify-center text-sm text-muted-foreground">
+              No closed trades yet
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Recent Activity */}
       <Card>
