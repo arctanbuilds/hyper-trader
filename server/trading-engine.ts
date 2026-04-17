@@ -39,6 +39,12 @@ const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "ETH",  displayName: "Ethereum",   dex: "",    maxLeverage: 25, szDecimals: 4, category: "crypto",    minNotional: 10 },
   { coin: "SOL",  displayName: "Solana",     dex: "",    maxLeverage: 20, szDecimals: 2, category: "crypto",    minNotional: 10 },
   { coin: "XRP",  displayName: "XRP",        dex: "",    maxLeverage: 20, szDecimals: 0, category: "crypto",    minNotional: 10 },
+  { coin: "DOGE", displayName: "Dogecoin",    dex: "",    maxLeverage: 10, szDecimals: 0, category: "crypto",    minNotional: 10 },
+  { coin: "AVAX", displayName: "Avalanche",   dex: "",    maxLeverage: 10, szDecimals: 2, category: "crypto",    minNotional: 10 },
+  { coin: "LINK", displayName: "Chainlink",   dex: "",    maxLeverage: 10, szDecimals: 1, category: "crypto",    minNotional: 10 },
+  { coin: "MATIC",displayName: "Polygon",     dex: "",    maxLeverage: 20, szDecimals: 1, category: "crypto",    minNotional: 10 },
+  { coin: "ARB",  displayName: "Arbitrum",    dex: "",    maxLeverage: 10, szDecimals: 1, category: "crypto",    minNotional: 10 },
+  { coin: "OP",   displayName: "Optimism",    dex: "",    maxLeverage: 5,  szDecimals: 1, category: "crypto",    minNotional: 10 },
   // === HIP-3 TradFi (xyz perp dex) ===
   { coin: "xyz:GOLD",     displayName: "Gold",         dex: "xyz", maxLeverage: 25, szDecimals: 4, category: "commodity", minNotional: 10 },
   { coin: "xyz:SILVER",   displayName: "Silver",       dex: "xyz", maxLeverage: 25, szDecimals: 2, category: "commodity", minNotional: 10 },
