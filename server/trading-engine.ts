@@ -1,15 +1,16 @@
 /**
- * HyperTrader — Trading Engine v13.2
+ * HyperTrader — Trading Engine v13.3
  *
- * PURE RSI STRATEGY — BTC + ETH:
+ * PURE RSI STRATEGY — 12 assets (BTC, ETH, SOL, DOGE + top HL perps):
  *   - LONG when 5m or 15m RSI ≤ 20 → instant market buy
  *   - SHORT when 5m or 15m RSI ≥ 81 → instant market sell
  *   - SL: -0.50% from entry (full close)
  *   - TP: +0.43% from entry (full close)
  *   - BE: SL moves to entry price after +0.2% profit
- *   - 80% margin, max leverage per asset (BTC 40x, ETH 25x)
+ *   - 80% total margin split across max 3 concurrent positions
+ *   - Max leverage per asset
  *   - Scan every 5 seconds
- *   - Up to 2 parallel positions (one per coin)
+ *   - Up to 3 parallel positions (one per coin)
  *   - Bug fixes: cancel all orders on close, orphan position detector
  */
 
@@ -36,6 +37,16 @@ interface AssetConfig {
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",  displayName: "Bitcoin",    dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
   { coin: "ETH",  displayName: "Ethereum",   dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
+  { coin: "SOL",  displayName: "Solana",     dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "HYPE", displayName: "Hyperliquid",dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "XRP",  displayName: "XRP",        dex: "", maxLeverage: 20, szDecimals: 0, category: "crypto", minNotional: 10 },
+  { coin: "DOGE", displayName: "Dogecoin",   dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
+  { coin: "SUI",  displayName: "Sui",        dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
+  { coin: "LINK", displayName: "Chainlink",  dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
+  { coin: "AVAX", displayName: "Avalanche",  dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "BNB",  displayName: "BNB",        dex: "", maxLeverage: 10, szDecimals: 3, category: "crypto", minNotional: 10 },
+  { coin: "AAVE", displayName: "Aave",       dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "WLD",  displayName: "Worldcoin",  dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
 ];
 
 // ============ STRATEGY TYPES ============
@@ -384,10 +395,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v13.2 started | PURE RSI (≤20/≥81) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | SL -0.5% | TP +0.43% | BE @ +0.2%`,
+      message: `Engine v13.3 started | PURE RSI (≤20/≥81) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | SL -0.5% | TP +0.43% | BE @ +0.2% | Max 3 pos`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v13.2 started — PURE RSI (≤20/≥81, TP +0.43%, SL -0.5%, BE @ +0.2%) — BTC+ETH — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v13.3 started — PURE RSI (≤20/≥81, TP +0.43%, SL -0.5%, BE @ +0.2%) — ${ALLOWED_ASSETS.length} assets — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
   async stop() {
@@ -498,7 +509,7 @@ class TradingEngine {
       // Open positions — shared pool
       const openTrades = await storage.getOpenTrades();
       const openCoins = new Set(openTrades.map(t => t.coin));
-      const maxPos = config.maxPositions || 8;
+      const maxPos = 3; // max 3 concurrent positions across all assets
       const slotsAvailable = maxPos - openTrades.length;
 
       // ======================================================================
@@ -610,9 +621,9 @@ class TradingEngine {
 
         log(`[PURE_RSI] ${asset.coin} ${triggerTF} RSI=${triggerRSI.toFixed(1)} → ${side.toUpperCase()} @ $${price} | TP: $${tp.toFixed(2)} (+0.43%) | SL: $${sl.toFixed(2)} (-0.5%)`, "engine");
 
-        // Position sizing — 80% margin, max leverage
+        // Position sizing — 80% total margin split across maxPos slots
         const leverage = asset.maxLeverage;
-        const capitalForTrade = equity * 0.80;
+        const capitalForTrade = (equity * 0.80) / maxPos;
         const notionalSize = capitalForTrade * leverage;
         const assetSize = notionalSize / price;
 
@@ -739,7 +750,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v13.2 PURE RSI (≤20/≥81) BTC+ETH | BE @ +0.2%`,
+        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v13.3 PURE RSI (≤20/≥81) ${ALLOWED_ASSETS.length} assets | BE @ +0.2%`,
         timestamp: new Date().toISOString(),
       });
 
