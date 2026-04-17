@@ -896,7 +896,50 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // v13: Exit on TP (+0.43%) or SL (-0.5%)
+      // v13: Move SL to breakeven once price reaches +0.2% profit
+      const rawPricePct = trade.side === "long"
+        ? (currentPrice - trade.entryPrice) / trade.entryPrice
+        : (trade.entryPrice - currentPrice) / trade.entryPrice;
+      const beSL = trade.entryPrice; // breakeven = entry price
+      const currentSL = trade.stopLoss;
+      const isStillOriginalSL = trade.side === "long"
+        ? currentSL < trade.entryPrice * 0.999  // SL is below entry (original)
+        : currentSL > trade.entryPrice * 1.001;  // SL is above entry (original)
+      if (rawPricePct >= 0.002 && isStillOriginalSL) {
+        // Move SL to breakeven
+        await storage.updateTrade(trade.id, { stopLoss: beSL });
+        trade.stopLoss = beSL;
+        log(`[BE] Trade #${trade.id} ${trade.coin} ${trade.side} | Price +${(rawPricePct*100).toFixed(2)}% → SL moved to BE @ $${displayPrice(beSL, szd)}`, "engine");
+        // Update SL order on HL
+        if (config.apiSecret && config.walletAddress) {
+          try {
+            const executor = createExecutor(config.apiSecret, config.walletAddress);
+            // Cancel existing SL order
+            const openOrders = await executor.getOpenOrders();
+            for (const order of openOrders.filter((o: any) => o.coin === trade.coin)) {
+              await executor.cancelOrder(order.coin, order.oid);
+            }
+            // Place new SL at breakeven
+            const hlPos = hlPosMap.get(trade.coin);
+            const sz = hlPos ? Math.abs(parseFloat(hlPos.szi || "0")) : 0;
+            if (sz > 0) {
+              const slTriggerPx = parseFloat(formatHLPrice(beSL, szd));
+              const slFillPx = trade.side === "long"
+                ? parseFloat(formatHLPrice(beSL * 0.98, szd))
+                : parseFloat(formatHLPrice(beSL * 1.02, szd));
+              await executor.placeOrder({
+                coin: trade.coin, isBuy: trade.side === "short", sz,
+                limitPx: slFillPx,
+                orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+                reduceOnly: true,
+              });
+              log(`[BE] ${trade.coin} new SL order @ $${slTriggerPx} (breakeven)`, "engine");
+            }
+          } catch (beErr) { log(`[BE] SL update error: ${beErr}`, "engine"); }
+        }
+      }
+
+      // v13: Exit on TP (+0.43%) or SL
       let shouldClose = false;
       let closeReason = "";
 
@@ -907,12 +950,15 @@ class TradingEngine {
         (trade.side === "short" && currentPrice >= trade.stopLoss)
       );
 
+      const isBE = !isStillOriginalSL; // SL was moved to breakeven
       if (tpHit) {
         shouldClose = true;
         closeReason = `[PURE_RSI] TP +0.43% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
       } else if (slHit) {
         shouldClose = true;
-        closeReason = `[PURE_RSI] SL -0.5% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        closeReason = isBE
+          ? `[PURE_RSI] SL @ BE $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`
+          : `[PURE_RSI] SL -0.5% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
         log(`[SL HIT] Trade #${trade.id} ${trade.coin} ${trade.side} | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
       }
 
@@ -951,7 +997,7 @@ class TradingEngine {
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              const exitLabel = slHit ? "SL -0.5%" : "TP +0.43%";
+              const exitLabel = slHit ? (isBE ? "SL @ BE" : "SL -0.5%") : "TP +0.43%";
               closeReason = `[PURE_RSI] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
