@@ -217,13 +217,14 @@ async function fetchUserState(address: string): Promise<any> {
     const usdcBalance = spotBalances.find((b: any) => b.coin === "USDC");
     const spotEquity = parseFloat(usdcBalance?.total || "0");
 
-    if (spotEquity > perpsEquity) {
-      perpsData.marginSummary = {
-        ...perpsData.marginSummary,
-        accountValue: spotEquity.toString(),
-        totalRawUsd: spotEquity.toString(),
-      };
-    }
+    // Unified wallet: spot USDC is the true equity source (perps accountValue = 0)
+    // Use whichever is higher — spot total includes all margin + free balance
+    const trueEquity = Math.max(spotEquity, perpsEquity);
+    perpsData.marginSummary = {
+      ...perpsData.marginSummary,
+      accountValue: trueEquity.toString(),
+      totalRawUsd: trueEquity.toString(),
+    };
     return perpsData;
   } catch (e) { log(`UserState error: ${e}`, "engine"); return null; }
 }
