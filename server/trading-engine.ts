@@ -1,16 +1,15 @@
 /**
- * HyperTrader — Trading Engine v12.0 (Quant HF)
+ * HyperTrader — Trading Engine v13.0
  *
- * QUANT HIGH-FREQUENCY STRATEGY:
- *   - 50 crypto assets, 1-min timeframe
- *   - LONG when 1m RSI ≤ 30 AND price ≤ BB lower band
- *   - SHORT when 1m RSI ≥ 70 AND price ≥ BB upper band
- *   - MAKER limit orders (Alo) — 0.02% entry fee
- *   - TP: +0.20% (limit GTC), SL: -0.10% (stop-market)
- *   - 10x leverage cap, sequential execution (one trade at a time)
- *   - Streak sizing: half after 2 losses, quarter after 3
- *   - Target: 100+ trades/day, 100%+/week compound
- *   - Scan batch: 10 assets per 5-second cycle (full rotation every ~25s)
+ * PURE RSI STRATEGY — BTC + ETH:
+ *   - LONG when 5m or 15m RSI ≤ 20 → instant market buy
+ *   - SHORT when 5m or 15m RSI ≥ 81 → instant market sell
+ *   - SL: -0.50% from entry (full close)
+ *   - TP: +0.35% from entry (full close)
+ *   - 80% margin, max leverage per asset (BTC 40x, ETH 25x)
+ *   - Scan every 5 seconds
+ *   - Up to 2 parallel positions (one per coin)
+ *   - Bug fixes: cancel all orders on close, orphan position detector
  */
 
 // minifyIdentifiers: false — keep readable names for debugging
@@ -34,59 +33,8 @@ interface AssetConfig {
 }
 
 const ALLOWED_ASSETS: AssetConfig[] = [
-  // === TOP TIER (most liquid) — all capped at 10x ===
-  { coin: "BTC",    displayName: "Bitcoin",      dex: "", maxLeverage: 10, szDecimals: 5, category: "crypto", minNotional: 10 },
-  { coin: "ETH",    displayName: "Ethereum",     dex: "", maxLeverage: 10, szDecimals: 4, category: "crypto", minNotional: 10 },
-  { coin: "SOL",    displayName: "Solana",       dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "XRP",    displayName: "XRP",          dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "MATIC",  displayName: "Polygon",      dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "RNDR",   displayName: "Render",       dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  // === MID TIER (maxLev 10 on HL, capped at 10) ===
-  { coin: "AVAX",   displayName: "Avalanche",    dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "BNB",    displayName: "BNB",          dex: "", maxLeverage: 10, szDecimals: 3, category: "crypto", minNotional: 10 },
-  { coin: "LTC",    displayName: "Litecoin",     dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "ARB",    displayName: "Arbitrum",     dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "DOGE",   displayName: "Dogecoin",     dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "SUI",    displayName: "Sui",          dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "kPEPE",  displayName: "PEPE",         dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "CRV",    displayName: "Curve",        dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "LINK",   displayName: "Chainlink",    dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "FTM",    displayName: "Fantom",       dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "BCH",    displayName: "Bitcoin Cash", dex: "", maxLeverage: 10, szDecimals: 3, category: "crypto", minNotional: 10 },
-  { coin: "APT",    displayName: "Aptos",        dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "AAVE",   displayName: "Aave",         dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "MKR",    displayName: "Maker",        dex: "", maxLeverage: 10, szDecimals: 4, category: "crypto", minNotional: 10 },
-  { coin: "WLD",    displayName: "Worldcoin",    dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "TRX",    displayName: "Tron",         dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "kSHIB",  displayName: "SHIB",         dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "UNI",    displayName: "Uniswap",      dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "DOT",    displayName: "Polkadot",     dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "ADA",    displayName: "Cardano",      dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "TON",    displayName: "Toncoin",      dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "NEAR",   displayName: "Near",         dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "kBONK",  displayName: "BONK",         dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "JUP",    displayName: "Jupiter",      dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "ONDO",   displayName: "Ondo",         dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "ENA",    displayName: "Ethena",       dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "HYPE",   displayName: "Hyperliquid",  dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "TRUMP",  displayName: "Trump",        dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "FARTCOIN", displayName: "Fartcoin",   dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "ZEC",    displayName: "Zcash",        dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  // === LOWER TIER (5x on HL) ===
-  { coin: "OP",      displayName: "Optimism",    dex: "", maxLeverage: 5, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "INJ",     displayName: "Injective",   dex: "", maxLeverage: 5, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "SEI",     displayName: "Sei",         dex: "", maxLeverage: 5, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "TIA",     displayName: "Celestia",    dex: "", maxLeverage: 5, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "PENDLE",  displayName: "Pendle",      dex: "", maxLeverage: 5, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "FET",     displayName: "Fetch.ai",    dex: "", maxLeverage: 5, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "WIF",     displayName: "dogwifhat",   dex: "", maxLeverage: 5, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "PYTH",    displayName: "Pyth",        dex: "", maxLeverage: 5, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "FIL",     displayName: "Filecoin",    dex: "", maxLeverage: 5, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "TAO",     displayName: "Bittensor",   dex: "", maxLeverage: 5, szDecimals: 3, category: "crypto", minNotional: 10 },
-  { coin: "HBAR",    displayName: "Hedera",      dex: "", maxLeverage: 5, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "EIGEN",   displayName: "EigenLayer",  dex: "", maxLeverage: 5, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "VIRTUAL", displayName: "Virtuals",    dex: "", maxLeverage: 5, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "BERA",    displayName: "Berachain",   dex: "", maxLeverage: 5, szDecimals: 1, category: "crypto", minNotional: 10 },
+  { coin: "BTC",  displayName: "Bitcoin",    dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
+  { coin: "ETH",  displayName: "Ethereum",   dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
 ];
 
 // ============ STRATEGY TYPES ============
@@ -181,20 +129,6 @@ function calculateRSI(closes: number[], period: number = 14): number {
   }
   if (avgLoss === 0) return 100;
   return 100 - (100 / (1 + avgGain / avgLoss));
-}
-
-function calculateBollingerBands(closes: number[], period: number = 20, stdDevMult: number = 2): { upper: number; middle: number; lower: number; width: number } | null {
-  if (closes.length < period) return null;
-  const slice = closes.slice(-period);
-  const mean = slice.reduce((a, b) => a + b, 0) / period;
-  const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
-  const stdDev = Math.sqrt(variance);
-  return {
-    upper: mean + stdDevMult * stdDev,
-    middle: mean,
-    lower: mean - stdDevMult * stdDev,
-    width: stdDev > 0 ? ((mean + stdDevMult * stdDev) - (mean - stdDevMult * stdDev)) / mean * 100 : 0,
-  };
 }
 
 const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
@@ -349,10 +283,8 @@ class TradingEngine {
   private lastLearningReview = 0;
   private pnlResetTimestamp = "";
   private pnlResetEquity = 0;
-  // v12.0: Quant HF state
-  private consecutiveLosses = 0;
-  private failedSetups: Map<string, number> = new Map(); // "COIN_side" -> timestamp
-  private assetScanOffset = 0; // rotates through ALLOWED_ASSETS in batches
+  // v11.0: RSI cross tracking — record price at the moment RSI first hits extreme
+  private rsiCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
   // v10.9.3: Robust position sync — track consecutive "no position" readings per tradeId
   private syncMissCount: Map<number, number> = new Map();
 
@@ -407,12 +339,54 @@ class TradingEngine {
     // Clean stale scan rows for coins no longer in ALLOWED_ASSETS
     await storage.deleteScansNotIn(ALLOWED_ASSETS.map(a => a.coin));
 
+    // v13 SAFETY: Orphan position detector — close HL positions not tracked in DB
+    if (config.apiSecret && config.walletAddress) {
+      try {
+        const executor = createExecutor(config.apiSecret, config.walletAddress);
+        const hlPositions = await executor.getPositions();
+        const openTrades = await storage.getOpenTrades();
+        const dbCoins = new Set(openTrades.map((t: any) => t.coin));
+        for (const p of hlPositions) {
+          const pos = p.position;
+          const sz = Math.abs(parseFloat(pos?.szi || "0"));
+          if (sz === 0) continue;
+          if (dbCoins.has(pos.coin)) continue;
+          // This is an orphan — position on HL but no open trade in DB
+          log(`[ORPHAN] Found orphan position: ${pos.coin} size=${pos.szi} entry=${pos.entryPx} — closing`, "engine");
+          try {
+            // Cancel any orders first
+            const openOrders = await executor.getOpenOrders();
+            for (const order of openOrders.filter((o: any) => o.coin === pos.coin)) {
+              await executor.cancelOrder(order.coin, order.oid);
+              log(`[ORPHAN] Cancelled order ${order.coin} oid=${order.oid}`, "engine");
+            }
+            // Close the position
+            const isBuy = parseFloat(pos.szi) < 0; // buy to close short, sell to close long
+            const midPx = parseFloat(pos.entryPx);
+            const closePx = isBuy ? midPx * 1.05 : midPx * 0.95;
+            const ac = ALLOWED_ASSETS.find(a => a.coin === pos.coin);
+            const szd = ac?.szDecimals ?? 2;
+            await executor.placeOrder({
+              coin: pos.coin, isBuy, sz,
+              limitPx: parseFloat(formatHLPrice(closePx, szd)),
+              orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
+            });
+            log(`[ORPHAN] Closed orphan ${pos.coin} size=${pos.szi}`, "engine");
+          } catch (closeErr) {
+            log(`[ORPHAN] Failed to close ${pos.coin}: ${closeErr}`, "engine");
+          }
+        }
+      } catch (orphanErr) {
+        log(`[ORPHAN] Detector error: ${orphanErr}`, "engine");
+      }
+    }
+
     await storage.createLog({
       type: "system",
-      message: `Engine v12.0 (QHF) started | RSI≤30/≥70 + BB | ${ALLOWED_ASSETS.length} assets | 10x cap | TP +0.20% | SL -0.10% | Maker orders | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v13.0 started | PURE RSI (≤20/≥81) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | SL -0.5% | TP +0.35%`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v12.0 (QHF) started — RSI≤30/≥70 + BB — ${ALLOWED_ASSETS.length} assets — 10x cap — TP +0.20% SL -0.10% — Maker — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v13.0 started — PURE RSI (≤20/≥81, TP +0.35%, SL -0.5%) — BTC+ETH — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
   async stop() {
@@ -504,9 +478,12 @@ class TradingEngine {
         });
       }
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v12.0 QHF | ${ALLOWED_ASSETS.length} assets | Trades today: ${this.dailyTradeCount} | Consec losses: ${this.consecutiveLosses}`, "engine");
+      // Drawdown check removed — user disabled all exposure reduction
+      const canOpenNew = true;
 
-      // Fetch market data (crypto only — no xyz)
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | BTC+ETH | v13.0 PURE RSI | Trades today: ${this.dailyTradeCount}`, "engine");
+
+      // Fetch market data (crypto only)
       const mainData = await fetchMetaAndAssetCtxs("");
       const assetCtxMap: Record<string, any> = {};
       if (mainData && mainData.length >= 2) {
@@ -517,29 +494,22 @@ class TradingEngine {
         }
       }
 
-      // Open positions — sequential: only trade if NO open positions
+      // Open positions — shared pool
       const openTrades = await storage.getOpenTrades();
-      const hasOpenPosition = openTrades.length > 0;
+      const openCoins = new Set(openTrades.map(t => t.coin));
+      const maxPos = config.maxPositions || 8;
+      const slotsAvailable = maxPos - openTrades.length;
 
       // ======================================================================
-      // v12.0: QUANT HIGH-FREQUENCY STRATEGY
-      // LONG: 1m RSI ≤ 30 AND price ≤ BB lower band
-      // SHORT: 1m RSI ≥ 70 AND price ≥ BB upper band
-      // Maker (Alo) limit orders, TP +0.20%, SL -0.10%, 10x cap, sequential
-      // Batch scan: 10 assets per cycle, rotating through all 50
+      // v11.0: PURE RSI STRATEGY
+      // LONG: RSI ≤ 20 on 5m or 15m → instant market buy, SL -0.5%, TP +0.35%
+      // SHORT: RSI ≥ 81 on 5m or 15m → instant market sell, SL -0.5%, TP +0.35%
+      // 80% margin, max leverage, all 9 assets
       // ======================================================================
 
-      const BATCH_SIZE = 10;
-      const startIdx = this.assetScanOffset % ALLOWED_ASSETS.length;
-      const batch: AssetConfig[] = [];
-      for (let i = 0; i < BATCH_SIZE; i++) {
-        batch.push(ALLOWED_ASSETS[(startIdx + i) % ALLOWED_ASSETS.length]);
-      }
-      this.assetScanOffset += BATCH_SIZE;
+      let slotsUsed = 0;
 
-      let entered = false;
-
-      for (const asset of batch) {
+      for (const asset of ALLOWED_ASSETS) {
         const ctx = assetCtxMap[asset.coin];
         if (!ctx?.midPx || ctx.midPx === "None") continue;
         const price = parseFloat(ctx.midPx);
@@ -550,225 +520,225 @@ class TradingEngine {
         const prevDayPx = parseFloat(ctx.prevDayPx || String(price));
         const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : 0;
 
-        // Fetch 1m candles for RSI + Bollinger Bands
-        const ohlcv1m = await fetchCandlesOHLCV(asset.coin, "1m", 30);
-        const closes1m = ohlcv1m.map(c => c.close);
-        if (closes1m.length < 20) continue;
+        // Fetch 5m and 15m candles for RSI only
+        const [ohlcv5m, ohlcv15m] = await Promise.all([
+          fetchCandlesOHLCV(asset.coin, "5m", 30),
+          fetchCandlesOHLCV(asset.coin, "15m", 30),
+        ]);
 
-        // Intra-candle: append current live price
-        const closesWithLive = [...closes1m, price];
-        const rsi1m = calculateRSI(closesWithLive);
-        const bb = calculateBollingerBands(closesWithLive, 20, 2);
+        const c5m = ohlcv5m.map(c => c.close);
+        const c15m = ohlcv15m.map(c => c.close);
+
+        if (c5m.length < 15 && c15m.length < 15) continue;
+
+        // Intra-candle RSI — append current live price
+        const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
+        const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
 
         // Update dashboard scan row
         let scanSignal: "neutral" | "oversold_long" | "overbought_short" = "neutral";
         let scanDetails = "";
-        const LONG_RSI = 30;
-        const SHORT_RSI = 70;
+        const LONG_THRESHOLD = 20;
+        const SHORT_THRESHOLD = 81;
 
-        const bbLong = bb && price <= bb.lower;
-        const bbShort = bb && price >= bb.upper;
-
-        if (rsi1m <= LONG_RSI && bbLong) {
+        if (rsi5m <= LONG_THRESHOLD || rsi15m <= LONG_THRESHOLD) {
           scanSignal = "oversold_long";
-          scanDetails = `QHF: 1m RSI=${rsi1m.toFixed(1)} ≤${LONG_RSI} + price≤BB.low($${bb!.lower.toFixed(2)})`;
-        } else if (rsi1m >= SHORT_RSI && bbShort) {
+          scanDetails = `RSI ≤20: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
+        } else if (rsi5m >= SHORT_THRESHOLD || rsi15m >= SHORT_THRESHOLD) {
           scanSignal = "overbought_short";
-          scanDetails = `QHF: 1m RSI=${rsi1m.toFixed(1)} ≥${SHORT_RSI} + price≥BB.up($${bb!.upper.toFixed(2)})`;
+          scanDetails = `RSI ≥81: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
         } else {
-          const bbStr = bb ? `BB[${bb.lower.toFixed(2)}-${bb.upper.toFixed(2)}]` : "BB N/A";
-          scanDetails = `1m RSI=${rsi1m.toFixed(1)} | ${bbStr}`;
+          const distToLong = Math.min(Math.abs(rsi5m - LONG_THRESHOLD), Math.abs(rsi15m - LONG_THRESHOLD));
+          const distToShort = Math.min(Math.abs(rsi5m - SHORT_THRESHOLD), Math.abs(rsi15m - SHORT_THRESHOLD));
+          scanDetails = `RSI 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Nearest: ${Math.min(distToLong, distToShort).toFixed(1)} pts`;
         }
 
         await storage.upsertMarketScan({
-          coin: asset.coin, price, rsi5m: rsi1m, rsi15m: 0, rsi: rsi1m, rsi4h: 0, rsi1d: 0,
-          ema10: bb?.lower || 0, ema21: bb?.middle || 0, ema50: bb?.upper || 0,
+          coin: asset.coin, price, rsi5m, rsi15m, rsi: 50, rsi4h: 50, rsi1d: 50,
+          ema10: 0, ema21: 0, ema50: 0,
           volume24h, change24h,
           signal: scanSignal,
           fundingRate: funding, openInterest,
           confluenceScore: scanSignal !== "neutral" ? 10 : 0,
           confluenceDetails: scanDetails,
-          riskRewardRatio: 2.0,
+          riskRewardRatio: 0,
           timestamp: new Date().toISOString(),
         });
 
         // --- ENTRY LOGIC ---
-        if (scanSignal === "neutral") continue;
-        if (hasOpenPosition || entered) continue; // Sequential: one at a time
-
-        const side: "long" | "short" = scanSignal === "oversold_long" ? "long" : "short";
-
-        // Failed setup cooldown: skip if this coin+side failed within 1 hour
-        const setupKey = `${asset.coin}_${side}`;
-        const failedAt = this.failedSetups.get(setupKey);
-        if (failedAt && (Date.now() - failedAt) < 3600_000) {
-          log(`[QHF] SKIP ${asset.coin} ${side}: failed setup cooldown (${((Date.now() - failedAt) / 60000).toFixed(0)}m ago)`, "engine");
+        if (scanSignal === "neutral") {
+          // Reset cross state when RSI recovers
+          if (rsi5m > LONG_THRESHOLD + 5 && rsi15m > LONG_THRESHOLD + 5) {
+            this.rsiCrossState.delete(`${asset.coin}_5m_long`);
+            this.rsiCrossState.delete(`${asset.coin}_15m_long`);
+          }
+          if (rsi5m < SHORT_THRESHOLD - 5 && rsi15m < SHORT_THRESHOLD - 5) {
+            this.rsiCrossState.delete(`${asset.coin}_5m_short`);
+            this.rsiCrossState.delete(`${asset.coin}_15m_short`);
+          }
+          await new Promise(r => setTimeout(r, 100));
           continue;
         }
 
-        // Streak-based position sizing
-        let marginPct = 0.80;
-        if (this.consecutiveLosses >= 3) marginPct = 0.20; // quarter
-        else if (this.consecutiveLosses >= 2) marginPct = 0.40; // half
+        // Skip if already have an open trade on this coin
+        if (openCoins.has(asset.coin)) { await new Promise(r => setTimeout(r, 100)); continue; }
+        if (slotsAvailable <= slotsUsed) { await new Promise(r => setTimeout(r, 100)); continue; }
 
-        const leverage = asset.maxLeverage; // already capped at 10 in ALLOWED_ASSETS
-        const capitalForTrade = equity * marginPct;
+        // Determine side and which TF triggered
+        let side: "long" | "short";
+        let triggerTF = "";
+        let triggerRSI = 50;
+        if (scanSignal === "oversold_long") {
+          side = "long";
+          if (rsi5m <= LONG_THRESHOLD) { triggerTF = "5m"; triggerRSI = rsi5m; }
+          else { triggerTF = "15m"; triggerRSI = rsi15m; }
+        } else {
+          side = "short";
+          if (rsi5m >= SHORT_THRESHOLD) { triggerTF = "5m"; triggerRSI = rsi5m; }
+          else { triggerTF = "15m"; triggerRSI = rsi15m; }
+        }
+
+        // Check cross state — only enter once per RSI extreme event
+        const crossKey = `${asset.coin}_${triggerTF}_${side}`;
+        if (this.rsiCrossState.has(crossKey)) { await new Promise(r => setTimeout(r, 100)); continue; }
+        this.rsiCrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
+
+        // TP at +0.35%, SL at -0.5%
+        const tp = side === "long" ? price * 1.0035 : price * 0.9965;
+        const sl = side === "long" ? price * 0.995 : price * 1.005;
+
+        log(`[PURE_RSI] ${asset.coin} ${triggerTF} RSI=${triggerRSI.toFixed(1)} → ${side.toUpperCase()} @ $${price} | TP: $${tp.toFixed(2)} (+0.35%) | SL: $${sl.toFixed(2)} (-0.5%)`, "engine");
+
+        // Position sizing — 80% margin, max leverage
+        const leverage = asset.maxLeverage;
+        const capitalForTrade = equity * 0.80;
         const notionalSize = capitalForTrade * leverage;
         const assetSize = notionalSize / price;
 
         if (capitalForTrade < 5) {
-          log(`[QHF] SKIP ${asset.coin}: Capital too low ($${capitalForTrade.toFixed(2)})`, "engine");
+          log(`[PURE_RSI] SKIP ${asset.coin}: Capital too low ($${capitalForTrade.toFixed(2)})`, "engine");
           continue;
         }
 
-        // TP +0.20%, SL -0.10% (2:1 R:R)
-        const tp = side === "long" ? price * 1.002 : price * 0.998;
-        const sl = side === "long" ? price * 0.999 : price * 1.001;
-
-        log(`[QHF] ${asset.coin} 1m RSI=${rsi1m.toFixed(1)} BB=${bbLong ? "LOW" : "UP"} → ${side.toUpperCase()} @ $${price} | TP: $${tp.toFixed(4)} (+0.20%) | SL: $${sl.toFixed(4)} (-0.10%) | margin=${(marginPct*100).toFixed(0)}% | ${leverage}x`, "engine");
-
-        // Execute MAKER limit order (Alo)
+        // Execute market order (IOC)
         let fillPrice = price;
-        let filledSz = 0;
+        let filledSz = 0; // actual filled asset quantity from HL
         if (config.apiSecret && config.walletAddress) {
           try {
             const executor = createExecutor(config.apiSecret, config.walletAddress);
-            await executor.setLeverage(asset.coin, leverage, true); // cross margin
-            const limitOffset = side === "long" ? 0.9999 : 1.0001;
-            const entryLimitPx = parseFloat(formatHLPrice(price * limitOffset, asset.szDecimals));
+            const isCross = !asset.isolatedOnly;
+            await executor.setLeverage(asset.coin, leverage, isCross);
+            const slippageMult = side === "long" ? 1.01 : 0.99;
+            const orderPrice = price * slippageMult;
             const roundedSize = parseFloat(formatHLSize(assetSize, asset.szDecimals));
-            if (roundedSize <= 0) { log(`[QHF] SKIP ${asset.coin}: Rounded size is 0`, "engine"); continue; }
-
+            if (roundedSize <= 0) { log(`[PURE_RSI] SKIP ${asset.coin}: Rounded size is 0`, "engine"); continue; }
             const orderResult = await executor.placeOrder({
               coin: asset.coin, isBuy: side === "long", sz: roundedSize,
-              limitPx: entryLimitPx,
-              orderType: { limit: { tif: "Alo" } }, // Maker-only!
-              reduceOnly: false,
+              limitPx: parseFloat(formatHLPrice(orderPrice, asset.szDecimals)),
+              orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
             });
 
-            log(`[HL RAW] ${asset.coin} qhf response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
+            log(`[HL RAW] ${asset.coin} pure_rsi response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
             const status = orderResult?.response?.data?.statuses?.[0];
+            const fillPx = status?.filled?.avgPx;
+            const totalSz = status?.filled?.totalSz;
             const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
 
             if (errorMsg) {
-              log(`[QHF] ORDER REJECTED: ${asset.coin} — ${errorMsg}`, "engine");
+              log(`[PURE_RSI] ORDER REJECTED: ${asset.coin} — ${errorMsg}`, "engine");
               await storage.createLog({ type: "order_error", message: `ORDER REJECTED: ${asset.coin} ${side} — ${errorMsg}`, timestamp: new Date().toISOString() });
               continue;
             }
 
-            // Alo might rest on book — wait 2s then check fill
-            await new Promise(r => setTimeout(r, 2000));
-            const positions = await executor.getPositions();
-            const pos = positions.find((p: any) => p.position?.coin === asset.coin);
-            const filledSzFromPos = pos ? Math.abs(parseFloat(pos.position?.szi || "0")) : 0;
-
-            if (filledSzFromPos <= 0) {
-              // Not filled — cancel pending orders
-              try {
-                const openOrders = await executor.getOpenOrders();
-                for (const o of openOrders) {
-                  if (o.coin === asset.coin) await executor.cancelOrder(asset.coin, o.oid);
-                }
-              } catch (cancelErr) { log(`[QHF] Cancel error: ${cancelErr}`, "engine"); }
-              log(`[QHF] Alo not filled: ${asset.coin} ${side} — cancelled`, "engine");
+            if (fillPx && parseFloat(totalSz) > 0) {
+              fillPrice = parseFloat(fillPx);
+              filledSz = parseFloat(totalSz);
+              log(`[PURE_RSI] FILLED: ${asset.coin} ${side} sz=${totalSz} @ $${fillPx}`, "engine");
+            } else {
+              log(`[PURE_RSI] IOC NOT FILLED: ${asset.coin} ${side}`, "engine");
+              await storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: ${asset.coin} ${side}`, timestamp: new Date().toISOString() });
               continue;
             }
-
-            filledSz = filledSzFromPos;
-            // Read fill price from position
-            fillPrice = parseFloat(pos.position?.entryPx || String(price));
-            log(`[QHF] FILLED: ${asset.coin} ${side} sz=${filledSz} @ $${fillPrice}`, "engine");
-
           } catch (execErr) {
-            log(`[QHF] ORDER FAILED: ${asset.coin} — ${execErr}`, "engine");
+            log(`[PURE_RSI] ORDER FAILED: ${asset.coin} — ${execErr}`, "engine");
             await storage.createLog({ type: "order_error", message: `ORDER FAILED: ${asset.coin} ${side} — ${execErr}`, timestamp: new Date().toISOString() });
             continue;
           }
         }
 
         // Recalculate TP and SL based on actual fill price
-        const actualTP = side === "long" ? fillPrice * 1.002 : fillPrice * 0.998;
-        const actualSL = side === "long" ? fillPrice * 0.999 : fillPrice * 1.001;
+        const actualTP = side === "long" ? fillPrice * 1.0035 : fillPrice * 0.9965;
+        const actualSL = side === "long" ? fillPrice * 0.995 : fillPrice * 1.005;
+        // Actual notional = filled size * fill price (GROUND TRUTH for P&L)
         const actualNotional = (filledSz > 0 ? filledSz : assetSize) * fillPrice;
 
         const trade = await storage.createTrade({
-          coin: asset.coin, side, entryPrice: fillPrice, size: marginPct * 100, leverage,
+          coin: asset.coin, side, entryPrice: fillPrice, size: 80, leverage,
           entryEquity: equity,
           notionalValue: actualNotional,
-          rsiAtEntry: rsi1m, rsi4h: 0, rsi1d: 0,
-          ema10: bb?.lower || 0, ema21: bb?.middle || 0, ema50: bb?.upper || 0,
+          rsiAtEntry: triggerRSI, rsi4h: 0, rsi1d: 0,
+          ema10: 0, ema21: 0, ema50: 0,
           stopLoss: actualSL,
           takeProfit1: actualTP,
           takeProfit2: actualTP,
           tp1Hit: false,
-          confluenceScore: 10,
-          confluenceDetails: `QHF: 1m RSI=${rsi1m.toFixed(1)} + BB ${side === "long" ? "lower" : "upper"} touch`,
-          riskRewardRatio: 2.0,
+          confluenceScore: 0,
+          confluenceDetails: `PURE RSI: ${triggerTF} RSI=${triggerRSI.toFixed(1)}`,
+          riskRewardRatio: 0.5,
           status: "open",
-          reason: `[QHF] ${side.toUpperCase()} | 1m RSI ${rsi1m.toFixed(1)} + BB | TP +0.20% | SL -0.10% | ${leverage}x | margin ${(marginPct*100).toFixed(0)}%`,
+          reason: `[PURE_RSI] ${side.toUpperCase()} | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL -0.5% | TP +0.35% | ${leverage}x`,
           setupType: "bb_rsi_reversion",
           strategy: "bb_rsi_reversion",
           openedAt: new Date().toISOString(),
         });
 
-        // Place TP as GTC limit order (maker fee on exit!) + SL as stop-market
+        // Place SL order on Hyperliquid as stop-market
         if (config.apiSecret && config.walletAddress && filledSz > 0) {
-          const executor = createExecutor(config.apiSecret, config.walletAddress);
-          // TP: GTC limit
           try {
-            await executor.placeOrder({
-              coin: asset.coin,
-              isBuy: side === "short",
-              sz: filledSz,
-              limitPx: parseFloat(formatHLPrice(actualTP, asset.szDecimals)),
-              orderType: { limit: { tif: "Gtc" } },
-              reduceOnly: true,
-            });
-            log(`[QHF TP] ${asset.coin} TP limit @ $${displayPrice(actualTP, asset.szDecimals)} (+0.20%)`, "engine");
-          } catch (tpErr) {
-            log(`[QHF TP] FAILED ${asset.coin}: ${tpErr}`, "engine");
-          }
-          // SL: stop-market
-          try {
+            const executor = createExecutor(config.apiSecret, config.walletAddress);
             const slTriggerPx = parseFloat(formatHLPrice(actualSL, asset.szDecimals));
+            // Stop-market: trigger at SL price, fill at slippage price
             const slFillPx = side === "long"
-              ? parseFloat(formatHLPrice(actualSL * 0.98, asset.szDecimals))
-              : parseFloat(formatHLPrice(actualSL * 1.02, asset.szDecimals));
+              ? parseFloat(formatHLPrice(actualSL * 0.98, asset.szDecimals))  // sell below SL
+              : parseFloat(formatHLPrice(actualSL * 1.02, asset.szDecimals)); // buy above SL
             await executor.placeOrder({
               coin: asset.coin,
-              isBuy: side === "short",
+              isBuy: side === "short",  // close direction
               sz: filledSz,
               limitPx: slFillPx,
               orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
               reduceOnly: true,
             });
-            log(`[QHF SL] ${asset.coin} SL stop @ $${slTriggerPx} (-0.10%)`, "engine");
+            log(`[SL ORDER] ${asset.coin} SL placed @ $${slTriggerPx} (-0.5%)`, "engine");
           } catch (slErr) {
-            log(`[QHF SL] FAILED ${asset.coin}: ${slErr}`, "engine");
+            log(`[SL ORDER] FAILED ${asset.coin}: ${slErr} — will monitor in checkExits`, "engine");
           }
         }
 
         await logDecision({
           tradeId: trade.id, coin: asset.coin, action: "entry", side, price: fillPrice,
-          reasoning: `QHF: ${side.toUpperCase()} ${asset.displayName} | 1m RSI ${rsi1m.toFixed(1)} + BB | TP $${actualTP.toFixed(4)} (+0.20%) | SL $${actualSL.toFixed(4)} (-0.10%) | ${leverage}x | margin ${(marginPct*100).toFixed(0)}% | $${capitalForTrade.toFixed(0)}`,
+          reasoning: `PURE RSI: ${side.toUpperCase()} ${asset.displayName} | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL $${actualSL.toFixed(2)} (-0.5%) | TP $${actualTP.toFixed(2)} (+0.35%) | ${leverage}x MAX | $${capitalForTrade.toFixed(0)} capital`,
           equity, leverage, positionSizeUsd: capitalForTrade, strategy: "bb_rsi_reversion",
         });
 
         await storage.createLog({
           type: "trade_open",
-          message: `[QHF] ${side.toUpperCase()} ${asset.displayName} @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | 1m RSI ${rsi1m.toFixed(1)} + BB | TP +0.20% | SL -0.10% | $${capitalForTrade.toFixed(0)}`,
+          message: `[PURE_RSI] ${side.toUpperCase()} ${asset.displayName} @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL -0.5% | TP +0.35% | $${capitalForTrade.toFixed(0)}`,
           data: JSON.stringify(trade),
           timestamp: new Date().toISOString(),
         });
 
-        entered = true;
+        openCoins.add(asset.coin);
+        slotsUsed++;
         this.dailyTradeCount++;
+
+        await new Promise(r => setTimeout(r, 100));
       }
 
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${entered ? 1 : 0} entries | Batch ${startIdx}-${startIdx + BATCH_SIZE - 1} | AUM: $${equity.toLocaleString()} | v12.0 QHF | Streak: ${this.consecutiveLosses}`,
+        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v13.0 PURE RSI (≤20/≥81) BTC+ETH`,
         timestamp: new Date().toISOString(),
       });
 
@@ -791,15 +761,6 @@ class TradingEngine {
     if (!config) return;
     let openTrades = await storage.getOpenTrades();
     const mids: Record<string, string> = (await fetchAllMids()) || {};
-
-    const xyzData = await fetchMetaAndAssetCtxs("xyz");
-    if (xyzData && xyzData.length >= 2) {
-      const universe = xyzData[0]?.universe || [];
-      const ctxs = xyzData[1] || [];
-      for (let i = 0; i < universe.length; i++) {
-        if (ctxs[i]?.midPx && ctxs[i].midPx !== "None") mids[universe[i].name] = ctxs[i].midPx;
-      }
-    }
     const currentEquity = equity || this.lastKnownEquity || 0;
 
     // ============================================================
@@ -847,7 +808,16 @@ class TradingEngine {
             if (misses < 3) continue;
 
             // 3 consecutive misses — position genuinely closed on HL
-            // v11.2: Fetch actual P&L from HL fills instead of calculating
+            // v13 SAFETY: Cancel any lingering orders for this coin
+            try {
+              const openOrders = await syncExec.getOpenOrders();
+              const coinOrders = openOrders.filter((o: any) => o.coin === trade.coin);
+              for (const order of coinOrders) {
+                await syncExec.cancelOrder(order.coin, order.oid);
+                log(`[SYNC SAFETY] Cancelled lingering order ${order.coin} oid=${order.oid}`, "engine");
+              }
+            } catch (cancelErr) { log(`[SYNC SAFETY] Cancel error: ${cancelErr}`, "engine"); }
+            // Fetch actual P&L from HL fills
             this.syncMissCount.delete(trade.id);
             const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
             const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
@@ -881,14 +851,6 @@ class TradingEngine {
               closedAt: new Date().toISOString(),
             });
             log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed | HL P&L: $${netPnl.toFixed(2)}`, "engine");
-            // v12.0: Track consecutive losses + failed setups
-            if (netPnl < 0) {
-              this.consecutiveLosses++;
-              this.failedSetups.set(`${trade.coin}_${trade.side}`, Date.now());
-              log(`[QHF] Loss streak: ${this.consecutiveLosses} | Failed setup: ${trade.coin}_${trade.side}`, "engine");
-            } else {
-              this.consecutiveLosses = 0;
-            }
             await storage.createLog({
               type: "trade_close",
               message: `[SYNC] Auto-closed ${trade.coin} ${trade.side} #${trade.id} | HL P&L: $${netPnl.toFixed(2)} USDC`,
@@ -934,7 +896,7 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // v11.2: Exit on TP (+0.5%) or SL (-1%)
+      // v13: Exit on TP (+0.35%) or SL (-0.5%)
       let shouldClose = false;
       let closeReason = "";
 
@@ -947,10 +909,10 @@ class TradingEngine {
 
       if (tpHit) {
         shouldClose = true;
-        closeReason = `[QHF] TP +0.20% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        closeReason = `[PURE_RSI] TP +0.35% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
       } else if (slHit) {
         shouldClose = true;
-        closeReason = `[QHF] SL -0.10% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        closeReason = `[PURE_RSI] SL -0.5% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
         log(`[SL HIT] Trade #${trade.id} ${trade.coin} ${trade.side} | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
       }
 
@@ -959,6 +921,16 @@ class TradingEngine {
         if (config.apiSecret && config.walletAddress) {
           try {
             const executor = createExecutor(config.apiSecret, config.walletAddress);
+            // v13 SAFETY: Cancel ALL open orders for this coin BEFORE closing
+            try {
+              const openOrders = await executor.getOpenOrders();
+              const coinOrders = openOrders.filter((o: any) => o.coin === trade.coin);
+              for (const order of coinOrders) {
+                await executor.cancelOrder(order.coin, order.oid);
+                log(`[SAFETY] Cancelled open order ${order.coin} oid=${order.oid}`, "engine");
+              }
+            } catch (cancelErr) { log(`[SAFETY] Cancel orders error: ${cancelErr}`, "engine"); }
+
             const pos = hlPos || (await executor.getPositions()).find((p: any) => p.position?.coin === trade.coin)?.position;
             if (pos) {
               const sz = Math.abs(parseFloat(pos.szi || "0"));
@@ -979,8 +951,8 @@ class TradingEngine {
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              const exitLabel = slHit ? "SL -0.10%" : "TP +0.20%";
-              closeReason = `[QHF] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
+              const exitLabel = slHit ? "SL -0.5%" : "TP +0.35%";
+              closeReason = `[PURE_RSI] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
                 exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: finalPnlOfAum,
@@ -1022,17 +994,9 @@ class TradingEngine {
           equity: currentEquity, leverage: trade.leverage, strategy: "bb_rsi_reversion",
         });
 
-        // v12.0: Track consecutive losses + failed setups
-        if (pnlUsd < 0) {
-          this.consecutiveLosses++;
-          this.failedSetups.set(`${trade.coin}_${trade.side}`, Date.now());
-          log(`[QHF] Loss streak: ${this.consecutiveLosses} | Failed setup: ${trade.coin}_${trade.side}`, "engine");
-        } else {
-          this.consecutiveLosses = 0;
-        }
         await storage.createLog({
           type: "trade_close",
-          message: `CLOSED [QHF] ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
+          message: `CLOSED [PURE_RSI] ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
           timestamp: new Date().toISOString(),
         });
       } else {
@@ -1071,12 +1035,6 @@ class TradingEngine {
     if (!trade || trade.status !== "open") return null;
     const strategy: StrategyType = (trade.strategy as StrategyType) || "confluence";
     const mids: Record<string, string> = (await fetchAllMids()) || {};
-    const xyzData = await fetchMetaAndAssetCtxs("xyz");
-    if (xyzData && xyzData.length >= 2) {
-      const universe = xyzData[0]?.universe || [];
-      const ctxs = xyzData[1] || [];
-      for (let i = 0; i < universe.length; i++) { if (ctxs[i]?.midPx && ctxs[i].midPx !== "None") mids[universe[i].name] = ctxs[i].midPx; }
-    }
     const currentPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
     const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
     const config = await storage.getConfig();
@@ -1291,7 +1249,7 @@ class TradingEngine {
       drawdownPaused: false,
       dayStartEquity: this.dayStartEquity.toFixed(2),
       dailyTradeCount: this.dailyTradeCount,
-      dailyTradeTarget: 200,
+      dailyTradeTarget: 20,
       equity: currentEquity.toFixed(2),
       startingEquity: startEq.toFixed(2),
       pnlResetTimestamp: this.pnlResetTimestamp || null,
