@@ -6,12 +6,12 @@ import { Button } from "@/components/ui/button";
 import {
   TrendingUp, TrendingDown, DollarSign, Target,
   BarChart3, Activity, RefreshCw, ArrowUpRight, ArrowDownRight, Wallet,
-  Shield, Clock,
+  Clock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
-  LineChart, Line, Legend, BarChart, Bar,
+  LineChart, Line, Legend,
 } from "recharts";
 // Display-friendly asset names
 const ASSET_DISPLAY: Record<string, string> = {
@@ -82,11 +82,14 @@ export default function Dashboard() {
     refetchInterval: 10000,
   });
 
-  const { data: strategies = [] } = useQuery<any[]>({
+  const { data: strategyData } = useQuery<{ raceStartedAt: string; raceHours: number; strategies: any[] }>({
     queryKey: ["/api/strategies"],
     queryFn: () => apiRequest("GET", "/api/strategies").then(r => r.json()),
     refetchInterval: 15000,
   });
+  const strategies = strategyData?.strategies || [];
+  const raceHours = strategyData?.raceHours || 0;
+  const raceStartedAt = strategyData?.raceStartedAt || "";
 
   const triggerScan = useMutation({
     mutationFn: () => apiRequest("POST", "/api/bot/scan"),
@@ -237,135 +240,101 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* Strategy Stats */}
-      {status?.strategyStats && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          <Card>
-            <CardContent className="p-4">
-              <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-zinc-500/10 text-zinc-400 border-zinc-500/30">LEGACY (CONF)</Badge>
-              </div>
-              <div className="space-y-1 mt-2">
-                <div className="flex justify-between text-xs font-mono">
-                  <span className="text-muted-foreground">{status.strategyStats.confluence.trades} trades</span>
-                  <span>{status.strategyStats.confluence.winRate}% WR</span>
-                </div>
-                <div className={cn("text-sm font-mono font-medium", parseFloat(status.strategyStats.confluence.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
-                  {parseFloat(status.strategyStats.confluence.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.confluence.pnlUsd || "0").toFixed(2)} USDC
-                </div>
-                <div className="text-[10px] text-muted-foreground">disabled</div>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent className="p-4">
-              <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-zinc-500/10 text-zinc-400 border-zinc-500/30">LEGACY (RSI)</Badge>
-              </div>
-              <div className="space-y-1 mt-2">
-                <div className="flex justify-between text-xs font-mono">
-                  <span className="text-muted-foreground">{status.strategyStats.extreme_rsi.trades} trades</span>
-                  <span>{status.strategyStats.extreme_rsi.winRate}% WR</span>
-                </div>
-                <div className={cn("text-sm font-mono font-medium", parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
-                  {parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.extreme_rsi.pnlUsd || "0").toFixed(2)} USDC
-                </div>
-                <div className="text-[10px] text-muted-foreground">{status.strategyStats.extreme_rsi.openPositions} open</div>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent className="p-4">
-              <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">REVERSAL</Badge>
-              </div>
-              <div className="space-y-1 mt-2">
-                <div className="flex justify-between text-xs font-mono">
-                  <span className="text-muted-foreground">{status.strategyStats.bb_rsi_reversion?.trades || 0} trades</span>
-                  <span>{status.strategyStats.bb_rsi_reversion?.winRate || "0.0"}% WR</span>
-                </div>
-                <div className={cn("text-sm font-mono font-medium", parseFloat(status.strategyStats.bb_rsi_reversion?.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
-                  {parseFloat(status.strategyStats.bb_rsi_reversion?.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.bb_rsi_reversion?.pnlUsd || "0").toFixed(2)} USDC
-                </div>
-                <div className="text-[10px] text-muted-foreground">{status.strategyStats.bb_rsi_reversion?.openPositions || 0} open</div>
-              </div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardContent className="p-4">
-              <div className="flex items-center gap-2 mb-1">
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">RETEST</Badge>
-              </div>
-              <div className="space-y-1 mt-2">
-                <div className="flex justify-between text-xs font-mono">
-                  <span className="text-muted-foreground">{status.strategyStats.breakout_retest?.trades || 0} trades</span>
-                  <span>{status.strategyStats.breakout_retest?.winRate || "0.0"}% WR</span>
-                </div>
-                <div className={cn("text-sm font-mono font-medium", parseFloat(status.strategyStats.breakout_retest?.pnlUsd || "0") >= 0 ? "text-emerald-400" : "text-red-400")}>
-                  {parseFloat(status.strategyStats.breakout_retest?.pnlUsd || "0") >= 0 ? "+" : ""}{parseFloat(status.strategyStats.breakout_retest?.pnlUsd || "0").toFixed(2)} USDC
-                </div>
-                <div className="text-[10px] text-muted-foreground">{status.strategyStats.breakout_retest?.openPositions || 0} open</div>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
+      {/* ========== HEAD-TO-HEAD STRATEGY RACE ========== */}
+      {(() => {
+        const pureRsi = strategies.find((s: any) => s.strategy === "pure_rsi");
+        const hstar = strategies.find((s: any) => s.strategy === "hstar");
+        const raceDays = raceHours >= 24 ? `${(raceHours / 24).toFixed(1)}d` : `${raceHours.toFixed(1)}h`;
+        const raceStart = raceStartedAt ? new Date(raceStartedAt).toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
 
-      {/* S/R Levels */}
-      {status?.srLevels && Object.keys(status.srLevels).length > 0 && (
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-2 mb-3">
-              <Shield className="w-4 h-4 text-muted-foreground" />
-              <span className="text-sm font-medium">Support / Resistance Levels</span>
+        // Determine leader
+        const prPnl = pureRsi?.totalPnlUsd || 0;
+        const hsPnl = hstar?.totalPnlUsd || 0;
+        const leader = prPnl === hsPnl ? "tie" : prPnl > hsPnl ? "pure_rsi" : "hstar";
+
+        // Helper for stat rows
+        const StatRow = ({ label, prVal, hsVal, fmt, higherBetter = true }: { label: string; prVal: number; hsVal: number; fmt: (v: number) => string; higherBetter?: boolean }) => {
+          const prWins = higherBetter ? prVal > hsVal : prVal < hsVal;
+          const hsWins = higherBetter ? hsVal > prVal : hsVal < prVal;
+          const tie = prVal === hsVal;
+          return (
+            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 py-1 border-b border-border/30 last:border-0">
+              <span className={cn("text-xs font-mono text-right", prWins && !tie ? "text-blue-400 font-semibold" : "text-muted-foreground")}>
+                {fmt(prVal)} {prWins && !tie && "\u25C0"}
+              </span>
+              <span className="text-[10px] text-muted-foreground text-center w-20 truncate">{label}</span>
+              <span className={cn("text-xs font-mono text-left", hsWins && !tie ? "text-amber-400 font-semibold" : "text-muted-foreground")}>
+                {hsWins && !tie && "\u25B6"} {fmt(hsVal)}
+              </span>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {Object.entries(status.srLevels).map(([coin, sr]: [string, any]) => (
-                <div key={coin} className="space-y-2">
-                  <span className="text-xs font-semibold text-muted-foreground uppercase">{getAssetLabel(coin)}</span>
-                  {sr.nearestSupport && (
-                    <div className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-1.5">
-                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                        <span className="text-emerald-400">Support</span>
-                      </div>
-                      <span className="font-mono">
-                        ${sr.nearestSupport.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                        <span className="text-muted-foreground ml-1">str:{sr.nearestSupport.strength} t:{sr.nearestSupport.touches}</span>
-                        {sr.atSupport && <Badge className="ml-1 text-[8px] px-1 py-0 bg-emerald-500/20 text-emerald-400 border-0">AT</Badge>}
-                      </span>
-                    </div>
-                  )}
-                  {sr.nearestResistance && (
-                    <div className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-1.5">
-                        <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
-                        <span className="text-red-400">Resistance</span>
-                      </div>
-                      <span className="font-mono">
-                        ${sr.nearestResistance.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                        <span className="text-muted-foreground ml-1">str:{sr.nearestResistance.strength} t:{sr.nearestResistance.touches}</span>
-                        {sr.atResistance && <Badge className="ml-1 text-[8px] px-1 py-0 bg-red-500/20 text-red-400 border-0">AT</Badge>}
-                      </span>
-                    </div>
-                  )}
-                  {sr.levels && sr.levels.length > 2 && (
-                    <div className="text-[10px] text-muted-foreground">
-                      {sr.levels.slice(0, 4).map((l: any, i: number) => (
-                        <span key={i} className="mr-2">
-                          <span className={l.type === "support" ? "text-emerald-400/60" : "text-red-400/60"}>{l.type === "support" ? "S" : "R"}</span>
-                          ${l.price.toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                          <span className="text-muted-foreground/60">({l.strength})</span>
-                        </span>
-                      ))}
-                    </div>
-                  )}
+          );
+        };
+
+        return (
+          <Card>
+            <CardHeader className="pb-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <CardTitle className="text-sm font-medium">Strategy Race: PURE RSI vs H\u2605\u2605</CardTitle>
+                  <p className="text-[10px] text-muted-foreground">Head-to-head since v13.4 deploy ({raceStart}) — {raceDays} elapsed</p>
                 </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      )}
+                <Badge variant="outline" className={cn(
+                  "text-[10px] px-2 py-0.5",
+                  leader === "pure_rsi" ? "bg-blue-500/10 text-blue-400 border-blue-500/30" :
+                  leader === "hstar" ? "bg-amber-500/10 text-amber-400 border-amber-500/30" :
+                  "bg-zinc-500/10 text-zinc-400 border-zinc-500/30"
+                )}>
+                  {leader === "pure_rsi" ? "PURE RSI leads" : leader === "hstar" ? "H\u2605\u2605 leads" : "Tied"}
+                </Badge>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-4">
+                {/* Column headers */}
+                <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                  <div className="flex items-center justify-end gap-2">
+                    <div className="w-2.5 h-2.5 rounded-full bg-blue-400" />
+                    <span className="text-xs font-semibold text-blue-400">PURE RSI</span>
+                  </div>
+                  <span className="text-[10px] text-muted-foreground text-center w-20">vs</span>
+                  <div className="flex items-center gap-2">
+                    <div className="w-2.5 h-2.5 rounded-full bg-amber-400" />
+                    <span className="text-xs font-semibold text-amber-400">H\u2605\u2605</span>
+                  </div>
+                </div>
+
+                {/* Stats comparison */}
+                <div>
+                  <StatRow label="Total P&L" prVal={prPnl} hsVal={hsPnl} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)} USDC`} />
+                  <StatRow label="P&L % AUM" prVal={pureRsi?.totalPnlPct || 0} hsVal={hstar?.totalPnlPct || 0} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`} />
+                  <StatRow label="Trades" prVal={pureRsi?.totalTrades || 0} hsVal={hstar?.totalTrades || 0} fmt={v => `${v}`} />
+                  <StatRow label="Win Rate" prVal={pureRsi?.winRate || 0} hsVal={hstar?.winRate || 0} fmt={v => `${v.toFixed(1)}%`} />
+                  <StatRow label="Avg/Trade" prVal={pureRsi?.avgPnlPerTrade || 0} hsVal={hstar?.avgPnlPerTrade || 0} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}`} />
+                  <StatRow label="Best Trade" prVal={pureRsi?.bestTradeUsd || 0} hsVal={hstar?.bestTradeUsd || 0} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}`} />
+                  <StatRow label="Worst Trade" prVal={pureRsi?.worstTradeUsd || 0} hsVal={hstar?.worstTradeUsd || 0} fmt={v => `${v.toFixed(2)}`} higherBetter={false} />
+                  <StatRow label="Max DD" prVal={pureRsi?.maxDrawdownUsd || 0} hsVal={hstar?.maxDrawdownUsd || 0} fmt={v => `-$${v.toFixed(2)}`} higherBetter={false} />
+                  <StatRow label="Max DD %" prVal={pureRsi?.maxDrawdownPct || 0} hsVal={hstar?.maxDrawdownPct || 0} fmt={v => `-${v.toFixed(2)}%`} higherBetter={false} />
+                  <StatRow label="Profit Factor" prVal={pureRsi?.profitFactor || 0} hsVal={hstar?.profitFactor || 0} fmt={v => v >= 999 ? "\u221E" : `${v.toFixed(2)}`} />
+                  <StatRow label="Win Streak" prVal={pureRsi?.bestWinStreak || 0} hsVal={hstar?.bestWinStreak || 0} fmt={v => `${v}`} />
+                  <StatRow label="Loss Streak" prVal={pureRsi?.worstLossStreak || 0} hsVal={hstar?.worstLossStreak || 0} fmt={v => `${v}`} higherBetter={false} />
+                </div>
+
+                {/* W/L breakdown */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="text-center p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                    <div className="text-lg font-semibold font-mono text-blue-400">{pureRsi?.wins || 0}W / {pureRsi?.losses || 0}L</div>
+                    <div className="text-[10px] text-muted-foreground">{pureRsi?.openPositions || 0} open</div>
+                  </div>
+                  <div className="text-center p-2 rounded bg-amber-500/5 border border-amber-500/20">
+                    <div className="text-lg font-semibold font-mono text-amber-400">{hstar?.wins || 0}W / {hstar?.losses || 0}L</div>
+                    <div className="text-[10px] text-muted-foreground">{hstar?.openPositions || 0} open</div>
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        );
+      })()}
 
       {/* Charts Row */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -432,105 +401,68 @@ export default function Dashboard() {
 
 
 
-        {/* Strategy Comparison */}
+        {/* Cumulative P&L Race Chart */}
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Strategy Comparison</CardTitle>
-            <p className="text-[10px] text-muted-foreground">PURE RSI vs H★★ — cumulative P&L per strategy</p>
+            <CardTitle className="text-sm font-medium">Cumulative P&L Race</CardTitle>
+            <p className="text-[10px] text-muted-foreground">PURE RSI vs H\u2605\u2605 — since v13.4 deploy</p>
           </CardHeader>
           <CardContent>
             {(() => {
               const pureRsi = strategies.find((s: any) => s.strategy === "pure_rsi");
               const hstar = strategies.find((s: any) => s.strategy === "hstar");
-              // Build merged timeline for the line chart
-              const allPoints: { idx: number, pure_rsi?: number, hstar?: number, label: string }[] = [];
-              const maxLen = Math.max(pureRsi?.cumPnlSeries?.length || 0, hstar?.cumPnlSeries?.length || 0);
-              if (maxLen > 0) {
-                for (let i = 0; i < maxLen; i++) {
-                  const pr = pureRsi?.cumPnlSeries?.[i];
-                  const hs = hstar?.cumPnlSeries?.[i];
-                  allPoints.push({
-                    idx: i + 1,
-                    pure_rsi: pr?.cumPnl ?? (i > 0 ? allPoints[i-1]?.pure_rsi : 0),
-                    hstar: hs?.cumPnl ?? (i > 0 ? allPoints[i-1]?.hstar : 0),
-                    label: `#${i + 1}`,
-                  });
-                }
+
+              // Build time-based merged series using actual timestamps
+              const allEvents: { ts: number; pure_rsi: number; hstar: number; label: string }[] = [];
+              let prCum = 0, hsCum = 0;
+              const prSeries = (pureRsi?.cumPnlSeries || []).map((p: any) => ({ ...p, strat: "pr" }));
+              const hsSeries = (hstar?.cumPnlSeries || []).map((p: any) => ({ ...p, strat: "hs" }));
+              const merged = [...prSeries, ...hsSeries].sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+              for (const evt of merged) {
+                if (evt.strat === "pr") prCum = evt.cumPnl;
+                else hsCum = evt.cumPnl;
+                const d = new Date(evt.timestamp);
+                allEvents.push({
+                  ts: d.getTime(),
+                  pure_rsi: prCum,
+                  hstar: hsCum,
+                  label: `${d.getMonth()+1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+                });
               }
-              return (
-                <div className="space-y-3">
-                  {/* Stats cards */}
-                  <div className="grid grid-cols-2 gap-3">
-                    {[pureRsi, hstar].map((s: any) => s && (
-                      <div key={s.strategy} className={`p-3 rounded-lg border ${
-                        s.strategy === "hstar" ? "border-amber-500/30 bg-amber-500/5" : "border-blue-500/30 bg-blue-500/5"
-                      }`}>
-                        <div className="flex items-center gap-2 mb-2">
-                          <div className={`w-2 h-2 rounded-full ${s.strategy === "hstar" ? "bg-amber-400" : "bg-blue-400"}`} />
-                          <span className="text-xs font-semibold">{s.label}</span>
-                        </div>
-                        <div className="space-y-1">
-                          <div className="flex justify-between text-xs">
-                            <span className="text-muted-foreground">Trades</span>
-                            <span>{s.totalTrades} ({s.openPositions} open)</span>
-                          </div>
-                          <div className="flex justify-between text-xs">
-                            <span className="text-muted-foreground">Win Rate</span>
-                            <span className={s.winRate >= 55 ? "text-emerald-400" : s.winRate >= 45 ? "text-yellow-400" : "text-red-400"}>
-                              {s.winRate}% ({s.wins}W / {s.losses}L)
-                            </span>
-                          </div>
-                          <div className="flex justify-between text-xs">
-                            <span className="text-muted-foreground">Total P&L</span>
-                            <span className={s.totalPnlUsd >= 0 ? "text-emerald-400 font-semibold" : "text-red-400 font-semibold"}>
-                              {s.totalPnlUsd >= 0 ? "+" : ""}{s.totalPnlUsd.toFixed(2)} USDC ({s.totalPnlPct}%)
-                            </span>
-                          </div>
-                          <div className="flex justify-between text-xs">
-                            <span className="text-muted-foreground">Avg/Trade</span>
-                            <span className={s.avgPnlPerTrade >= 0 ? "text-emerald-400" : "text-red-400"}>
-                              {s.avgPnlPerTrade >= 0 ? "+" : ""}{s.avgPnlPerTrade.toFixed(2)} USDC
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  {/* Cumulative P&L line chart */}
-                  {allPoints.length > 1 ? (
-                    <ResponsiveContainer width="100%" height={180}>
-                      <LineChart data={allPoints}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
-                        <XAxis dataKey="label" tick={{ fontSize: 9 }} stroke="hsl(220, 10%, 40%)" />
-                        <YAxis
-                          tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)"
-                          tickFormatter={(v: number) => `$${v.toFixed(0)}`}
-                        />
-                        <Tooltip
-                          contentStyle={{
-                            background: "hsl(225, 18%, 10%)",
-                            border: "1px solid hsl(220, 15%, 15%)",
-                            borderRadius: "6px",
-                            fontSize: "11px",
-                          }}
-                          formatter={(value: number, name: string) => [
-                            `$${value.toFixed(2)}`,
-                            name === "pure_rsi" ? "PURE RSI" : "H\u2605\u2605"
-                          ]}
-                        />
-                        <Legend
-                          formatter={(value: string) => value === "pure_rsi" ? "PURE RSI" : "H\u2605\u2605"}
-                          wrapperStyle={{ fontSize: "11px" }}
-                        />
-                        <Line type="monotone" dataKey="pure_rsi" stroke="hsl(210, 70%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
-                        <Line type="monotone" dataKey="hstar" stroke="hsl(40, 90%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  ) : (
-                    <div className="h-[180px] flex items-center justify-center text-sm text-muted-foreground">
-                      Chart builds as trades close from both strategies
-                    </div>
-                  )}
+
+              return allEvents.length > 0 ? (
+                <ResponsiveContainer width="100%" height={200}>
+                  <LineChart data={allEvents}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
+                    <XAxis dataKey="label" tick={{ fontSize: 9 }} stroke="hsl(220, 10%, 40%)" />
+                    <YAxis
+                      tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)"
+                      tickFormatter={(v: number) => `$${v.toFixed(0)}`}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        background: "hsl(225, 18%, 10%)",
+                        border: "1px solid hsl(220, 15%, 15%)",
+                        borderRadius: "6px",
+                        fontSize: "11px",
+                      }}
+                      formatter={(value: number, name: string) => [
+                        `${value >= 0 ? "+" : ""}$${value.toFixed(2)}`,
+                        name === "pure_rsi" ? "PURE RSI" : "H\u2605\u2605"
+                      ]}
+                    />
+                    <Legend
+                      formatter={(value: string) => value === "pure_rsi" ? "PURE RSI" : "H\u2605\u2605"}
+                      wrapperStyle={{ fontSize: "11px" }}
+                    />
+                    <Line type="monotone" dataKey="pure_rsi" stroke="hsl(210, 70%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
+                    <Line type="monotone" dataKey="hstar" stroke="hsl(40, 90%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
+                  Chart builds as trades close from both strategies
                 </div>
               );
             })()}

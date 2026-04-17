@@ -139,38 +139,92 @@ export async function registerRoutes(
   });
 
   // ============ STRATEGY COMPARISON ============
-  app.get("/api/strategies", async (_req, res) => {
+  // Head-to-head race: only counts trades opened AFTER v13.4 deploy
+  const V134_RACE_START = "2026-04-17T22:23:00.000Z";
+
+  app.get("/api/strategies", async (req, res) => {
     const allTrades = await storage.getAllTrades(500);
     const currentEquity = tradingEngine.getLastKnownEquity();
 
     // Group trades by strategy
-    const stratMap: Record<string, { trades: any[], wins: number, losses: number, totalPnl: number, cumPnlSeries: { tradeNum: number, cumPnl: number, timestamp: string }[] }> = {
-      pure_rsi: { trades: [], wins: 0, losses: 0, totalPnl: 0, cumPnlSeries: [] },
-      hstar: { trades: [], wins: 0, losses: 0, totalPnl: 0, cumPnlSeries: [] },
+    type StratBucket = {
+      trades: any[]; wins: number; losses: number; totalPnl: number;
+      grossProfit: number; grossLoss: number;
+      bestTrade: number; worstTrade: number;
+      peakPnl: number; maxDrawdownUsd: number;
+      cumPnlSeries: { tradeNum: number; cumPnl: number; timestamp: string }[];
+      streakCurrent: number; streakBest: number; streakWorst: number; streakType: string;
+    };
+    const makeBucket = (): StratBucket => ({
+      trades: [], wins: 0, losses: 0, totalPnl: 0,
+      grossProfit: 0, grossLoss: 0,
+      bestTrade: 0, worstTrade: 0,
+      peakPnl: 0, maxDrawdownUsd: 0,
+      cumPnlSeries: [],
+      streakCurrent: 0, streakBest: 0, streakWorst: 0, streakType: "none",
+    });
+    const stratMap: Record<string, StratBucket> = {
+      pure_rsi: makeBucket(),
+      hstar: makeBucket(),
     };
 
-    // Sort closed trades by closedAt ascending for cumulative P&L
+    // Sort closed trades by closedAt ascending — only trades opened after v13.4 deploy
     const closedTrades = allTrades
-      .filter((t: any) => t.status === "closed" && t.closedAt)
+      .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V134_RACE_START)
       .sort((a: any, b: any) => new Date(a.closedAt).getTime() - new Date(b.closedAt).getTime());
 
     for (const t of closedTrades) {
+      const pnl = t.hlPnlUsd ?? 0;
+
       // Determine strategy bucket
       let strat = t.strategy || "";
       if (strat === "bb_rsi_reversion" || strat === "confluence" || strat === "extreme_rsi" || strat === "pure_rsi") {
         strat = "pure_rsi";
       } else if (strat !== "hstar") {
-        strat = "pure_rsi"; // legacy trades default to pure_rsi
+        strat = "pure_rsi";
       }
 
       const bucket = stratMap[strat];
       if (!bucket) continue;
 
-      const pnl = t.hlPnlUsd ?? 0;
       bucket.trades.push(t);
       bucket.totalPnl += pnl;
-      if (pnl > 0) bucket.wins++;
-      else bucket.losses++;
+      if (pnl > 0) {
+        bucket.wins++;
+        bucket.grossProfit += pnl;
+      } else {
+        bucket.losses++;
+        bucket.grossLoss += Math.abs(pnl);
+      }
+
+      // Best / worst single trade
+      if (pnl > bucket.bestTrade) bucket.bestTrade = pnl;
+      if (pnl < bucket.worstTrade) bucket.worstTrade = pnl;
+
+      // Max drawdown (peak-to-trough on cumulative P&L)
+      if (bucket.totalPnl > bucket.peakPnl) bucket.peakPnl = bucket.totalPnl;
+      const dd = bucket.peakPnl - bucket.totalPnl;
+      if (dd > bucket.maxDrawdownUsd) bucket.maxDrawdownUsd = dd;
+
+      // Win/loss streaks
+      if (pnl > 0) {
+        if (bucket.streakType === "win") {
+          bucket.streakCurrent++;
+        } else {
+          bucket.streakType = "win";
+          bucket.streakCurrent = 1;
+        }
+        if (bucket.streakCurrent > bucket.streakBest) bucket.streakBest = bucket.streakCurrent;
+      } else {
+        if (bucket.streakType === "loss") {
+          bucket.streakCurrent++;
+        } else {
+          bucket.streakType = "loss";
+          bucket.streakCurrent = 1;
+        }
+        if (bucket.streakCurrent > bucket.streakWorst) bucket.streakWorst = bucket.streakCurrent;
+      }
+
       bucket.cumPnlSeries.push({
         tradeNum: bucket.trades.length,
         cumPnl: parseFloat(bucket.totalPnl.toFixed(2)),
@@ -178,10 +232,14 @@ export async function registerRoutes(
       });
     }
 
-    // Also count open trades
+    // Also count open trades (all open, not just post-v13.4)
     const openTrades = allTrades.filter((t: any) => t.status === "open");
     const openPureRsi = openTrades.filter((t: any) => (t.strategy || "") !== "hstar").length;
     const openHstar = openTrades.filter((t: any) => t.strategy === "hstar").length;
+
+    // Race runtime
+    const raceStartMs = new Date(V134_RACE_START).getTime();
+    const raceHours = parseFloat(((Date.now() - raceStartMs) / 3600000).toFixed(1));
 
     const result = Object.entries(stratMap).map(([name, data]) => ({
       strategy: name,
@@ -193,11 +251,18 @@ export async function registerRoutes(
       totalPnlUsd: parseFloat(data.totalPnl.toFixed(2)),
       totalPnlPct: currentEquity > 0 ? parseFloat(((data.totalPnl / currentEquity) * 100).toFixed(2)) : 0,
       avgPnlPerTrade: data.trades.length > 0 ? parseFloat((data.totalPnl / data.trades.length).toFixed(2)) : 0,
+      bestTradeUsd: parseFloat(data.bestTrade.toFixed(2)),
+      worstTradeUsd: parseFloat(data.worstTrade.toFixed(2)),
+      maxDrawdownUsd: parseFloat(data.maxDrawdownUsd.toFixed(2)),
+      maxDrawdownPct: currentEquity > 0 ? parseFloat(((data.maxDrawdownUsd / currentEquity) * 100).toFixed(2)) : 0,
+      profitFactor: data.grossLoss > 0 ? parseFloat((data.grossProfit / data.grossLoss).toFixed(2)) : data.grossProfit > 0 ? 999 : 0,
+      bestWinStreak: data.streakBest,
+      worstLossStreak: data.streakWorst,
       openPositions: name === "hstar" ? openHstar : openPureRsi,
       cumPnlSeries: data.cumPnlSeries,
     }));
 
-    res.json(result);
+    res.json({ raceStartedAt: V134_RACE_START, raceHours, strategies: result });
   });
 
   app.get("/api/trades/:id", async (req, res) => {
