@@ -6,7 +6,7 @@
  * PURE RSI STRATEGY:
  *   - LONG when 5m or 15m RSI ≤ 20 → instant market buy
  *   - SHORT when 5m or 15m RSI ≥ 85 → instant market sell
- *   - NO STOP LOSS
+ *   - SL: -1.0% from entry (full close)
  *   - TP: +0.5% from entry (full close)
  *   - 80% margin, max leverage per asset
  *   - All 9 assets: BTC, ETH, SOL, XRP, GOLD, SILVER, OIL, SP500, EUR
@@ -337,10 +337,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v11.0 started | PURE RSI (≤20/≥85) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights | NO SL | TP +0.5%`,
+      message: `Engine v11.2 started | PURE RSI (≤20/≥85) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights | SL -1% | TP +0.5%`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v7 started — PURE RSI (≤20/≥85, TP +0.5%) — AUM: $${this.lastKnownEquity.toFixed(2)} | ${insights.length} learned insights | NO SL | TP +0.5%`, "engine");
+    log(`Engine v11.2 started — PURE RSI (≤20/≥85, TP +0.5%, SL -1%) — AUM: $${this.lastKnownEquity.toFixed(2)} | ${insights.length} learned insights | SL -1% | TP +0.5%`, "engine");
     this.scheduleNextScan();
   }
   async stop() {
@@ -559,10 +559,11 @@ class TradingEngine {
         if (this.rsiCrossState.has(crossKey)) { await new Promise(r => setTimeout(r, 100)); continue; }
         this.rsiCrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
 
-        // TP at 0.5%, NO SL
+        // TP at +0.5%, SL at -1.0%
         const tp = side === "long" ? price * 1.005 : price * 0.995;
+        const sl = side === "long" ? price * 0.99 : price * 1.01;
 
-        log(`[PURE_RSI] ${asset.coin} ${triggerTF} RSI=${triggerRSI.toFixed(1)} → ${side.toUpperCase()} @ $${price} | TP: $${tp.toFixed(2)} (+0.5%) | NO SL`, "engine");
+        log(`[PURE_RSI] ${asset.coin} ${triggerTF} RSI=${triggerRSI.toFixed(1)} → ${side.toUpperCase()} @ $${price} | TP: $${tp.toFixed(2)} (+0.5%) | SL: $${sl.toFixed(2)} (-1%)`, "engine");
 
         // Position sizing — 80% margin, max leverage
         const leverage = asset.maxLeverage;
@@ -621,8 +622,9 @@ class TradingEngine {
           }
         }
 
-        // Recalculate TP based on actual fill price
+        // Recalculate TP and SL based on actual fill price
         const actualTP = side === "long" ? fillPrice * 1.005 : fillPrice * 0.995;
+        const actualSL = side === "long" ? fillPrice * 0.99 : fillPrice * 1.01;
         // Actual notional = filled size * fill price (GROUND TRUTH for P&L)
         const actualNotional = (filledSz > 0 ? filledSz : assetSize) * fillPrice;
 
@@ -632,31 +634,52 @@ class TradingEngine {
           notionalValue: actualNotional,
           rsiAtEntry: triggerRSI, rsi4h: 0, rsi1d: 0,
           ema10: 0, ema21: 0, ema50: 0,
-          stopLoss: 0, // NO SL
+          stopLoss: actualSL,
           takeProfit1: actualTP,
-          takeProfit2: actualTP, // Same — single TP
+          takeProfit2: actualTP,
           tp1Hit: false,
           confluenceScore: 0,
           confluenceDetails: `PURE RSI: ${triggerTF} RSI=${triggerRSI.toFixed(1)}`,
-          riskRewardRatio: 0,
+          riskRewardRatio: 0.5,
           status: "open",
-          reason: `[PURE_RSI] ${side.toUpperCase()} | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | NO SL | TP +0.5% | ${leverage}x`,
+          reason: `[PURE_RSI] ${side.toUpperCase()} | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL -1% | TP +0.5% | ${leverage}x`,
           setupType: "bb_rsi_reversion",
           strategy: "bb_rsi_reversion",
           openedAt: new Date().toISOString(),
         });
 
-        // NO SL order on HL — user explicitly requested no stop loss
+        // Place SL order on Hyperliquid as stop-market
+        if (config.apiSecret && config.walletAddress && filledSz > 0) {
+          try {
+            const executor = createExecutor(config.apiSecret, config.walletAddress);
+            const slTriggerPx = parseFloat(formatHLPrice(actualSL, asset.szDecimals));
+            // Stop-market: trigger at SL price, fill at slippage price
+            const slFillPx = side === "long"
+              ? parseFloat(formatHLPrice(actualSL * 0.98, asset.szDecimals))  // sell below SL
+              : parseFloat(formatHLPrice(actualSL * 1.02, asset.szDecimals)); // buy above SL
+            await executor.placeOrder({
+              coin: asset.coin,
+              isBuy: side === "short",  // close direction
+              sz: filledSz,
+              limitPx: slFillPx,
+              orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+              reduceOnly: true,
+            });
+            log(`[SL ORDER] ${asset.coin} SL placed @ $${slTriggerPx} (-1% from entry $${displayPrice(fillPrice, asset.szDecimals)})`, "engine");
+          } catch (slErr) {
+            log(`[SL ORDER] FAILED ${asset.coin}: ${slErr} — will monitor in checkExits`, "engine");
+          }
+        }
 
         await logDecision({
           tradeId: trade.id, coin: asset.coin, action: "entry", side, price: fillPrice,
-          reasoning: `PURE RSI: ${side.toUpperCase()} ${asset.displayName} | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | NO SL | TP $${actualTP.toFixed(2)} (+0.5%) | ${leverage}x MAX | $${capitalForTrade.toFixed(0)} capital`,
+          reasoning: `PURE RSI: ${side.toUpperCase()} ${asset.displayName} | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL $${actualSL.toFixed(2)} (-1%) | TP $${actualTP.toFixed(2)} (+0.5%) | ${leverage}x MAX | $${capitalForTrade.toFixed(0)} capital`,
           equity, leverage, positionSizeUsd: capitalForTrade, strategy: "bb_rsi_reversion",
         });
 
         await storage.createLog({
           type: "trade_open",
-          message: `[PURE_RSI] ${side.toUpperCase()} ${asset.displayName} @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | NO SL | TP +0.5% | $${capitalForTrade.toFixed(0)}`,
+          message: `[PURE_RSI] ${side.toUpperCase()} ${asset.displayName} @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL -1% | TP +0.5% | $${capitalForTrade.toFixed(0)}`,
           data: JSON.stringify(trade),
           timestamp: new Date().toISOString(),
         });
@@ -829,15 +852,24 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // v11.0: ONLY exit on TP hit (+0.5%) — NO SL
+      // v11.2: Exit on TP (+0.5%) or SL (-1%)
       let shouldClose = false;
       let closeReason = "";
 
       const tpHit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
                     (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
+      const slHit = trade.stopLoss > 0 && (
+        (trade.side === "long" && currentPrice <= trade.stopLoss) ||
+        (trade.side === "short" && currentPrice >= trade.stopLoss)
+      );
+
       if (tpHit) {
         shouldClose = true;
         closeReason = `[PURE_RSI] TP +0.5% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+      } else if (slHit) {
+        shouldClose = true;
+        closeReason = `[PURE_RSI] SL -1% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        log(`[SL HIT] Trade #${trade.id} ${trade.coin} ${trade.side} | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
       }
 
       if (shouldClose) {
@@ -865,7 +897,8 @@ class TradingEngine {
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              closeReason = `[PURE_RSI] TP +0.5% | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
+              const exitLabel = slHit ? "SL -1%" : "TP +0.5%";
+              closeReason = `[PURE_RSI] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
                 exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: finalPnlOfAum,
