@@ -284,7 +284,7 @@ export default function Dashboard() {
                   leader === "hstar" ? "bg-amber-500/10 text-amber-400 border-amber-500/30" :
                   "bg-zinc-500/10 text-zinc-400 border-zinc-500/30"
                 )}>
-                  {leader === "pure_rsi" ? "PURE RSI leads" : leader === "hstar" ? "H\u2605\u2605 leads" : "Tied"}
+                  {leader === "pure_rsi" ? "PURE RSI leads" : leader === "hstar" ? "H★★ leads" : "Tied"}
                 </Badge>
               </div>
             </CardHeader>
@@ -299,7 +299,7 @@ export default function Dashboard() {
                   <span className="text-[10px] text-muted-foreground text-center w-20">vs</span>
                   <div className="flex items-center gap-2">
                     <div className="w-2.5 h-2.5 rounded-full bg-amber-400" />
-                    <span className="text-xs font-semibold text-amber-400">H\u2605\u2605</span>
+                    <span className="text-xs font-semibold text-amber-400">H★★</span>
                   </div>
                 </div>
 
@@ -405,7 +405,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Cumulative P&L Race</CardTitle>
-            <p className="text-[10px] text-muted-foreground">PURE RSI vs H\u2605\u2605 — since v13.4 deploy</p>
+            <p className="text-[10px] text-muted-foreground">PURE RSI vs H★★ — since v13.4 deploy</p>
           </CardHeader>
           <CardContent>
             {(() => {
@@ -449,11 +449,11 @@ export default function Dashboard() {
                       }}
                       formatter={(value: number, name: string) => [
                         `${value >= 0 ? "+" : ""}$${value.toFixed(2)}`,
-                        name === "pure_rsi" ? "PURE RSI" : "H\u2605\u2605"
+                        name === "pure_rsi" ? "PURE RSI" : "H★★"
                       ]}
                     />
                     <Legend
-                      formatter={(value: string) => value === "pure_rsi" ? "PURE RSI" : "H\u2605\u2605"}
+                      formatter={(value: string) => value === "pure_rsi" ? "PURE RSI" : "H★★"}
                       wrapperStyle={{ fontSize: "11px" }}
                     />
                     <Line type="monotone" dataKey="pure_rsi" stroke="hsl(210, 70%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
