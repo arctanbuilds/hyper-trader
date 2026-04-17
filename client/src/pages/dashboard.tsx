@@ -58,6 +58,12 @@ export default function Dashboard() {
     refetchInterval: 30000,
   });
 
+  const { data: equityCurve = [] } = useQuery({
+    queryKey: ["/api/equity-curve"],
+    queryFn: () => apiRequest("GET", "/api/equity-curve").then(r => r.json()),
+    refetchInterval: 15000,
+  });
+
   const { data: account } = useQuery({
     queryKey: ["/api/account"],
     queryFn: () => apiRequest("GET", "/api/account").then(r => r.json()),
@@ -97,6 +103,17 @@ export default function Dashboard() {
     pnl: p.totalPnlPct,
     equity: p.totalEquity,
   }));
+
+  // Equity curve from actual trade P&L (ground truth)
+  const equityChartData = (equityCurve || []).map((p: any) => {
+    const d = new Date(p.timestamp);
+    return {
+      time: `${d.getMonth()+1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+      equity: p.equity,
+      trade: p.trade,
+      pnl: p.pnl,
+    };
+  });
 
   const sessionInfo = getSessionInfo();
 
@@ -340,24 +357,30 @@ export default function Dashboard() {
 
       {/* Charts Row */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* P&L Chart */}
+        {/* Equity Curve — from actual trade P&L */}
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "265.14").toFixed(2)} USDC baseline</p>
           </CardHeader>
           <CardContent>
-            {pnlChartData.length > 0 ? (
+            {equityChartData.length > 1 ? (
               <ResponsiveContainer width="100%" height={200}>
-                <AreaChart data={pnlChartData}>
+                <AreaChart data={equityChartData}>
                   <defs>
-                    <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
+                    <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor="hsl(142, 70%, 45%)" stopOpacity={0.3} />
                       <stop offset="95%" stopColor="hsl(142, 70%, 45%)" stopOpacity={0} />
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
-                  <XAxis dataKey="time" tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)" />
-                  <YAxis tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)" />
+                  <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="hsl(220, 10%, 40%)" />
+                  <YAxis
+                    tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)"
+                    domain={['dataMin', 'dataMax']}
+                    tickFormatter={(v: number) => `$${v.toFixed(0)}`}
+                    padding={{ top: 10, bottom: 10 }}
+                  />
                   <Tooltip
                     contentStyle={{
                       background: "hsl(225, 18%, 10%)",
@@ -365,19 +388,31 @@ export default function Dashboard() {
                       borderRadius: "6px",
                       fontSize: "12px",
                     }}
+                    formatter={(value: number, name: string) => [
+                      `$${value.toFixed(2)}`, name === "equity" ? "Equity" : name
+                    ]}
+                    labelFormatter={(label: string, payload: any[]) => {
+                      const item = payload?.[0]?.payload;
+                      if (item?.trade && item.trade !== "Baseline" && item.trade !== "Now") {
+                        const sign = item.pnl >= 0 ? "+" : "";
+                        return `${label} | ${item.trade} (${sign}$${item.pnl.toFixed(2)})`;
+                      }
+                      return label;
+                    }}
                   />
                   <Area
                     type="monotone"
-                    dataKey="pnl"
+                    dataKey="equity"
                     stroke="hsl(142, 70%, 45%)"
-                    fill="url(#pnlGrad)"
+                    fill="url(#eqGrad)"
                     strokeWidth={2}
+                    dot={{ r: 3, fill: "hsl(142, 70%, 45%)", stroke: "hsl(225, 18%, 10%)", strokeWidth: 1 }}
                   />
                 </AreaChart>
               </ResponsiveContainer>
             ) : (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
-                No data yet — start the bot to begin trading
+                No trades yet — equity curve builds as trades close
               </div>
             )}
           </CardContent>

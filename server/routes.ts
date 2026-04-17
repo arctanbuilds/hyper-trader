@@ -245,6 +245,54 @@ export async function registerRoutes(
     res.json(await storage.getPnlSnapshots(since));
   });
 
+  // Equity curve built from actual trade closes — ground truth
+  app.get("/api/equity-curve", async (_req, res) => {
+    try {
+      const config = await storage.getConfig();
+      const baselineEquity = config?.pnlBaselineEquity || 265.14;
+      const baselineTs = config?.pnlBaselineTimestamp || "2026-04-16T14:40:00.000Z";
+
+      const allTrades = await storage.getAllTrades(500);
+      // Only trades after baseline, sorted by close time
+      const closedAfterBaseline = allTrades
+        .filter(t => t.status === "closed" && t.closedAt && t.openedAt >= baselineTs)
+        .sort((a, b) => (a.closedAt || "").localeCompare(b.closedAt || ""));
+
+      // Build equity curve: start at baseline, add each trade's P&L
+      const curve: { timestamp: string; equity: number; trade: string; pnl: number }[] = [];
+
+      // Starting point
+      curve.push({ timestamp: baselineTs, equity: baselineEquity, trade: "Baseline", pnl: 0 });
+
+      let runningEquity = baselineEquity;
+      for (const t of closedAfterBaseline) {
+        const tradePnl = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
+        runningEquity += tradePnl;
+        curve.push({
+          timestamp: t.closedAt || t.openedAt,
+          equity: parseFloat(runningEquity.toFixed(2)),
+          trade: `${t.side.toUpperCase()} ${t.coin}`,
+          pnl: parseFloat(tradePnl.toFixed(2)),
+        });
+      }
+
+      // Add current point (live equity)
+      const currentEquity = tradingEngine.getLastKnownEquity();
+      if (currentEquity > 0) {
+        curve.push({
+          timestamp: new Date().toISOString(),
+          equity: parseFloat(currentEquity.toFixed(2)),
+          trade: "Now",
+          pnl: 0,
+        });
+      }
+
+      res.json(curve);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ============ MARKET SCANS ============
   app.get("/api/scans", async (_req, res) => {
     res.json(await storage.getLatestScans());
