@@ -5,7 +5,7 @@
  *
  * PURE RSI STRATEGY:
  *   - LONG when 5m or 15m RSI ≤ 20 → instant market buy
- *   - SHORT when 5m or 15m RSI ≥ 85 → instant market sell
+ *   - SHORT when 5m or 15m RSI ≥ 81 → instant market sell
  *   - SL: -1.0% from entry (full close)
  *   - TP: +0.5% from entry (full close)
  *   - 80% margin, max leverage per asset
@@ -356,10 +356,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v11.2 started | PURE RSI (≤20/≥85) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights | SL -1% | TP +0.5%`,
+      message: `Engine v11.2 started | PURE RSI (≤20/≥81) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | ${insights.length} learned insights | SL -1% | TP +0.5%`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v11.2 started — PURE RSI (≤20/≥85, TP +0.5%, SL -1%) — AUM: $${this.lastKnownEquity.toFixed(2)} | ${insights.length} learned insights | SL -1% | TP +0.5%`, "engine");
+    log(`Engine v11.2 started — PURE RSI (≤20/≥81, TP +0.5%, SL -1%) — AUM: $${this.lastKnownEquity.toFixed(2)} | ${insights.length} learned insights | SL -1% | TP +0.5%`, "engine");
     this.scheduleNextScan();
   }
   async stop() {
@@ -387,7 +387,7 @@ class TradingEngine {
   private async scheduleNextScan() {
     const config = await storage.getConfig();
     if (!config?.isRunning) return;
-    this.scanTimer = setTimeout(() => this.runScanCycle(), (config.scanIntervalSecs || 10) * 1000);
+    this.scanTimer = setTimeout(() => this.runScanCycle(), (config.scanIntervalSecs || 5) * 1000);
   }
 
   private async refreshEquity(): Promise<number> {
@@ -514,14 +514,14 @@ class TradingEngine {
         let scanSignal: "neutral" | "oversold_long" | "overbought_short" = "neutral";
         let scanDetails = "";
         const LONG_THRESHOLD = 20;
-        const SHORT_THRESHOLD = 85;
+        const SHORT_THRESHOLD = 81;
 
         if (rsi5m <= LONG_THRESHOLD || rsi15m <= LONG_THRESHOLD) {
           scanSignal = "oversold_long";
           scanDetails = `RSI ≤20: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
         } else if (rsi5m >= SHORT_THRESHOLD || rsi15m >= SHORT_THRESHOLD) {
           scanSignal = "overbought_short";
-          scanDetails = `RSI ≥85: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
+          scanDetails = `RSI ≥81: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
         } else {
           const distToLong = Math.min(Math.abs(rsi5m - LONG_THRESHOLD), Math.abs(rsi15m - LONG_THRESHOLD));
           const distToShort = Math.min(Math.abs(rsi5m - SHORT_THRESHOLD), Math.abs(rsi15m - SHORT_THRESHOLD));
@@ -713,7 +713,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v11.0 PURE RSI (≤20/≥85)`,
+        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v11.0 PURE RSI (≤20/≥81)`,
         timestamp: new Date().toISOString(),
       });
 
