@@ -1,11 +1,12 @@
 /**
- * HyperTrader — Trading Engine v13.0
+ * HyperTrader — Trading Engine v13.2
  *
  * PURE RSI STRATEGY — BTC + ETH:
  *   - LONG when 5m or 15m RSI ≤ 20 → instant market buy
  *   - SHORT when 5m or 15m RSI ≥ 81 → instant market sell
  *   - SL: -0.50% from entry (full close)
  *   - TP: +0.43% from entry (full close)
+ *   - BE: SL moves to entry price after +0.2% profit
  *   - 80% margin, max leverage per asset (BTC 40x, ETH 25x)
  *   - Scan every 5 seconds
  *   - Up to 2 parallel positions (one per coin)
@@ -383,10 +384,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v13.0 started | PURE RSI (≤20/≥81) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | SL -0.5% | TP +0.43%`,
+      message: `Engine v13.2 started | PURE RSI (≤20/≥81) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()} | MAX leverage | SL -0.5% | TP +0.43% | BE @ +0.2%`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v13.0 started — PURE RSI (≤20/≥81, TP +0.43%, SL -0.5%) — BTC+ETH — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v13.2 started — PURE RSI (≤20/≥81, TP +0.43%, SL -0.5%, BE @ +0.2%) — BTC+ETH — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
   async stop() {
@@ -502,8 +503,8 @@ class TradingEngine {
 
       // ======================================================================
       // v11.0: PURE RSI STRATEGY
-      // LONG: RSI ≤ 20 on 5m or 15m → instant market buy, SL -0.5%, TP +0.35%
-      // SHORT: RSI ≥ 81 on 5m or 15m → instant market sell, SL -0.5%, TP +0.35%
+      // LONG: RSI ≤ 20 on 5m or 15m → instant market buy, SL -0.5%, TP +0.43%, BE @ +0.2%
+      // SHORT: RSI ≥ 81 on 5m or 15m → instant market sell, SL -0.5%, TP +0.43%, BE @ +0.2%
       // 80% margin, max leverage, all 9 assets
       // ======================================================================
 
@@ -738,7 +739,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v13.0 PURE RSI (≤20/≥81) BTC+ETH`,
+        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v13.2 PURE RSI (≤20/≥81) BTC+ETH | BE @ +0.2%`,
         timestamp: new Date().toISOString(),
       });
 
