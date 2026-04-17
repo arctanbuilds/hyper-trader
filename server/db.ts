@@ -185,6 +185,25 @@ export async function initDatabase() {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS aiweekly_research (
+        id SERIAL PRIMARY KEY,
+        cycle_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        sonar_research TEXT DEFAULT '',
+        sonar_picks TEXT DEFAULT '',
+        claude_picks TEXT DEFAULT '',
+        gpt_picks TEXT DEFAULT '',
+        consensus_picks TEXT DEFAULT '',
+        trades_opened INTEGER DEFAULT 0,
+        trades_closed INTEGER DEFAULT 0,
+        cycle_pnl_usd DOUBLE PRECISION DEFAULT 0,
+        research_started_at TEXT,
+        research_completed_at TEXT,
+        positions_opened_at TEXT,
+        positions_closed_at TEXT,
+        next_cycle_at TEXT,
+        created_at TEXT NOT NULL
+      );
     `);
     // Add new columns to existing tables (safe — IF NOT EXISTS equivalent via catching errors)
     const alterQueries = [
