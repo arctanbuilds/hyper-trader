@@ -58,9 +58,8 @@ export default function Dashboard() {
     refetchInterval: 30000,
   });
 
-  const { data: equityCurve = [] } = useQuery({
+  const { data: equityCurve = [] } = useQuery<any[]>({
     queryKey: ["/api/equity-curve"],
-    queryFn: () => apiRequest("GET", "/api/equity-curve").then(r => r.json()),
     refetchInterval: 15000,
   });
 
