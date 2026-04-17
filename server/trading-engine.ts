@@ -319,9 +319,22 @@ class TradingEngine {
       }
     }
 
-    // Auto-reset P&L baseline to current AUM on every start
-    this.pnlResetTimestamp = new Date().toISOString();
-    this.pnlResetEquity = this.lastKnownEquity;
+    // Restore persisted P&L baseline (survives restarts)
+    if (config.pnlBaselineTimestamp && config.pnlBaselineEquity && config.pnlBaselineEquity > 0) {
+      this.pnlResetTimestamp = config.pnlBaselineTimestamp;
+      this.pnlResetEquity = config.pnlBaselineEquity;
+      this.startingEquity = config.pnlBaselineEquity;
+      log(`[BASELINE] Restored P&L baseline: $${config.pnlBaselineEquity.toFixed(2)} from ${config.pnlBaselineTimestamp}`, "engine");
+    } else {
+      // First-time start: set baseline to current equity
+      this.pnlResetTimestamp = new Date().toISOString();
+      this.pnlResetEquity = this.lastKnownEquity;
+      await storage.updateConfig({
+        pnlBaselineEquity: this.lastKnownEquity,
+        pnlBaselineTimestamp: this.pnlResetTimestamp,
+      });
+      log(`[BASELINE] Initial P&L baseline set: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    }
 
     // Restore last review time from DB
     const lastReviewTime = await storage.getLastReviewTime();
@@ -1078,6 +1091,11 @@ class TradingEngine {
     this.pnlResetEquity = equity;
     this.startingEquity = equity;
     this.dayStartEquity = equity;
+    // Persist baseline so it survives restarts
+    await storage.updateConfig({
+      pnlBaselineEquity: equity,
+      pnlBaselineTimestamp: this.pnlResetTimestamp,
+    });
     await storage.createLog({
       type: "system",
       message: `P&L RESET: New baseline AUM $${equity.toFixed(2)} at ${this.pnlResetTimestamp}`,

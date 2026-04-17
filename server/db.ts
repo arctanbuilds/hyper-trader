@@ -196,6 +196,8 @@ export async function initDatabase() {
       "ALTER TABLE trades ADD COLUMN IF NOT EXISTS notional_value DOUBLE PRECISION",
       "ALTER TABLE trades ADD COLUMN IF NOT EXISTS hl_pnl_usd DOUBLE PRECISION",
       "ALTER TABLE trades ADD COLUMN IF NOT EXISTS hl_close_fee DOUBLE PRECISION",
+      "ALTER TABLE bot_config ADD COLUMN IF NOT EXISTS pnl_baseline_equity DOUBLE PRECISION DEFAULT 0",
+      "ALTER TABLE bot_config ADD COLUMN IF NOT EXISTS pnl_baseline_timestamp TEXT DEFAULT ''",
     ];
     for (const q of alterQueries) {
       try { await client.query(q); } catch (e) { /* column may already exist */ }

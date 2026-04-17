@@ -24,6 +24,9 @@ export const botConfig = pgTable("bot_config", {
   takeProfitPct: doublePrecision("take_profit_pct").default(0.5),
   takeProfit2Pct: doublePrecision("take_profit_2_pct").default(1.0),
   trailingStopPct: doublePrecision("trailing_stop_pct").default(0.3),
+  // P&L baseline — persisted across restarts
+  pnlBaselineEquity: doublePrecision("pnl_baseline_equity").default(0),
+  pnlBaselineTimestamp: text("pnl_baseline_timestamp").default(""),
   useTrailingStop: boolean("use_trailing_stop").default(true),
   maxRiskPerTradePct: doublePrecision("max_risk_per_trade_pct").default(0.25),
   minRiskRewardRatio: doublePrecision("min_risk_reward_ratio").default(1.0),
