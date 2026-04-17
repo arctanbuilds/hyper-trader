@@ -275,8 +275,8 @@ export default function Dashboard() {
             <CardHeader className="pb-2">
               <div className="flex items-center justify-between">
                 <div>
-                  <CardTitle className="text-sm font-medium">Strategy Race: PURE RSI vs H\u2605\u2605</CardTitle>
-                  <p className="text-[10px] text-muted-foreground">Head-to-head since v13.4 deploy ({raceStart}) — {raceDays} elapsed</p>
+                  <CardTitle className="text-sm font-medium">Strategy Race: PURE RSI vs H★★</CardTitle>
+                  <p className="text-[10px] text-muted-foreground">Head-to-head since v13.4 deploy{raceStart ? ` (${raceStart})` : ""} — {raceDays} elapsed</p>
                 </div>
                 <Badge variant="outline" className={cn(
                   "text-[10px] px-2 py-0.5",
