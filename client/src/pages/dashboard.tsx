@@ -11,6 +11,7 @@ import {
 import { cn } from "@/lib/utils";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
+  LineChart, Line, Legend, BarChart, Bar,
 } from "recharts";
 // Display-friendly asset names
 const ASSET_DISPLAY: Record<string, string> = {
@@ -79,6 +80,12 @@ export default function Dashboard() {
     queryKey: ["/api/logs"],
     queryFn: () => apiRequest("GET", "/api/logs?limit=10").then(r => r.json()),
     refetchInterval: 10000,
+  });
+
+  const { data: strategies = [] } = useQuery<any[]>({
+    queryKey: ["/api/strategies"],
+    queryFn: () => apiRequest("GET", "/api/strategies").then(r => r.json()),
+    refetchInterval: 15000,
   });
 
   const triggerScan = useMutation({
@@ -425,7 +432,114 @@ export default function Dashboard() {
 
 
 
-        {/* Open Positions */}
+        {/* Strategy Comparison */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">Strategy Comparison</CardTitle>
+            <p className="text-[10px] text-muted-foreground">PURE RSI vs H★★ — cumulative P&L per strategy</p>
+          </CardHeader>
+          <CardContent>
+            {(() => {
+              const pureRsi = strategies.find((s: any) => s.strategy === "pure_rsi");
+              const hstar = strategies.find((s: any) => s.strategy === "hstar");
+              // Build merged timeline for the line chart
+              const allPoints: { idx: number, pure_rsi?: number, hstar?: number, label: string }[] = [];
+              const maxLen = Math.max(pureRsi?.cumPnlSeries?.length || 0, hstar?.cumPnlSeries?.length || 0);
+              if (maxLen > 0) {
+                for (let i = 0; i < maxLen; i++) {
+                  const pr = pureRsi?.cumPnlSeries?.[i];
+                  const hs = hstar?.cumPnlSeries?.[i];
+                  allPoints.push({
+                    idx: i + 1,
+                    pure_rsi: pr?.cumPnl ?? (i > 0 ? allPoints[i-1]?.pure_rsi : 0),
+                    hstar: hs?.cumPnl ?? (i > 0 ? allPoints[i-1]?.hstar : 0),
+                    label: `#${i + 1}`,
+                  });
+                }
+              }
+              return (
+                <div className="space-y-3">
+                  {/* Stats cards */}
+                  <div className="grid grid-cols-2 gap-3">
+                    {[pureRsi, hstar].map((s: any) => s && (
+                      <div key={s.strategy} className={`p-3 rounded-lg border ${
+                        s.strategy === "hstar" ? "border-amber-500/30 bg-amber-500/5" : "border-blue-500/30 bg-blue-500/5"
+                      }`}>
+                        <div className="flex items-center gap-2 mb-2">
+                          <div className={`w-2 h-2 rounded-full ${s.strategy === "hstar" ? "bg-amber-400" : "bg-blue-400"}`} />
+                          <span className="text-xs font-semibold">{s.label}</span>
+                        </div>
+                        <div className="space-y-1">
+                          <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">Trades</span>
+                            <span>{s.totalTrades} ({s.openPositions} open)</span>
+                          </div>
+                          <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">Win Rate</span>
+                            <span className={s.winRate >= 55 ? "text-emerald-400" : s.winRate >= 45 ? "text-yellow-400" : "text-red-400"}>
+                              {s.winRate}% ({s.wins}W / {s.losses}L)
+                            </span>
+                          </div>
+                          <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">Total P&L</span>
+                            <span className={s.totalPnlUsd >= 0 ? "text-emerald-400 font-semibold" : "text-red-400 font-semibold"}>
+                              {s.totalPnlUsd >= 0 ? "+" : ""}{s.totalPnlUsd.toFixed(2)} USDC ({s.totalPnlPct}%)
+                            </span>
+                          </div>
+                          <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">Avg/Trade</span>
+                            <span className={s.avgPnlPerTrade >= 0 ? "text-emerald-400" : "text-red-400"}>
+                              {s.avgPnlPerTrade >= 0 ? "+" : ""}{s.avgPnlPerTrade.toFixed(2)} USDC
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {/* Cumulative P&L line chart */}
+                  {allPoints.length > 1 ? (
+                    <ResponsiveContainer width="100%" height={180}>
+                      <LineChart data={allPoints}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
+                        <XAxis dataKey="label" tick={{ fontSize: 9 }} stroke="hsl(220, 10%, 40%)" />
+                        <YAxis
+                          tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)"
+                          tickFormatter={(v: number) => `$${v.toFixed(0)}`}
+                        />
+                        <Tooltip
+                          contentStyle={{
+                            background: "hsl(225, 18%, 10%)",
+                            border: "1px solid hsl(220, 15%, 15%)",
+                            borderRadius: "6px",
+                            fontSize: "11px",
+                          }}
+                          formatter={(value: number, name: string) => [
+                            `$${value.toFixed(2)}`,
+                            name === "pure_rsi" ? "PURE RSI" : "H\u2605\u2605"
+                          ]}
+                        />
+                        <Legend
+                          formatter={(value: string) => value === "pure_rsi" ? "PURE RSI" : "H\u2605\u2605"}
+                          wrapperStyle={{ fontSize: "11px" }}
+                        />
+                        <Line type="monotone" dataKey="pure_rsi" stroke="hsl(210, 70%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
+                        <Line type="monotone" dataKey="hstar" stroke="hsl(40, 90%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <div className="h-[180px] flex items-center justify-center text-sm text-muted-foreground">
+                      Chart builds as trades close from both strategies
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Open Positions */}
+      <div className="grid grid-cols-1 gap-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Open Positions</CardTitle>
@@ -449,14 +563,14 @@ export default function Dashboard() {
                       <div>
                         <span className="text-sm font-medium">{getAssetLabel(trade.coin)}</span>
                         <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
-                        {trade.strategy === "bb_rsi_reversion" && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-                            Reversal
+                        {(trade.strategy === "bb_rsi_reversion" || trade.strategy === "pure_rsi") && (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
+                            PURE RSI
                           </Badge>
                         )}
-                        {trade.strategy === "breakout_retest" && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
-                            Retest
+                        {trade.strategy === "hstar" && (
+                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">
+                            H★★
                           </Badge>
                         )}
                         {(trade.strategy === "extreme_rsi" || trade.strategy === "confluence" || (!trade.strategy && trade.confluenceScore != null)) && (

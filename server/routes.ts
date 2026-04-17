@@ -138,6 +138,68 @@ export async function registerRoutes(
     res.json(enriched);
   });
 
+  // ============ STRATEGY COMPARISON ============
+  app.get("/api/strategies", async (_req, res) => {
+    const allTrades = await storage.getAllTrades(500);
+    const currentEquity = tradingEngine.getLastKnownEquity();
+
+    // Group trades by strategy
+    const stratMap: Record<string, { trades: any[], wins: number, losses: number, totalPnl: number, cumPnlSeries: { tradeNum: number, cumPnl: number, timestamp: string }[] }> = {
+      pure_rsi: { trades: [], wins: 0, losses: 0, totalPnl: 0, cumPnlSeries: [] },
+      hstar: { trades: [], wins: 0, losses: 0, totalPnl: 0, cumPnlSeries: [] },
+    };
+
+    // Sort closed trades by closedAt ascending for cumulative P&L
+    const closedTrades = allTrades
+      .filter((t: any) => t.status === "closed" && t.closedAt)
+      .sort((a: any, b: any) => new Date(a.closedAt).getTime() - new Date(b.closedAt).getTime());
+
+    for (const t of closedTrades) {
+      // Determine strategy bucket
+      let strat = t.strategy || "";
+      if (strat === "bb_rsi_reversion" || strat === "confluence" || strat === "extreme_rsi" || strat === "pure_rsi") {
+        strat = "pure_rsi";
+      } else if (strat !== "hstar") {
+        strat = "pure_rsi"; // legacy trades default to pure_rsi
+      }
+
+      const bucket = stratMap[strat];
+      if (!bucket) continue;
+
+      const pnl = t.hlPnlUsd ?? 0;
+      bucket.trades.push(t);
+      bucket.totalPnl += pnl;
+      if (pnl > 0) bucket.wins++;
+      else bucket.losses++;
+      bucket.cumPnlSeries.push({
+        tradeNum: bucket.trades.length,
+        cumPnl: parseFloat(bucket.totalPnl.toFixed(2)),
+        timestamp: t.closedAt,
+      });
+    }
+
+    // Also count open trades
+    const openTrades = allTrades.filter((t: any) => t.status === "open");
+    const openPureRsi = openTrades.filter((t: any) => (t.strategy || "") !== "hstar").length;
+    const openHstar = openTrades.filter((t: any) => t.strategy === "hstar").length;
+
+    const result = Object.entries(stratMap).map(([name, data]) => ({
+      strategy: name,
+      label: name === "hstar" ? "H\u2605\u2605 (2:1 R:R)" : "PURE RSI (Conservative)",
+      totalTrades: data.trades.length,
+      wins: data.wins,
+      losses: data.losses,
+      winRate: data.trades.length > 0 ? parseFloat(((data.wins / data.trades.length) * 100).toFixed(1)) : 0,
+      totalPnlUsd: parseFloat(data.totalPnl.toFixed(2)),
+      totalPnlPct: currentEquity > 0 ? parseFloat(((data.totalPnl / currentEquity) * 100).toFixed(2)) : 0,
+      avgPnlPerTrade: data.trades.length > 0 ? parseFloat((data.totalPnl / data.trades.length).toFixed(2)) : 0,
+      openPositions: name === "hstar" ? openHstar : openPureRsi,
+      cumPnlSeries: data.cumPnlSeries,
+    }));
+
+    res.json(result);
+  });
+
   app.get("/api/trades/:id", async (req, res) => {
     const trade = await storage.getTradeById(parseInt(req.params.id));
     if (!trade) return res.status(404).json({ error: "Trade not found" });
