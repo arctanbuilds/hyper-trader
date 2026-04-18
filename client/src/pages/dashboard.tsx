@@ -70,7 +70,8 @@ export default function Dashboard() {
     queryFn: () => apiRequest("GET", "/api/strategies").then(r => r.json()),
     refetchInterval: 15000,
   });
-  const degenStrategy = strategyData?.strategies?.[0];
+  const rsi18Strat = strategyData?.strategies?.find((s: any) => s.strategy === "rsi18");
+  const divStrat = strategyData?.strategies?.find((s: any) => s.strategy === "divergence");
   const raceHours = strategyData?.raceHours || 0;
 
   const triggerScan = useMutation({
@@ -106,18 +107,50 @@ export default function Dashboard() {
     };
   });
 
-  // DEGEN_RSI P&L line chart
-  const degenChartData = (degenStrategy?.cumPnlSeries || []).map((p: any) => {
-    const d = new Date(p.timestamp);
-    return {
-      time: `${d.getMonth()+1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
-      pnl: p.cumPnl,
-      tradeNum: p.tradeNum,
-    };
-  });
+  // Merged cumulative P&L data for dual strategy comparison chart
+  const rsi18Series = (rsi18Strat?.cumPnlSeries || []).map((p: any) => ({
+    timestamp: new Date(p.timestamp).getTime(),
+    rsi18Pnl: p.cumPnl,
+  }));
+  const divSeries = (divStrat?.cumPnlSeries || []).map((p: any) => ({
+    timestamp: new Date(p.timestamp).getTime(),
+    divPnl: p.cumPnl,
+  }));
+
+  // Merge both series into a single timeline
+  const mergedMap = new Map<number, { rsi18Pnl?: number; divPnl?: number }>();
+  for (const p of rsi18Series) {
+    const existing = mergedMap.get(p.timestamp) || {};
+    mergedMap.set(p.timestamp, { ...existing, rsi18Pnl: p.rsi18Pnl });
+  }
+  for (const p of divSeries) {
+    const existing = mergedMap.get(p.timestamp) || {};
+    mergedMap.set(p.timestamp, { ...existing, divPnl: p.divPnl });
+  }
+  const comparisonData = Array.from(mergedMap.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([ts, vals]) => {
+      const d = new Date(ts);
+      return {
+        time: `${d.getMonth()+1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+        rsi18Pnl: vals.rsi18Pnl,
+        divPnl: vals.divPnl,
+      };
+    });
+  // Forward-fill missing values
+  let lastRsi18 = 0, lastDiv = 0;
+  for (const p of comparisonData) {
+    if (p.rsi18Pnl !== undefined) lastRsi18 = p.rsi18Pnl; else p.rsi18Pnl = lastRsi18;
+    if (p.divPnl !== undefined) lastDiv = p.divPnl; else p.divPnl = lastDiv;
+  }
 
   const sessionInfo = getSessionInfo();
   const raceDays = raceHours >= 24 ? `${(raceHours / 24).toFixed(1)}d` : `${raceHours.toFixed(1)}h`;
+
+  // Max positions display
+  const rsi18Open = status?.strategyStats?.rsi18?.openPositions || 0;
+  const divOpen = status?.strategyStats?.divergence?.openPositions || 0;
+  const totalOpen = (status?.openPositions || 0);
 
   return (
     <div className="p-6 space-y-6 max-w-[1400px]">
@@ -126,7 +159,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v14.0 DEGEN_RSI — Real-time overview</p>
+            <p className="text-sm text-muted-foreground">v14.1 DUAL — RSI18 + DIVERGENCE</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -194,13 +227,10 @@ export default function Dashboard() {
               <Activity className="w-4 h-4 text-muted-foreground" />
             </div>
             <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
-              {status?.openPositions || 0} / 1
+              {totalOpen} / 3
             </div>
-            <p className={cn(
-              "text-[10px] font-mono mt-1",
-              parseFloat(status?.openPnl || "0") >= 0 ? "text-emerald-400/70" : "text-red-400/70"
-            )}>
-              {parseFloat(status?.openPnl || "0") >= 0 ? "+" : ""}{status?.openPnl || "0.00"}% ({fmtUsd(openPnlUsd)})
+            <p className="text-[10px] text-muted-foreground mt-1">
+              RSI18: {rsi18Open}/1 | DIV: {divOpen}/2
             </p>
           </CardContent>
         </Card>
@@ -221,85 +251,128 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* ========== DEGEN RSI v14.0 Strategy Card ========== */}
+      {/* ========== STRATEGY COMPARISON — RSI18 vs DIVERGENCE ========== */}
       <Card>
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <div>
-              <CardTitle className="text-sm font-medium">DEGEN RSI — v14.0</CardTitle>
+              <CardTitle className="text-sm font-medium">Strategy Comparison — v14.1</CardTitle>
               <p className="text-[10px] text-muted-foreground mt-0.5">
-                BTC only | LONG | RSI ≤25 (5m+15m) | 90% equity | 40x | SL -0.5% | TP +0.43% | BE @ +0.25% | {raceDays} running
+                50/50 equity split | SL -0.5% | BE @ +0.25% | {raceDays} running
               </p>
             </div>
-            <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-              Active
-            </Badge>
+            <div className="flex gap-1.5">
+              <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                RSI18
+              </Badge>
+              <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-blue-500/10 text-blue-400 border-blue-500/30">
+                DIVERGENCE
+              </Badge>
+            </div>
           </div>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-              <div className="text-[10px] text-muted-foreground mb-1">Trades</div>
-              <div className="text-base font-semibold font-mono text-emerald-400">
-                {degenStrategy?.totalTrades || 0}
+          {/* Two-column stat boxes */}
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            {/* RSI18 column — green theme */}
+            <div className="space-y-2">
+              <div className="text-[10px] font-medium text-emerald-400 text-center mb-1">
+                RSI18 — BTC only | RSI ≤18 | TP +0.5%
               </div>
-              <div className="text-[9px] text-muted-foreground">{degenStrategy?.wins || 0}W / {degenStrategy?.losses || 0}L</div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                  <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
+                  <div className="text-sm font-semibold font-mono text-emerald-400">
+                    {rsi18Strat?.totalTrades || 0}
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">{rsi18Strat?.wins || 0}W / {rsi18Strat?.losses || 0}L</div>
+                </div>
+                <div className="p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                  <div className="text-[9px] text-muted-foreground mb-0.5">Win Rate</div>
+                  <div className="text-sm font-semibold font-mono text-emerald-400">
+                    {rsi18Strat?.winRate || 0}%
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">{rsi18Strat?.bestWinStreak || 0}W / {rsi18Strat?.worstLossStreak || 0}L streak</div>
+                </div>
+                <div className="p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                  <div className="text-[9px] text-muted-foreground mb-0.5">Total P&L</div>
+                  <div className={cn(
+                    "text-sm font-semibold font-mono",
+                    (rsi18Strat?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                  )}>
+                    {(rsi18Strat?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(rsi18Strat?.totalPnlUsd || 0).toFixed(2)}
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">
+                    {(rsi18Strat?.totalPnlPct || 0) >= 0 ? "+" : ""}{(rsi18Strat?.totalPnlPct || 0).toFixed(2)}% AUM
+                  </div>
+                </div>
+                <div className="p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                  <div className="text-[9px] text-muted-foreground mb-0.5">Avg / Trade</div>
+                  <div className={cn(
+                    "text-sm font-semibold font-mono",
+                    (rsi18Strat?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                  )}>
+                    {(rsi18Strat?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(rsi18Strat?.avgPnlPerTrade || 0).toFixed(2)}
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">
+                    PF: {(rsi18Strat?.profitFactor || 0) >= 999 ? "∞" : (rsi18Strat?.profitFactor || 0).toFixed(2)}
+                  </div>
+                </div>
+              </div>
             </div>
-            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-              <div className="text-[10px] text-muted-foreground mb-1">Win Rate</div>
-              <div className="text-base font-semibold font-mono text-emerald-400">
-                {degenStrategy?.winRate || 0}%
+
+            {/* DIVERGENCE column — blue theme */}
+            <div className="space-y-2">
+              <div className="text-[10px] font-medium text-blue-400 text-center mb-1">
+                DIVERGENCE — 10 assets | Div + RSI &lt;30 | TP +0.43%
               </div>
-              <div className="text-[9px] text-muted-foreground">Streak: {degenStrategy?.bestWinStreak || 0}W / {degenStrategy?.worstLossStreak || 0}L</div>
-            </div>
-            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-              <div className="text-[10px] text-muted-foreground mb-1">Total P&L</div>
-              <div className={cn(
-                "text-base font-semibold font-mono",
-                (degenStrategy?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
-              )}>
-                {(degenStrategy?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(degenStrategy?.totalPnlUsd || 0).toFixed(2)}
-              </div>
-              <div className="text-[9px] text-muted-foreground">
-                {(degenStrategy?.totalPnlPct || 0) >= 0 ? "+" : ""}{(degenStrategy?.totalPnlPct || 0).toFixed(2)}% AUM
-              </div>
-            </div>
-            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-              <div className="text-[10px] text-muted-foreground mb-1">Avg / Trade</div>
-              <div className={cn(
-                "text-base font-semibold font-mono",
-                (degenStrategy?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
-              )}>
-                {(degenStrategy?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(degenStrategy?.avgPnlPerTrade || 0).toFixed(2)}
-              </div>
-              <div className="text-[9px] text-muted-foreground">
-                Best: +${(degenStrategy?.bestTradeUsd || 0).toFixed(2)} | Worst: ${(degenStrategy?.worstTradeUsd || 0).toFixed(2)}
+              <div className="grid grid-cols-2 gap-2">
+                <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                  <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
+                  <div className="text-sm font-semibold font-mono text-blue-400">
+                    {divStrat?.totalTrades || 0}
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">{divStrat?.wins || 0}W / {divStrat?.losses || 0}L</div>
+                </div>
+                <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                  <div className="text-[9px] text-muted-foreground mb-0.5">Win Rate</div>
+                  <div className="text-sm font-semibold font-mono text-blue-400">
+                    {divStrat?.winRate || 0}%
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">{divStrat?.bestWinStreak || 0}W / {divStrat?.worstLossStreak || 0}L streak</div>
+                </div>
+                <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                  <div className="text-[9px] text-muted-foreground mb-0.5">Total P&L</div>
+                  <div className={cn(
+                    "text-sm font-semibold font-mono",
+                    (divStrat?.totalPnlUsd || 0) >= 0 ? "text-blue-400" : "text-red-400"
+                  )}>
+                    {(divStrat?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(divStrat?.totalPnlUsd || 0).toFixed(2)}
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">
+                    {(divStrat?.totalPnlPct || 0) >= 0 ? "+" : ""}{(divStrat?.totalPnlPct || 0).toFixed(2)}% AUM
+                  </div>
+                </div>
+                <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                  <div className="text-[9px] text-muted-foreground mb-0.5">Avg / Trade</div>
+                  <div className={cn(
+                    "text-sm font-semibold font-mono",
+                    (divStrat?.avgPnlPerTrade || 0) >= 0 ? "text-blue-400" : "text-red-400"
+                  )}>
+                    {(divStrat?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(divStrat?.avgPnlPerTrade || 0).toFixed(2)}
+                  </div>
+                  <div className="text-[8px] text-muted-foreground">
+                    PF: {(divStrat?.profitFactor || 0) >= 999 ? "∞" : (divStrat?.profitFactor || 0).toFixed(2)}
+                  </div>
+                </div>
               </div>
             </div>
           </div>
 
-          {/* Additional stats row */}
-          <div className="grid grid-cols-3 gap-2 mb-4">
-            <div className="p-2 rounded bg-muted/30 border border-border/50 text-center">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Max Drawdown</div>
-              <div className="text-xs font-mono text-red-400">-${(degenStrategy?.maxDrawdownUsd || 0).toFixed(2)}</div>
-            </div>
-            <div className="p-2 rounded bg-muted/30 border border-border/50 text-center">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Profit Factor</div>
-              <div className="text-xs font-mono">
-                {(degenStrategy?.profitFactor || 0) >= 999 ? "∞" : (degenStrategy?.profitFactor || 0).toFixed(2)}
-              </div>
-            </div>
-            <div className="p-2 rounded bg-muted/30 border border-border/50 text-center">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Open Positions</div>
-              <div className="text-xs font-mono text-emerald-400">{degenStrategy?.openPositions || 0} / 1</div>
-            </div>
-          </div>
-
-          {/* DEGEN_RSI Cumulative P&L chart */}
-          {degenChartData.length > 1 ? (
-            <ResponsiveContainer width="100%" height={180}>
-              <LineChart data={degenChartData}>
+          {/* Cumulative P&L comparison chart — green RSI18 vs blue DIVERGENCE */}
+          {comparisonData.length > 1 ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <LineChart data={comparisonData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
                 <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="hsl(220, 10%, 40%)" />
                 <YAxis
@@ -313,38 +386,47 @@ export default function Dashboard() {
                     borderRadius: "6px",
                     fontSize: "11px",
                   }}
-                  formatter={(value: number) => [
-                    `${value >= 0 ? "+" : ""}$${value.toFixed(2)}`, "Cumulative P&L"
+                  formatter={(value: number, name: string) => [
+                    `${value >= 0 ? "+" : ""}$${value.toFixed(2)}`,
+                    name === "rsi18Pnl" ? "RSI18" : "DIVERGENCE"
                   ]}
-                  labelFormatter={(label: string, payload: any[]) => {
-                    const item = payload?.[0]?.payload;
-                    return item ? `Trade #${item.tradeNum} — ${label}` : label;
-                  }}
+                />
+                <Legend
+                  formatter={(value: string) => value === "rsi18Pnl" ? "RSI18" : "DIVERGENCE"}
+                  wrapperStyle={{ fontSize: "10px" }}
                 />
                 <Line
                   type="monotone"
-                  dataKey="pnl"
+                  dataKey="rsi18Pnl"
                   stroke="hsl(145, 65%, 50%)"
                   strokeWidth={2}
                   dot={{ r: 3, fill: "hsl(145, 65%, 50%)", stroke: "hsl(225, 18%, 10%)", strokeWidth: 1 }}
+                  connectNulls
+                />
+                <Line
+                  type="monotone"
+                  dataKey="divPnl"
+                  stroke="hsl(217, 91%, 60%)"
+                  strokeWidth={2}
+                  dot={{ r: 3, fill: "hsl(217, 91%, 60%)", stroke: "hsl(225, 18%, 10%)", strokeWidth: 1 }}
+                  connectNulls
                 />
               </LineChart>
             </ResponsiveContainer>
           ) : (
-            <div className="h-[180px] flex items-center justify-center text-sm text-muted-foreground">
-              P&L chart builds as trades close
+            <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
+              Comparison chart builds as trades close
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Charts Row */}
+      {/* Charts Row — Equity Curve */}
       <div className="grid grid-cols-1 lg:grid-cols-1 gap-4">
-        {/* Equity Curve */}
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "658").toFixed(2)} USDC baseline (v14.0)</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "658").toFixed(2)} USDC baseline (v14.1)</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
@@ -411,56 +493,61 @@ export default function Dashboard() {
           <CardContent>
             {openTrades.length > 0 ? (
               <div className="space-y-2">
-                {openTrades.map((trade: any) => (
-                  <div
-                    key={trade.id}
-                    className="flex items-center justify-between p-2.5 rounded-md bg-muted/50 border border-border"
-                    data-testid={`card-position-${trade.id}`}
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <Badge
-                        variant="default"
-                        className="text-[10px] px-1.5 py-0 uppercase"
-                      >
-                        LONG
-                      </Badge>
-                      <div>
-                        <span className="text-sm font-medium">{trade.coin}</span>
-                        <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
-                        <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-                          DEGEN RSI
+                {openTrades.map((trade: any) => {
+                  const isRsi18 = trade.strategy === "rsi18";
+                  const stratLabel = isRsi18 ? "RSI18" : "DIV";
+                  const badgeBg = isRsi18 ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" : "bg-blue-500/10 text-blue-400 border-blue-500/30";
+                  return (
+                    <div
+                      key={trade.id}
+                      className="flex items-center justify-between p-2.5 rounded-md bg-muted/50 border border-border"
+                      data-testid={`card-position-${trade.id}`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <Badge
+                          variant="default"
+                          className="text-[10px] px-1.5 py-0 uppercase"
+                        >
+                          LONG
                         </Badge>
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className={cn(
-                        "text-sm font-mono font-medium",
-                        (trade.pnlOfAum || 0) >= 0 ? "text-emerald-500" : "text-red-500"
-                      )}>
-                        {(trade.pnlOfAum || 0) >= 0 ? "+" : ""}{(trade.pnlOfAum || 0).toFixed(3)}% AUM
-                      </div>
-                      <div className={cn(
-                        "text-[10px] font-mono",
-                        (trade.pnlUsd || 0) >= 0 ? "text-emerald-400/60" : "text-red-400/60"
-                      )}>
-                        {fmtUsd(trade.pnlUsd || 0)}
-                        {trade.hlPnlUsd !== null && trade.hlPnlUsd !== undefined && (
-                          <span className="text-[8px] text-muted-foreground ml-1">HL</span>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-1.5 justify-end">
-                        <span className="text-[10px] text-muted-foreground font-mono">
-                          ${trade.entryPrice?.toFixed(2)}
-                        </span>
-                        {trade.stopLoss > 0 && (
-                          <Badge className="text-[8px] px-1 py-0 bg-amber-500/20 text-amber-400 border-0">
-                            BE SL
+                        <div>
+                          <span className="text-sm font-medium">{trade.coin}</span>
+                          <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
+                          <Badge variant="outline" className={cn("ml-2 text-[9px] px-1 py-0", badgeBg)}>
+                            {stratLabel}
                           </Badge>
-                        )}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className={cn(
+                          "text-sm font-mono font-medium",
+                          (trade.pnlOfAum || 0) >= 0 ? "text-emerald-500" : "text-red-500"
+                        )}>
+                          {(trade.pnlOfAum || 0) >= 0 ? "+" : ""}{(trade.pnlOfAum || 0).toFixed(3)}% AUM
+                        </div>
+                        <div className={cn(
+                          "text-[10px] font-mono",
+                          (trade.pnlUsd || 0) >= 0 ? "text-emerald-400/60" : "text-red-400/60"
+                        )}>
+                          {fmtUsd(trade.pnlUsd || 0)}
+                          {trade.hlPnlUsd !== null && trade.hlPnlUsd !== undefined && (
+                            <span className="text-[8px] text-muted-foreground ml-1">HL</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1.5 justify-end">
+                          <span className="text-[10px] text-muted-foreground font-mono">
+                            ${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}
+                          </span>
+                          {trade.stopLoss > 0 && trade.stopLoss >= trade.entryPrice * 0.999 && (
+                            <Badge className="text-[8px] px-1 py-0 bg-amber-500/20 text-amber-400 border-0">
+                              BE SL
+                            </Badge>
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
@@ -484,7 +571,7 @@ export default function Dashboard() {
                   <tr className="border-b border-border text-muted-foreground">
                     <th className="text-left py-1.5 px-1 font-medium">Date/Time</th>
                     <th className="text-left py-1.5 px-1 font-medium">Asset</th>
-                    <th className="text-left py-1.5 px-1 font-medium">Side</th>
+                    <th className="text-left py-1.5 px-1 font-medium">Strategy</th>
                     <th className="text-right py-1.5 px-1 font-medium">Entry</th>
                     <th className="text-right py-1.5 px-1 font-medium">Exit</th>
                     <th className="text-right py-1.5 px-1 font-medium">P&L (USDC)</th>
@@ -496,8 +583,9 @@ export default function Dashboard() {
                     const net = (trade.hlPnlUsd || 0) - (trade.hlCloseFee || 0);
                     const openDate = trade.openedAt ? new Date(trade.openedAt) : null;
                     const closeDate = trade.closedAt ? new Date(trade.closedAt) : null;
+                    const isRsi18 = trade.strategy === "rsi18";
                     const reason = (trade.closeReason || "")
-                      .replace(/\[DEGEN_RSI\]\s*/g, "")
+                      .replace(/\[(RSI18|DIV)\]\s*/g, "")
                       .replace(/\s*\|\s*HL P&L.*$/g, "")
                       .replace(/Position closed on HL \(sync\)\s*\|?\s*/g, "Sync")
                       .replace(/P&L:.*$/g, "")
@@ -514,10 +602,13 @@ export default function Dashboard() {
                         <td className="py-1.5 px-1 font-medium">{trade.coin}</td>
                         <td className="py-1.5 px-1">
                           <Badge
-                            variant="default"
-                            className="text-[9px] px-1 py-0 uppercase"
+                            variant="outline"
+                            className={cn(
+                              "text-[9px] px-1 py-0",
+                              isRsi18 ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" : "bg-blue-500/10 text-blue-400 border-blue-500/30"
+                            )}
                           >
-                            {trade.side}
+                            {isRsi18 ? "RSI18" : "DIV"}
                           </Badge>
                         </td>
                         <td className="py-1.5 px-1 text-right font-mono">${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}</td>

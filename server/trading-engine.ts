@@ -1,20 +1,17 @@
 /**
- * HyperTrader — Trading Engine v14.0
+ * HyperTrader — Trading Engine v14.1
  *
- * SINGLE STRATEGY: DEGEN_RSI
+ * DUAL STRATEGY ENGINE:
+ *   A) RSI18  — BTC ONLY, LONG only, RSI ≤ 18 on 5m OR 15m, 50% equity, 40x, 1 position max
+ *   B) DIVERGENCE — 10 assets, LONG only, bullish divergence + RSI < 30, 50% equity, asset maxLev, 2 positions max
  *
- * - BTC ONLY, LONG only
- * - RSI ≤ 25 on BOTH 5m AND 15m simultaneously
- * - 90% of equity per trade
- * - 40x leverage (BTC max)
- * - 1 position at a time
- * - SL: -0.5% from fill (placed immediately)
- * - TP: +0.43% from fill price
- * - Breakeven SL: when price hits +0.25%, move SL to entry price
- * - Horizontal support detection (informational, 1h candles)
- *
- * BTC only, scan every 5 seconds
- * Bug fixes: cancel all orders on close, orphan position detector
+ * Shared rules:
+ *   - SL -0.5% from fill (placed immediately)
+ *   - TP: RSI18 +0.5% | DIV +0.43%
+ *   - Breakeven SL: move SL to entry when price hits +0.25%
+ *   - Scan every 5 seconds
+ *   - Cancel all orders on close (ghost position prevention)
+ *   - Orphan detector on startup
  */
 
 // minifyIdentifiers: false — keep readable names for debugging
@@ -38,11 +35,20 @@ interface AssetConfig {
 }
 
 const ALLOWED_ASSETS: AssetConfig[] = [
-  { coin: "BTC",  displayName: "Bitcoin",    dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
+  { coin: "BTC",  displayName: "Bitcoin",     dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
+  { coin: "ETH",  displayName: "Ethereum",    dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
+  { coin: "SOL",  displayName: "Solana",      dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "HYPE", displayName: "Hyperliquid", dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "XRP",  displayName: "Ripple",      dex: "", maxLeverage: 20, szDecimals: 0, category: "crypto", minNotional: 10 },
+  { coin: "DOGE", displayName: "Dogecoin",    dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
+  { coin: "SUI",  displayName: "Sui",         dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
+  { coin: "LINK", displayName: "Chainlink",   dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
+  { coin: "AVAX", displayName: "Avalanche",   dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "BNB",  displayName: "BNB",         dex: "", maxLeverage: 10, szDecimals: 3, category: "crypto", minNotional: 10 },
 ];
 
 // ============ STRATEGY TYPES ============
-type StrategyType = "degen_rsi";
+type StrategyType = "rsi18" | "divergence";
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -303,6 +309,59 @@ function findHorizontalSupport(candles: OHLCVCandle[], currentPrice: number): { 
   return clusters[0];
 }
 
+// ============ BULLISH DIVERGENCE DETECTION ============
+
+/**
+ * Detect bullish divergence: price makes lower low, RSI makes higher low
+ * Looks for 2 swing lows in the last `lookback` candles
+ * A swing low is a candle whose low is lower than both neighbors
+ */
+function detectBullishDivergence(
+  candles: OHLCVCandle[],
+  currentPrice: number,
+  lookback: number = 20
+): { found: boolean; priceLow1: number; priceLow2: number; rsiLow1: number; rsiLow2: number } {
+  const result = { found: false, priceLow1: 0, priceLow2: 0, rsiLow1: 0, rsiLow2: 0 };
+  if (candles.length < lookback + 2) return result;
+
+  // Take the last `lookback` candles (excluding the very last incomplete one)
+  const slice = candles.slice(-lookback - 1, -1); // last lookback completed candles
+
+  // Find swing lows (local minima in price)
+  const swingLows: { index: number; price: number; rsi: number }[] = [];
+
+  for (let i = 1; i < slice.length - 1; i++) {
+    if (slice[i].low < slice[i - 1].low && slice[i].low < slice[i + 1].low) {
+      // Calculate RSI up to this point
+      const closesUpToHere = candles.slice(0, candles.length - lookback - 1 + i + 1).map(c => c.close);
+      const rsi = closesUpToHere.length >= 15 ? calculateRSI(closesUpToHere) : 50;
+      swingLows.push({ index: i, price: slice[i].low, rsi });
+    }
+  }
+
+  if (swingLows.length < 2) return result;
+
+  // Check the last two swing lows for divergence
+  // Price: lower low (second swing low is lower than first)
+  // RSI: higher low (second RSI low is higher than first)
+  for (let j = swingLows.length - 1; j >= 1; j--) {
+    const recent = swingLows[j];
+    const prior = swingLows[j - 1];
+
+    if (recent.price < prior.price && recent.rsi > prior.rsi) {
+      // Bullish divergence found
+      result.found = true;
+      result.priceLow1 = prior.price;
+      result.priceLow2 = recent.price;
+      result.rsiLow1 = prior.rsi;
+      result.rsiLow2 = recent.rsi;
+      return result;
+    }
+  }
+
+  return result;
+}
+
 // ============ TRADING ENGINE ============
 
 class TradingEngine {
@@ -318,8 +377,12 @@ class TradingEngine {
   private lastLearningReview = 0;
   private pnlResetTimestamp = "";
   private pnlResetEquity = 0;
-  // RSI cross tracking — only enter once per RSI extreme event
-  private rsiCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
+
+  // Strategy A: RSI18 cross state — only enter once per RSI extreme event (BTC only)
+  private rsi18CrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
+  // Strategy B: DIVERGENCE cross state — per-asset, independent of RSI18
+  private divCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
+
   // Robust position sync — track consecutive "no position" readings per tradeId
   private syncMissCount: Map<number, number> = new Map();
 
@@ -343,8 +406,8 @@ class TradingEngine {
       }
     }
 
-    // v14.0: Force fresh P&L baseline on first v14 deploy
-    const V14_DEPLOY = "2026-04-18T11:56:00.000Z";
+    // v14.1: Force fresh P&L baseline on first v14.1 deploy
+    const V14_DEPLOY = "2026-04-18T17:30:00.000Z";
     if (!config.pnlBaselineTimestamp || config.pnlBaselineTimestamp < V14_DEPLOY) {
       this.pnlResetTimestamp = new Date().toISOString();
       this.pnlResetEquity = this.lastKnownEquity;
@@ -353,9 +416,9 @@ class TradingEngine {
         pnlBaselineEquity: this.lastKnownEquity,
         pnlBaselineTimestamp: this.pnlResetTimestamp,
       });
-      log(`[v14.0] Fresh start — P&L baseline reset to $${this.lastKnownEquity.toFixed(2)}`, "engine");
+      log(`[v14.1] Fresh start — P&L baseline reset to $${this.lastKnownEquity.toFixed(2)}`, "engine");
     } else {
-      // Normal restore: baseline already set to v14 or later
+      // Normal restore: baseline already set to v14.1 or later
       this.pnlResetTimestamp = config.pnlBaselineTimestamp;
       this.pnlResetEquity = config.pnlBaselineEquity;
       this.startingEquity = config.pnlBaselineEquity;
@@ -371,7 +434,7 @@ class TradingEngine {
     // Clean stale scan rows for coins no longer in ALLOWED_ASSETS
     await storage.deleteScansNotIn(ALLOWED_ASSETS.map(a => a.coin));
 
-    // v13 SAFETY: Orphan position detector — close HL positions not tracked in DB
+    // SAFETY: Orphan position detector — close HL positions not tracked in DB
     if (config.apiSecret && config.walletAddress) {
       try {
         const executor = createExecutor(config.apiSecret, config.walletAddress);
@@ -412,10 +475,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v14.0 started | DEGEN_RSI: BTC LONG only, RSI ≤25 (5m+15m), 90% equity, 40x, SL -0.5%, TP +0.43%, BE @ +0.25% | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v14.1 started | DUAL: RSI18 (BTC, ≤18) + DIVERGENCE (10 assets, div<30) | 50/50 split | SL -0.5% | BE @ +0.25% | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v14.0 started — DEGEN_RSI: BTC LONG | RSI ≤25 (5m+15m) | 90% equity | 40x | SL -0.5% | TP +0.43% | BE @ +0.25% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v14.1 started | DUAL: RSI18 (BTC, ≤18) + DIVERGENCE (10 assets, div<30) | 50/50 split | SL -0.5% | BE @ +0.25% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
 
@@ -462,6 +525,156 @@ class TradingEngine {
     return this.lastKnownEquity;
   }
 
+  // ============ ENTRY HELPER ============
+
+  private async executeEntry(params: {
+    asset: AssetConfig;
+    strategy: StrategyType;
+    equityPct: number;    // 0.50 for both
+    leverage: number;
+    tpMultiplier: number; // 1.005 for rsi18, 1.0043 for div
+    slMultiplier: number; // 0.995 for both
+    rsi5m: number;
+    rsi15m: number;
+    triggerRSI: number;
+    price: number;
+    equity: number;
+    entryReason: string;
+    config: any;
+  }): Promise<boolean> {
+    const { asset, strategy, equityPct, leverage, tpMultiplier, slMultiplier, rsi5m, rsi15m, triggerRSI, price, equity, entryReason, config } = params;
+    const stratLabel = strategy === "rsi18" ? "RSI18" : "DIV";
+
+    // Position sizing — equityPct of equity, at leverage
+    const capitalForTrade = equity * equityPct;
+    const notionalSize = capitalForTrade * leverage;
+    const assetSize = notionalSize / price;
+
+    if (capitalForTrade < 5) {
+      log(`[${stratLabel}] SKIP ${asset.coin}: capital too low ($${capitalForTrade.toFixed(2)})`, "engine");
+      return false;
+    }
+
+    const tp = price * tpMultiplier;
+    const sl = price * slMultiplier;
+    const tpPctLabel = strategy === "rsi18" ? "+0.5%" : "+0.43%";
+
+    log(`[${stratLabel}] ${asset.coin} LONG @ $${price} | TP ${tpPctLabel} | SL -0.5% | BE @ +0.25% | ${leverage}x | ${entryReason}`, "engine");
+
+    let fillPrice = price;
+    let filledSz = 0;
+
+    if (config.apiSecret && config.walletAddress) {
+      try {
+        const executor = createExecutor(config.apiSecret, config.walletAddress);
+        const isCross = !asset.isolatedOnly;
+        await executor.setLeverage(asset.coin, leverage, isCross);
+        const orderPrice = price * 1.01; // 1% slippage for long
+        const roundedSize = parseFloat(formatHLSize(assetSize, asset.szDecimals));
+        if (roundedSize <= 0) {
+          log(`[${stratLabel}] SKIP ${asset.coin}: rounded size is 0`, "engine");
+          return false;
+        }
+
+        const orderResult = await executor.placeOrder({
+          coin: asset.coin, isBuy: true, sz: roundedSize,
+          limitPx: parseFloat(formatHLPrice(orderPrice, asset.szDecimals)),
+          orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
+        });
+
+        log(`[HL RAW] ${asset.coin} ${strategy} response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
+        const status = orderResult?.response?.data?.statuses?.[0];
+        const fillPx = status?.filled?.avgPx;
+        const totalSz = status?.filled?.totalSz;
+        const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
+
+        if (errorMsg) {
+          log(`[${stratLabel}] ORDER REJECTED: ${asset.coin} — ${errorMsg}`, "engine");
+          await storage.createLog({ type: "order_error", message: `${stratLabel} REJECTED: ${asset.coin} LONG — ${errorMsg}`, timestamp: new Date().toISOString() });
+          return false;
+        } else if (fillPx && parseFloat(totalSz) > 0) {
+          fillPrice = parseFloat(fillPx);
+          filledSz = parseFloat(totalSz);
+          log(`[${stratLabel}] FILLED: ${asset.coin} LONG sz=${totalSz} @ $${fillPx}`, "engine");
+        } else {
+          log(`[${stratLabel}] IOC NOT FILLED: ${asset.coin} LONG`, "engine");
+          await storage.createLog({ type: "order_unfilled", message: `${stratLabel} NOT FILLED: ${asset.coin} LONG`, timestamp: new Date().toISOString() });
+          return false;
+        }
+      } catch (execErr) {
+        log(`[${stratLabel}] ORDER FAILED: ${asset.coin} — ${execErr}`, "engine");
+        await storage.createLog({ type: "order_error", message: `${stratLabel} FAILED: ${asset.coin} LONG — ${execErr}`, timestamp: new Date().toISOString() });
+        return false;
+      }
+    } else {
+      // Paper mode — simulate fill at current price
+      filledSz = parseFloat(formatHLSize(assetSize, asset.szDecimals));
+      if (filledSz <= 0) return false;
+    }
+
+    if (filledSz <= 0) return false;
+
+    // Recalculate TP and SL based on actual fill price
+    const actualTP = fillPrice * tpMultiplier;
+    const actualSL = fillPrice * slMultiplier;
+    const actualNotional = filledSz * fillPrice;
+
+    const trade = await storage.createTrade({
+      coin: asset.coin, side: "long", entryPrice: fillPrice, size: Math.round(equityPct * 100), leverage,
+      entryEquity: equity,
+      notionalValue: actualNotional,
+      rsiAtEntry: triggerRSI, rsi4h: 0, rsi1d: 0,
+      ema10: 0, ema21: 0, ema50: 0,
+      stopLoss: actualSL,  // SL -0.5% placed immediately
+      takeProfit1: actualTP,
+      takeProfit2: actualTP,
+      tp1Hit: false,
+      confluenceScore: 0,
+      confluenceDetails: `${stratLabel}: ${entryReason} | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`,
+      riskRewardRatio: strategy === "rsi18" ? 1.0 : 0.86,
+      status: "open",
+      reason: `[${stratLabel}] ${asset.coin} LONG | ${entryReason} | SL -0.5% | TP ${tpPctLabel} | BE @ +0.25% | ${leverage}x`,
+      setupType: strategy,
+      strategy,
+      openedAt: new Date().toISOString(),
+    });
+
+    // Place SL order on HL immediately (-0.5%)
+    if (config.apiSecret && config.walletAddress) {
+      try {
+        const executor = createExecutor(config.apiSecret, config.walletAddress);
+        const slTriggerPx = parseFloat(formatHLPrice(actualSL, asset.szDecimals));
+        const slFillPx = parseFloat(formatHLPrice(actualSL * 0.98, asset.szDecimals));
+        await executor.placeOrder({
+          coin: asset.coin, isBuy: false, sz: filledSz,
+          limitPx: slFillPx,
+          orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+          reduceOnly: true,
+        });
+        log(`[SL ORDER] ${asset.coin} SL placed @ $${slTriggerPx} (-0.5%)`, "engine");
+      } catch (slErr) {
+        log(`[SL ORDER] FAILED ${asset.coin}: ${slErr} — will monitor in checkExits`, "engine");
+      }
+    }
+
+    await logDecision({
+      tradeId: trade.id, coin: asset.coin, action: "entry", side: "long", price: fillPrice,
+      reasoning: `${stratLabel}: ${asset.coin} LONG | ${entryReason} | SL $${actualSL.toFixed(2)} (-0.5%) | TP $${actualTP.toFixed(2)} (${tpPctLabel}) | BE @ +0.25% | ${leverage}x | $${capitalForTrade.toFixed(0)} capital`,
+      equity, leverage, positionSizeUsd: capitalForTrade, strategy,
+    });
+
+    await storage.createLog({
+      type: "trade_open",
+      message: `[${stratLabel}] ${asset.coin} LONG @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | ${entryReason} | SL -0.5% | TP ${tpPctLabel} | BE @ +0.25% | $${capitalForTrade.toFixed(0)}`,
+      data: JSON.stringify(trade),
+      timestamp: new Date().toISOString(),
+    });
+
+    return true;
+  }
+
+  // ============ MAIN SCAN CYCLE ============
+
   async runScanCycle() {
     if (this.isScanning) return;
     this.isScanning = true;
@@ -507,9 +720,9 @@ class TradingEngine {
         });
       }
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v14.0 DEGEN_RSI | LONG only | ${ALLOWED_ASSETS.length} assets`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v14.1 DUAL: RSI18 (BTC, ≤18) + DIV (10 assets, divergence<30) | 50/50 split`, "engine");
 
-      // Fetch market data
+      // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
       const assetCtxMap: Record<string, any> = {};
       if (mainData && mainData.length >= 2) {
@@ -520,224 +733,247 @@ class TradingEngine {
         }
       }
 
-      // Open positions — DEGEN_RSI: 1 at a time
+      // Open positions — filter by strategy
       const openTrades = await storage.getOpenTrades();
-      const openCoins = new Set(openTrades.map(t => t.coin));
-      const maxPositions = 1;
+      const rsi18Open = openTrades.filter(t => t.strategy === "rsi18");
+      const divOpen = openTrades.filter(t => t.strategy === "divergence");
 
-      // ======================================================================
-      // v14.0: DEGEN_RSI STRATEGY
-      // BTC LONG only: RSI ≤ 25 on BOTH 5m AND 15m simultaneously
-      // 90% equity, 40x leverage, 1 position at a time
-      // SL -0.5% (placed immediately), TP +0.43%, BE SL @ +0.25%
-      // ======================================================================
+      const RSI18_MAX_POSITIONS = 1;
+      const DIV_MAX_POSITIONS = 2;
 
-      let slotsUsed = 0;
-      const LONG_THRESHOLD = 25;
-      const asset = ALLOWED_ASSETS[0]; // BTC only
+      let totalEntries = 0;
 
-      const ctx = assetCtxMap[asset.coin];
-      if (ctx?.midPx && ctx.midPx !== "None") {
-        const price = parseFloat(ctx.midPx);
-        if (!isNaN(price) && price > 0) {
-        const volume24h = parseFloat(ctx.dayNtlVlm || "0");
-        const funding = parseFloat(ctx.funding || "0");
-        const openInterest = parseFloat(ctx.openInterest || "0");
-        const prevDayPx = parseFloat(ctx.prevDayPx || String(price));
-        const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : 0;
+      // ================================================================
+      // STRATEGY A: RSI18 — BTC ONLY
+      // Signal: 5m RSI ≤ 18 OR 15m RSI ≤ 18
+      // 50% equity, 40x, max 1 position, TP +0.5%, SL -0.5%, BE @ +0.25%
+      // ================================================================
+      {
+        const RSI18_THRESHOLD = 18;
+        const RSI18_RESET_THRESHOLD = 25;
+        const btcAsset = ALLOWED_ASSETS.find(a => a.coin === "BTC")!;
 
-        // Fetch 5m and 15m candles for RSI
-        const [ohlcv5m, ohlcv15m] = await Promise.all([
-          fetchCandlesOHLCV(asset.coin, "5m", 30),
-          fetchCandlesOHLCV(asset.coin, "15m", 30),
-        ]);
+        const ctx = assetCtxMap["BTC"];
+        if (ctx?.midPx && ctx.midPx !== "None") {
+          const price = parseFloat(ctx.midPx);
+          if (!isNaN(price) && price > 0) {
+            const volume24h = parseFloat(ctx.dayNtlVlm || "0");
+            const funding = parseFloat(ctx.funding || "0");
+            const openInterest = parseFloat(ctx.openInterest || "0");
+            const prevDayPx = parseFloat(ctx.prevDayPx || String(price));
+            const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : 0;
 
-        const c5m = ohlcv5m.map(c => c.close);
-        const c15m = ohlcv15m.map(c => c.close);
+            const [ohlcv5m, ohlcv15m] = await Promise.all([
+              fetchCandlesOHLCV("BTC", "5m", 30),
+              fetchCandlesOHLCV("BTC", "15m", 30),
+            ]);
 
-        if (c5m.length >= 15 || c15m.length >= 15) {
+            const c5m = ohlcv5m.map(c => c.close);
+            const c15m = ohlcv15m.map(c => c.close);
 
-        // Intra-candle RSI — append current live price
-        const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
-        const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
+            if (c5m.length >= 15 || c15m.length >= 15) {
+              // Intra-candle RSI — append current live price
+              const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
+              const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
 
-        // Signal: BOTH 5m AND 15m must be ≤25 simultaneously
-        let scanSignal: "neutral" | "oversold_long" = "neutral";
-        let scanDetails = "";
+              // Signal: 5m OR 15m ≤ 18
+              const rsi18Signal = rsi5m <= RSI18_THRESHOLD || rsi15m <= RSI18_THRESHOLD;
+              const triggerRSI = Math.min(rsi5m, rsi15m);
+              const triggeredTF = rsi5m <= RSI18_THRESHOLD ? (rsi15m <= RSI18_THRESHOLD ? "5m+15m" : "5m") : "15m";
 
-        if (rsi5m <= LONG_THRESHOLD && rsi15m <= LONG_THRESHOLD) {
-          scanSignal = "oversold_long";
-          scanDetails = `RSI ≤25 BOTH: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
-        } else {
-          const dist5m = Math.abs(rsi5m - LONG_THRESHOLD);
-          const dist15m = Math.abs(rsi15m - LONG_THRESHOLD);
-          scanDetails = `RSI 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need BOTH ≤25 (5m: ${rsi5m <= LONG_THRESHOLD ? "✓" : dist5m.toFixed(1)+" away"}, 15m: ${rsi15m <= LONG_THRESHOLD ? "✓" : dist15m.toFixed(1)+" away"})`;
-        }
+              let scanSignal: string = "neutral";
+              let scanDetails = "";
 
-        await storage.upsertMarketScan({
-          coin: asset.coin, price, rsi5m, rsi15m, rsi: 50, rsi4h: 50, rsi1d: 50,
-          ema10: 0, ema21: 0, ema50: 0,
-          volume24h, change24h,
-          signal: scanSignal,
-          fundingRate: funding, openInterest,
-          confluenceScore: scanSignal !== "neutral" ? 10 : 0,
-          confluenceDetails: scanDetails,
-          riskRewardRatio: 0,
-          timestamp: new Date().toISOString(),
-        });
+              if (rsi18Signal) {
+                scanSignal = "rsi18_oversold";
+                scanDetails = `RSI18: ${triggeredTF} triggered | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
+              } else {
+                scanDetails = `RSI18: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need ≤18 on either TF`;
+              }
 
-        // --- ENTRY LOGIC ---
-        if (scanSignal === "neutral") {
-          // Reset cross state when BOTH RSIs recover above 30
-          if (rsi5m > LONG_THRESHOLD + 5 && rsi15m > LONG_THRESHOLD + 5) {
-            this.rsiCrossState.delete(`${asset.coin}_dual_long`);
-          }
-        } else if (scanSignal === "oversold_long") {
-          // Check slot availability
-          if (!openCoins.has(asset.coin) && openTrades.length < maxPositions && slotsUsed < maxPositions) {
+              await storage.upsertMarketScan({
+                coin: "BTC", price, rsi5m, rsi15m, rsi: 50, rsi4h: 50, rsi1d: 50,
+                ema10: 0, ema21: 0, ema50: 0,
+                volume24h, change24h,
+                signal: scanSignal,
+                fundingRate: funding, openInterest,
+                confluenceScore: rsi18Signal ? 10 : 0,
+                confluenceDetails: scanDetails,
+                riskRewardRatio: 0,
+                timestamp: new Date().toISOString(),
+              });
 
-          // Cross state — only enter once per dual RSI extreme event
-          const crossKey = `${asset.coin}_dual_long`;
-          if (!this.rsiCrossState.has(crossKey)) {
-            this.rsiCrossState.set(crossKey, { price, timestamp: Date.now(), rsi: Math.min(rsi5m, rsi15m) });
+              const crossKey = `BTC_rsi18_long`;
 
-            const triggerRSI = Math.min(rsi5m, rsi15m);
-
-            // TP +0.43%, SL -0.5% (placed immediately)
-            const tp = price * 1.0043;
-            const sl = price * 0.995;
-
-            // Check horizontal support (informational)
-            const ohlcv1h = await fetchCandlesOHLCV(asset.coin, "1h", 100);
-            const support = findHorizontalSupport(ohlcv1h, price);
-            const supportInfo = support && (Math.abs(price - support.level) / price <= 0.005)
-              ? `NEAR SUPPORT $${support.level.toFixed(2)} (${support.touches} touches)`
-              : support ? `Support $${support.level.toFixed(2)} (${support.touches}t, ${((price - support.level)/price*100).toFixed(1)}% away)` : "No clear support";
-
-            log(`[DEGEN_RSI] BTC 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} BOTH ≤25 → LONG @ $${price} | TP +0.43% | SL -0.5% | BE @ +0.25% | ${supportInfo}`, "engine");
-
-            // Position sizing — 90% of equity, 40x leverage
-            const leverage = asset.maxLeverage; // 40x
-            const capitalForTrade = equity * 0.90;
-            const notionalSize = capitalForTrade * leverage;
-            const assetSize = notionalSize / price;
-
-            if (capitalForTrade >= 5) {
-
-            // Execute market order (IOC)
-            let fillPrice = price;
-            let filledSz = 0;
-            if (config.apiSecret && config.walletAddress) {
-              try {
-                const executor = createExecutor(config.apiSecret, config.walletAddress);
-                const isCross = !asset.isolatedOnly;
-                await executor.setLeverage(asset.coin, leverage, isCross);
-                const orderPrice = price * 1.01; // 1% slippage for long
-                const roundedSize = parseFloat(formatHLSize(assetSize, asset.szDecimals));
-                if (roundedSize <= 0) { log(`[DEGEN_RSI] SKIP BTC: Rounded size is 0`, "engine"); }
-                else {
-                const orderResult = await executor.placeOrder({
-                  coin: asset.coin, isBuy: true, sz: roundedSize,
-                  limitPx: parseFloat(formatHLPrice(orderPrice, asset.szDecimals)),
-                  orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
-                });
-
-                log(`[HL RAW] BTC degen_rsi response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
-                const status = orderResult?.response?.data?.statuses?.[0];
-                const fillPx = status?.filled?.avgPx;
-                const totalSz = status?.filled?.totalSz;
-                const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
-
-                if (errorMsg) {
-                  log(`[DEGEN_RSI] ORDER REJECTED: BTC — ${errorMsg}`, "engine");
-                  await storage.createLog({ type: "order_error", message: `DEGEN_RSI REJECTED: BTC LONG — ${errorMsg}`, timestamp: new Date().toISOString() });
-                } else if (fillPx && parseFloat(totalSz) > 0) {
-                  fillPrice = parseFloat(fillPx);
-                  filledSz = parseFloat(totalSz);
-                  log(`[DEGEN_RSI] FILLED: BTC LONG sz=${totalSz} @ $${fillPx}`, "engine");
-                } else {
-                  log(`[DEGEN_RSI] IOC NOT FILLED: BTC LONG`, "engine");
-                  await storage.createLog({ type: "order_unfilled", message: `DEGEN_RSI NOT FILLED: BTC LONG`, timestamp: new Date().toISOString() });
+              // Reset cross state when RSI recovers above 25 on BOTH timeframes
+              if (!rsi18Signal && rsi5m > RSI18_RESET_THRESHOLD && rsi15m > RSI18_RESET_THRESHOLD) {
+                if (this.rsi18CrossState.has(crossKey)) {
+                  this.rsi18CrossState.delete(crossKey);
+                  log(`[RSI18] BTC cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${RSI18_RESET_THRESHOLD}`, "engine");
                 }
-                } // end roundedSize > 0
-              } catch (execErr) {
-                log(`[DEGEN_RSI] ORDER FAILED: BTC — ${execErr}`, "engine");
-                await storage.createLog({ type: "order_error", message: `DEGEN_RSI FAILED: BTC LONG — ${execErr}`, timestamp: new Date().toISOString() });
+              }
+
+              // Entry: RSI18 signal, no position already open for this strategy, slot available
+              if (rsi18Signal && rsi18Open.length < RSI18_MAX_POSITIONS) {
+                if (!this.rsi18CrossState.has(crossKey)) {
+                  this.rsi18CrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
+
+                  const entryReason = `RSI18: ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ 18`;
+                  const entered = await this.executeEntry({
+                    asset: btcAsset,
+                    strategy: "rsi18",
+                    equityPct: 0.50,
+                    leverage: btcAsset.maxLeverage, // 40x
+                    tpMultiplier: 1.005,   // +0.5%
+                    slMultiplier: 0.995,   // -0.5%
+                    rsi5m, rsi15m, triggerRSI, price, equity,
+                    entryReason,
+                    config,
+                  });
+
+                  if (entered) {
+                    totalEntries++;
+                    this.dailyTradeCount++;
+                  } else {
+                    // Remove cross state if entry failed (didn't fill)
+                    this.rsi18CrossState.delete(crossKey);
+                  }
+                }
               }
             }
+          }
+        }
+      }
 
-            if (filledSz > 0) {
-            // Recalculate TP and SL based on actual fill price
-            const actualTP = fillPrice * 1.0043;
-            const actualSL = fillPrice * 0.995;
-            const actualNotional = filledSz * fillPrice;
+      // ================================================================
+      // STRATEGY B: DIVERGENCE — ALL 10 ASSETS
+      // Signal: detectBullishDivergence() found on 5m OR 15m AND RSI < 30
+      // 50% equity, asset.maxLeverage, max 2 positions, TP +0.43%, SL -0.5%, BE @ +0.25%
+      // ================================================================
+      {
+        const DIV_RSI_THRESHOLD = 30;
+        const DIV_RSI_RESET_THRESHOLD = 35;
 
-            const trade = await storage.createTrade({
-              coin: asset.coin, side: "long", entryPrice: fillPrice, size: 90, leverage,
-              entryEquity: equity,
-              notionalValue: actualNotional,
-              rsiAtEntry: triggerRSI, rsi4h: 0, rsi1d: 0,
-              ema10: 0, ema21: 0, ema50: 0,
-              stopLoss: actualSL,  // SL -0.5% placed immediately
-              takeProfit1: actualTP,
-              takeProfit2: actualTP,
-              tp1Hit: false,
-              confluenceScore: 0,
-              confluenceDetails: `DEGEN RSI: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} BOTH ≤25 | ${supportInfo}`,
-              riskRewardRatio: 0.86,
-              status: "open",
-              reason: `[DEGEN_RSI] BTC LONG | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | SL -0.5% | TP +0.43% | BE @ +0.25% | ${leverage}x | ${supportInfo}`,
-              setupType: "degen_rsi",
-              strategy: "degen_rsi",
-              openedAt: new Date().toISOString(),
-            });
+        for (const asset of ALLOWED_ASSETS) {
+          // Check slot availability (across all assets for this strategy)
+          if (divOpen.length >= DIV_MAX_POSITIONS) break;
 
-            // Place SL order on HL immediately (-0.5%)
-            if (config.apiSecret && config.walletAddress) {
-              try {
-                const executor = createExecutor(config.apiSecret, config.walletAddress);
-                const slTriggerPx = parseFloat(formatHLPrice(actualSL, asset.szDecimals));
-                const slFillPx = parseFloat(formatHLPrice(actualSL * 0.98, asset.szDecimals));
-                await executor.placeOrder({
-                  coin: asset.coin, isBuy: false, sz: filledSz,
-                  limitPx: slFillPx,
-                  orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
-                  reduceOnly: true,
-                });
-                log(`[SL ORDER] BTC SL placed @ $${slTriggerPx} (-0.5%)`, "engine");
-              } catch (slErr) {
-                log(`[SL ORDER] FAILED BTC: ${slErr} — will monitor in checkExits`, "engine");
+          const ctx = assetCtxMap[asset.coin];
+          if (!ctx?.midPx || ctx.midPx === "None") continue;
+
+          const price = parseFloat(ctx.midPx);
+          if (isNaN(price) || price <= 0) continue;
+
+          const volume24h = parseFloat(ctx.dayNtlVlm || "0");
+          const funding = parseFloat(ctx.funding || "0");
+          const openInterest = parseFloat(ctx.openInterest || "0");
+          const prevDayPx = parseFloat(ctx.prevDayPx || String(price));
+          const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : 0;
+
+          // Fetch 5m and 15m candles
+          const [ohlcv5m, ohlcv15m] = await Promise.all([
+            fetchCandlesOHLCV(asset.coin, "5m", 40),
+            fetchCandlesOHLCV(asset.coin, "15m", 40),
+          ]);
+
+          if (ohlcv5m.length < 15 && ohlcv15m.length < 15) continue;
+
+          const c5m = ohlcv5m.map(c => c.close);
+          const c15m = ohlcv15m.map(c => c.close);
+
+          // Intra-candle RSI
+          const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
+          const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
+
+          // Detect divergence on 5m and/or 15m
+          const div5m = ohlcv5m.length >= 22 ? detectBullishDivergence(ohlcv5m, price, 20) : { found: false, priceLow1: 0, priceLow2: 0, rsiLow1: 0, rsiLow2: 0 };
+          const div15m = ohlcv15m.length >= 22 ? detectBullishDivergence(ohlcv15m, price, 20) : { found: false, priceLow1: 0, priceLow2: 0, rsiLow1: 0, rsiLow2: 0 };
+
+          // Signal: divergence on either timeframe AND RSI < 30 on that timeframe
+          const div5mSignal = div5m.found && rsi5m < DIV_RSI_THRESHOLD;
+          const div15mSignal = div15m.found && rsi15m < DIV_RSI_THRESHOLD;
+          const divSignal = div5mSignal || div15mSignal;
+
+          // Determine trigger timeframe and RSI for entry reason
+          let divTriggeredTF = "";
+          let triggerRSI = 50;
+          let divInfo = "";
+          if (div5mSignal && div15mSignal) {
+            divTriggeredTF = "5m+15m";
+            triggerRSI = Math.min(rsi5m, rsi15m);
+            divInfo = `price lows: ${div5m.priceLow1.toFixed(2)}→${div5m.priceLow2.toFixed(2)} RSI lows: ${div5m.rsiLow1.toFixed(1)}→${div5m.rsiLow2.toFixed(1)}`;
+          } else if (div5mSignal) {
+            divTriggeredTF = "5m";
+            triggerRSI = rsi5m;
+            divInfo = `price lows: ${div5m.priceLow1.toFixed(2)}→${div5m.priceLow2.toFixed(2)} RSI lows: ${div5m.rsiLow1.toFixed(1)}→${div5m.rsiLow2.toFixed(1)}`;
+          } else if (div15mSignal) {
+            divTriggeredTF = "15m";
+            triggerRSI = rsi15m;
+            divInfo = `price lows: ${div15m.priceLow1.toFixed(2)}→${div15m.priceLow2.toFixed(2)} RSI lows: ${div15m.rsiLow1.toFixed(1)}→${div15m.rsiLow2.toFixed(1)}`;
+          }
+
+          let scanSignal = divSignal ? "div_bullish" : "neutral";
+          let scanDetails = divSignal
+            ? `DIV ${divTriggeredTF}: bullish divergence, RSI=${triggerRSI.toFixed(1)} | ${divInfo}`
+            : `DIV: no signal | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
+
+          await storage.upsertMarketScan({
+            coin: asset.coin, price, rsi5m, rsi15m, rsi: 50, rsi4h: 50, rsi1d: 50,
+            ema10: 0, ema21: 0, ema50: 0,
+            volume24h, change24h,
+            signal: scanSignal,
+            fundingRate: funding, openInterest,
+            confluenceScore: divSignal ? 10 : 0,
+            confluenceDetails: scanDetails,
+            riskRewardRatio: 0,
+            timestamp: new Date().toISOString(),
+          });
+
+          const crossKey = `${asset.coin}_div_long`;
+
+          // Reset cross state when RSI recovers above 35 on BOTH timeframes
+          if (!divSignal && rsi5m > DIV_RSI_RESET_THRESHOLD && rsi15m > DIV_RSI_RESET_THRESHOLD) {
+            if (this.divCrossState.has(crossKey)) {
+              this.divCrossState.delete(crossKey);
+              log(`[DIV] ${asset.coin} cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${DIV_RSI_RESET_THRESHOLD}`, "engine");
+            }
+          }
+
+          // Entry: divergence signal, slot available, no cross state active
+          if (divSignal && divOpen.length < DIV_MAX_POSITIONS) {
+            if (!this.divCrossState.has(crossKey)) {
+              this.divCrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
+
+              const entryReason = `DIV: ${divTriggeredTF} bullish divergence, RSI=${triggerRSI.toFixed(1)} | ${divInfo}`;
+              const entered = await this.executeEntry({
+                asset,
+                strategy: "divergence",
+                equityPct: 0.50,
+                leverage: asset.maxLeverage,
+                tpMultiplier: 1.0043,  // +0.43%
+                slMultiplier: 0.995,   // -0.5%
+                rsi5m, rsi15m, triggerRSI, price, equity,
+                entryReason,
+                config,
+              });
+
+              if (entered) {
+                totalEntries++;
+                this.dailyTradeCount++;
+                // Re-fetch open divergence trades to track slot count accurately
+                divOpen.push({} as any); // pessimistic slot reservation
+              } else {
+                this.divCrossState.delete(crossKey);
               }
             }
-
-            await logDecision({
-              tradeId: trade.id, coin: asset.coin, action: "entry", side: "long", price: fillPrice,
-              reasoning: `DEGEN RSI: BTC LONG | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} BOTH ≤25 | SL $${actualSL.toFixed(2)} (-0.5%) | TP $${actualTP.toFixed(2)} (+0.43%) | BE @ +0.25% | ${leverage}x | $${capitalForTrade.toFixed(0)} capital | ${supportInfo}`,
-              equity, leverage, positionSizeUsd: capitalForTrade, strategy: "degen_rsi",
-            });
-
-            await storage.createLog({
-              type: "trade_open",
-              message: `[DEGEN_RSI] BTC LONG @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | SL -0.5% | TP +0.43% | BE @ +0.25% | $${capitalForTrade.toFixed(0)} | ${supportInfo}`,
-              data: JSON.stringify(trade),
-              timestamp: new Date().toISOString(),
-            });
-
-            slotsUsed++;
-            this.dailyTradeCount++;
-            } // end filledSz > 0
-            } // end capitalForTrade >= 5
-          } // end crossKey check
-          } // end slot check
-        } // end oversold_long
-        } // end c5m/c15m length check
-        } // end price valid
-      } // end ctx valid
+          }
+        }
+      }
 
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v14.0 DEGEN_RSI | BTC LONG only | RSI 5m+15m ≤25`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v14.1 DUAL: RSI18 (BTC, ≤18) + DIV (10 assets, divergence<30) | 50/50 split`,
         timestamp: new Date().toISOString(),
       });
 
@@ -864,6 +1100,8 @@ class TradingEngine {
 
     // ============================================================
     // OPEN TRADE MONITORING: read unrealizedPnl from HL + check TP/BE
+    // Both strategies: LONG only, SL -0.5%, BE @ +0.25%
+    // RSI18: TP +0.5% | DIVERGENCE: TP +0.43%
     // ============================================================
     for (const trade of openTrades) {
       const currentPrice = parseFloat(mids[trade.coin] || "0");
@@ -871,6 +1109,10 @@ class TradingEngine {
       const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
       const szd = ac?.szDecimals ?? 2;
       const eqForTrade = (trade as any).entryEquity || currentEquity;
+
+      // Determine strategy label for log messages
+      const stratLabel = trade.strategy === "rsi18" ? "RSI18" : "DIV";
+      const tpPctLabel = trade.strategy === "rsi18" ? "TP +0.5%" : "TP +0.43%";
 
       // Read unrealizedPnl directly from HL position
       const hlPos = hlPosMap.get(trade.coin);
@@ -884,18 +1126,18 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // DEGEN_RSI: Breakeven SL at +0.25%
+      // Breakeven SL at +0.25%
       // SL starts at -0.5% from entry — move to entry (BE) when price reaches +0.25%
       const rawPricePct = (currentPrice - trade.entryPrice) / trade.entryPrice; // long only
       const beSL = trade.entryPrice; // breakeven = entry price
       const originalSL = trade.entryPrice * 0.995; // -0.5% from entry
-      const slStillAtOriginal = trade.stopLoss > 0 && Math.abs(trade.stopLoss - originalSL) < trade.entryPrice * 0.001; // SL is still near -0.5%
+      const slStillAtOriginal = trade.stopLoss > 0 && Math.abs(trade.stopLoss - originalSL) < trade.entryPrice * 0.001;
 
       if (slStillAtOriginal && rawPricePct >= 0.0025) {
         // Price moved +0.25% — activate BE SL at entry price
         await storage.updateTrade(trade.id, { stopLoss: beSL });
         trade.stopLoss = beSL;
-        log(`[BE SL] Trade #${trade.id} ${trade.coin} LONG | Price +${(rawPricePct*100).toFixed(2)}% → BE SL activated @ $${displayPrice(beSL, szd)}`, "engine");
+        log(`[BE SL] Trade #${trade.id} ${trade.coin} LONG [${stratLabel}] | Price +${(rawPricePct*100).toFixed(2)}% → BE SL activated @ $${displayPrice(beSL, szd)}`, "engine");
 
         // Place stop-market SL on HL at entry price
         if (config.apiSecret && config.walletAddress) {
@@ -918,14 +1160,14 @@ class TradingEngine {
                 orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
                 reduceOnly: true,
               });
-              log(`[BE SL] ${trade.coin} SL order placed @ $${slTriggerPx} (entry price, BE SL activated @ +0.25%)`, "engine");
+              log(`[BE SL] ${trade.coin} SL order placed @ $${slTriggerPx} (entry price, BE SL activated @ +0.25%) [${stratLabel}]`, "engine");
             }
           } catch (beErr) { log(`[BE SL] SL update error: ${beErr}`, "engine"); }
         }
 
         await storage.createLog({
           type: "system",
-          message: `[DEGEN_RSI] BE SL activated @ +0.25% | ${trade.coin} LONG | SL now @ $${displayPrice(beSL, szd)}`,
+          message: `[${stratLabel}] BE SL activated @ +0.25% | ${trade.coin} LONG | SL now @ $${displayPrice(beSL, szd)}`,
           timestamp: new Date().toISOString(),
         });
       }
@@ -935,21 +1177,23 @@ class TradingEngine {
       let closeReason = "";
 
       // TP hit: price >= takeProfit1
+      // trade.takeProfit1 is stored at entry: rsi18 = entry * 1.005, div = entry * 1.0043
       const tpHit = currentPrice >= (trade.takeProfit1 || Infinity);
       // SL hit: either at original -0.5% or at BE (entry price)
       const slActive = trade.stopLoss > 0;
       const slHit = slActive && currentPrice <= trade.stopLoss;
 
       const isBE = slActive && trade.stopLoss >= trade.entryPrice * 0.999; // SL is at or near entry = BE was activated
+
       if (tpHit) {
         shouldClose = true;
-        closeReason = `[DEGEN_RSI] TP +0.43% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        closeReason = `[${stratLabel}] ${tpPctLabel} @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
       } else if (slHit) {
         shouldClose = true;
         closeReason = isBE
-          ? `[DEGEN_RSI] SL @ BE $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`
-          : `[DEGEN_RSI] SL -0.5% hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
-        log(`[SL HIT] Trade #${trade.id} ${trade.coin} LONG | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
+          ? `[${stratLabel}] SL @ BE $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`
+          : `[${stratLabel}] SL -0.5% hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        log(`[SL HIT] Trade #${trade.id} ${trade.coin} LONG [${stratLabel}] | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
       }
 
       if (shouldClose) {
@@ -986,15 +1230,15 @@ class TradingEngine {
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, "long", tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              const exitLabel = slHit ? (isBE ? "SL @ BE" : "SL -0.5%") : "TP +0.43%";
-              closeReason = `[DEGEN_RSI] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
+              const exitLabel = slHit ? (isBE ? "SL @ BE" : "SL -0.5%") : tpPctLabel;
+              closeReason = `[${stratLabel}] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
                 exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: finalPnlOfAum,
                 hlPnlUsd: hlPnl.netPnl, hlCloseFee: hlPnl.totalFee,
                 peakPnlPct: 0, status: "closed", closeReason, closedAt: new Date().toISOString(),
               });
-              log(`[CLOSE] Trade #${trade.id} ${trade.coin} LONG | HL P&L: $${hlPnl.netPnl.toFixed(2)}`, "engine");
+              log(`[CLOSE] Trade #${trade.id} ${trade.coin} LONG [${stratLabel}] | HL P&L: $${hlPnl.netPnl.toFixed(2)}`, "engine");
             } else {
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
@@ -1024,13 +1268,13 @@ class TradingEngine {
 
         await logDecision({
           tradeId: trade.id, coin: trade.coin, action: "exit", side: "long", price: currentPrice,
-          reasoning: `EXIT [DEGEN_RSI]: ${closeReason} | HL P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${(eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0).toFixed(3)}%`,
-          equity: currentEquity, leverage: trade.leverage, strategy: "degen_rsi",
+          reasoning: `EXIT [${stratLabel}]: ${closeReason} | HL P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${(eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0).toFixed(3)}%`,
+          equity: currentEquity, leverage: trade.leverage, strategy: (trade.strategy as StrategyType) || "rsi18",
         });
 
         await storage.createLog({
           type: "trade_close",
-          message: `CLOSED [DEGEN_RSI] LONG ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
+          message: `CLOSED [${stratLabel}] LONG ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
           timestamp: new Date().toISOString(),
         });
       } else {
@@ -1068,11 +1312,15 @@ class TradingEngine {
   async forceCloseTrade(tradeId: number) {
     const trade = await storage.getTradeById(tradeId);
     if (!trade || trade.status !== "open") return null;
-    const strategy: StrategyType = "degen_rsi";
+
+    const strategy: StrategyType = (trade.strategy as StrategyType) || "rsi18";
+    const stratLabel = strategy === "rsi18" ? "RSI18" : "DIV";
+
     const mids: Record<string, string> = (await fetchAllMids()) || {};
     const currentPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
     const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
     const config = await storage.getConfig();
+
     if (config?.apiSecret && config?.walletAddress) {
       try {
         const executor = createExecutor(config.apiSecret, config.walletAddress);
@@ -1100,17 +1348,17 @@ class TradingEngine {
           const updated = await storage.updateTrade(trade.id, {
             exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: pnlOfAum,
             hlPnlUsd: hlPnl.netPnl, hlCloseFee: hlPnl.totalFee,
-            status: "closed", closeReason: `Manual close | HL P&L: $${hlPnl.netPnl.toFixed(2)}`,
+            status: "closed", closeReason: `Manual close [${stratLabel}] | HL P&L: $${hlPnl.netPnl.toFixed(2)}`,
             closedAt: new Date().toISOString(),
           });
           await logDecision({
             tradeId: trade.id, coin: trade.coin, action: "exit", side: "long", price: hlPnl.exitPrice,
-            reasoning: `MANUAL CLOSE | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)}) | ROI/AUM: ${pnlOfAum.toFixed(3)}%`,
+            reasoning: `MANUAL CLOSE [${stratLabel}] | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)}) | ROI/AUM: ${pnlOfAum.toFixed(3)}%`,
             equity: eq, leverage: trade.leverage, strategy,
           });
           await storage.createLog({
             type: "trade_close",
-            message: `Manual close LONG ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
+            message: `Manual close [${stratLabel}] LONG ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
             timestamp: new Date().toISOString(),
           });
           return updated;
@@ -1130,17 +1378,17 @@ class TradingEngine {
     const updated = await storage.updateTrade(trade.id, {
       exitPrice: currentPrice, pnl: 0, pnlPct: pnlOfAum,
       hlPnlUsd: pnlUsd, hlCloseFee: 0,
-      status: "closed", closeReason: "Manual close (estimated P&L)",
+      status: "closed", closeReason: `Manual close [${stratLabel}] (estimated P&L)`,
       closedAt: new Date().toISOString(),
     });
     await logDecision({
       tradeId: trade.id, coin: trade.coin, action: "exit", side: "long", price: currentPrice,
-      reasoning: `MANUAL CLOSE | Est P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${pnlOfAum.toFixed(3)}%`,
+      reasoning: `MANUAL CLOSE [${stratLabel}] | Est P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${pnlOfAum.toFixed(3)}%`,
       equity: eq, leverage: trade.leverage, strategy,
     });
     await storage.createLog({
       type: "trade_close",
-      message: `Manual close LONG ${trade.coin} | Est P&L: $${pnlUsd.toFixed(2)} USDC`,
+      message: `Manual close [${stratLabel}] LONG ${trade.coin} | Est P&L: $${pnlUsd.toFixed(2)} USDC`,
       timestamp: new Date().toISOString(),
     });
     return updated;
@@ -1212,15 +1460,23 @@ class TradingEngine {
       const eqForT = (t as any).entryEquity || currentEquity;
       const pnlUsd = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
       const pnlOfAum = eqForT > 0 ? (pnlUsd / eqForT) * 100 : 0;
-      return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
+      const stratBadge = t.strategy === "rsi18" ? "RSI18" : t.strategy === "divergence" ? "DIV" : t.strategy || "UNKNOWN";
+      return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)), stratBadge };
     });
 
-    // DEGEN_RSI single strategy stats
-    const degenTrades = activeClosedTrades.filter(t => t.strategy === "degen_rsi" || !t.strategy);
-    const degenWins = degenTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
-    const degenWinRate = degenTrades.length > 0 ? (degenWins / degenTrades.length) * 100 : 0;
-    const degenPnlUsd = degenTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
-    const degenPnlOfAum = startEq > 0 ? (degenPnlUsd / startEq) * 100 : 0;
+    // Strategy A: RSI18 stats
+    const rsi18Trades = activeClosedTrades.filter(t => t.strategy === "rsi18");
+    const rsi18Wins = rsi18Trades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
+    const rsi18WinRate = rsi18Trades.length > 0 ? (rsi18Wins / rsi18Trades.length) * 100 : 0;
+    const rsi18PnlUsd = rsi18Trades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
+    const rsi18PnlOfAum = startEq > 0 ? (rsi18PnlUsd / startEq) * 100 : 0;
+
+    // Strategy B: DIVERGENCE stats
+    const divTrades = activeClosedTrades.filter(t => t.strategy === "divergence");
+    const divWins = divTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
+    const divWinRate = divTrades.length > 0 ? (divWins / divTrades.length) * 100 : 0;
+    const divPnlUsd = divTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
+    const divPnlOfAum = startEq > 0 ? (divPnlUsd / startEq) * 100 : 0;
 
     return {
       isRunning: config?.isRunning || false,
@@ -1250,12 +1506,20 @@ class TradingEngine {
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
       strategyStats: {
-        degen_rsi: {
-          trades: degenTrades.length,
-          winRate: degenWinRate.toFixed(1),
-          openPositions: openTrades.filter(t => t.strategy === "degen_rsi").length,
-          pnlUsd: degenPnlUsd.toFixed(4),
-          pnlOfAum: degenPnlOfAum.toFixed(3),
+        rsi18: {
+          trades: rsi18Trades.length,
+          winRate: rsi18WinRate.toFixed(1),
+          openPositions: openTrades.filter(t => t.strategy === "rsi18").length,
+          pnlUsd: rsi18PnlUsd.toFixed(4),
+          pnlOfAum: rsi18PnlOfAum.toFixed(3),
+          status: "active",
+        },
+        divergence: {
+          trades: divTrades.length,
+          winRate: divWinRate.toFixed(1),
+          openPositions: openTrades.filter(t => t.strategy === "divergence").length,
+          pnlUsd: divPnlUsd.toFixed(4),
+          pnlOfAum: divPnlOfAum.toFixed(3),
           status: "active",
         },
       },
