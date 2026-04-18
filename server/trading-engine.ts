@@ -1,27 +1,19 @@
 /**
- * HyperTrader — Trading Engine v13.5
+ * HyperTrader — Trading Engine v14.0
  *
- * TRIPLE STRATEGY ENGINE:
+ * SINGLE STRATEGY: DEGEN_RSI
  *
- * Strategy A — PURE_RSI (conservative):
- *   - LONG when 5m or 15m RSI ≤ 20 | SHORT when ≥ 81
- *   - TP +0.43%, SL -0.50%, BE @ +0.2%
- *   - Max leverage per asset, up to 2 positions
+ * - BTC ONLY, LONG only
+ * - RSI ≤ 25 on BOTH 5m AND 15m simultaneously
+ * - 90% of equity per trade
+ * - 40x leverage (BTC max)
+ * - 1 position at a time
+ * - SL: -0.5% from fill (placed immediately)
+ * - TP: +0.43% from fill price
+ * - Breakeven SL: when price hits +0.25%, move SL to entry price
+ * - Horizontal support detection (informational, 1h candles)
  *
- * Strategy B — HSTAR (high-frequency 2:1 R:R):
- *   - LONG when 5m or 15m RSI ≤ 25 | SHORT when ≥ 75
- *   - TP +0.40%, SL -0.20% (2:1 R:R), NO breakeven
- *   - 15x leverage cap, up to 4 positions
- *   - Volume filter: 24h vol > $50M
- *   - Consecutive-loss sizing: half after 2 losses, quarter after 3
- *   - Skips coins already held by PURE_RSI
- *
- * Strategy C — AIWEEKLY (3-model AI consensus, swing trading):
- *   - Runs every 72 hours — Sonar research + Claude + GPT votes
- *   - Trades HL xyz stocks & commodities on ≥2/3 model consensus
- *   - TP +5%, SL -1% (5:1 R:R), 5x leverage, $100 fixed allocation
- *
- * 12 assets (crypto) + xyz stocks/commodities, scan every 5 seconds
+ * BTC only, scan every 5 seconds
  * Bug fixes: cancel all orders on close, orphan position detector
  */
 
@@ -31,7 +23,6 @@ import { storage } from "./storage";
 import { log } from "./index";
 import { createExecutor } from "./hyperliquid-executor";
 import { logDecision, reviewClosedTrades, generateInsights, getLearningStats, run24hReview } from "./learning-engine";
-import { runFullResearch, AIWEEKLY_STOCKS, AIWEEKLY_COMMODITIES, type ConsensusResult } from "./ai-researcher";
 
 // ============ ASSET CONFIGURATION ============
 
@@ -39,37 +30,19 @@ interface AssetConfig {
   coin: string;
   displayName: string;
   dex: string;
-  maxLeverage: number;     // ALWAYS used — no scaling down
+  maxLeverage: number;
   szDecimals: number;
   category: "crypto" | "commodity" | "forex" | "index";
   minNotional: number;
-  isolatedOnly?: boolean;  // Some HIP-3 assets only support isolated margin
+  isolatedOnly?: boolean;
 }
 
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",  displayName: "Bitcoin",    dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
-  { coin: "ETH",  displayName: "Ethereum",   dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
-  { coin: "SOL",  displayName: "Solana",     dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "HYPE", displayName: "Hyperliquid",dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "XRP",  displayName: "XRP",        dex: "", maxLeverage: 20, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "DOGE", displayName: "Dogecoin",   dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "SUI",  displayName: "Sui",        dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "LINK", displayName: "Chainlink",  dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "AVAX", displayName: "Avalanche",  dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "BNB",  displayName: "BNB",        dex: "", maxLeverage: 10, szDecimals: 3, category: "crypto", minNotional: 10 },
-  { coin: "AAVE", displayName: "Aave",       dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "WLD",  displayName: "Worldcoin",  dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
 ];
 
 // ============ STRATEGY TYPES ============
-type StrategyType = "confluence" | "extreme_rsi" | "bb_rsi_reversion" | "breakout_retest" | "aiweekly";
-
-// ============ AIWEEKLY STRATEGY CONSTANTS ============
-const AIWEEKLY_CYCLE_HOURS = 72; // every 3 days
-const AIWEEKLY_TP_PCT = 0.05;    // +5% take profit
-const AIWEEKLY_SL_PCT = 0.01;    // -1% stop loss (5:1 R:R)
-const AIWEEKLY_ALLOCATION = 100;  // $100 fixed allocation
-const AIWEEKLY_LEVERAGE = 5;      // moderate leverage for swing trades
+type StrategyType = "degen_rsi";
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -232,8 +205,7 @@ async function fetchUserState(address: string): Promise<any> {
     const usdcBalance = spotBalances.find((b: any) => b.coin === "USDC");
     const spotEquity = parseFloat(usdcBalance?.total || "0");
 
-    // Unified wallet: spot USDC is the true equity source (perps accountValue = 0)
-    // Use whichever is higher — spot total includes all margin + free balance
+    // Unified wallet: spot USDC is the true equity source
     const trueEquity = Math.max(spotEquity, perpsEquity);
     perpsData.marginSummary = {
       ...perpsData.marginSummary,
@@ -243,9 +215,9 @@ async function fetchUserState(address: string): Promise<any> {
     return perpsData;
   } catch (e) { log(`UserState error: ${e}`, "engine"); return null; }
 }
+
 // ============ HL FILLS — GROUND TRUTH P&L ============
 
-// Fetch recent fills for a user (returns all fills since startTime)
 async function fetchUserFills(address: string, startTime?: number): Promise<any[]> {
   try {
     const body: any = { type: "userFillsByTime", user: address, startTime: startTime || (Date.now() - 24 * 3600 * 1000) };
@@ -254,13 +226,9 @@ async function fetchUserFills(address: string, startTime?: number): Promise<any[
   } catch (e) { log(`Fills error: ${e}`, "engine"); return []; }
 }
 
-// Get the realized P&L for a specific coin's close from HL fills
-// Aggregates all close fills for the coin within a time window
-// Returns { closedPnl, totalFee, exitPrice, exitSize } or null if not found
 function extractClosePnlFromFills(fills: any[], coin: string, side: "long" | "short", afterTime: number): {
   closedPnl: number; totalFee: number; netPnl: number; exitPrice: number; exitSize: number;
 } | null {
-  // Close fills: "Close Long" or "Close Short"
   const closeDir = side === "long" ? "Close Long" : "Close Short";
   const closeFills = fills.filter(f =>
     f.coin === coin && f.dir === closeDir && f.time >= afterTime
@@ -279,8 +247,6 @@ function extractClosePnlFromFills(fills: any[], coin: string, side: "long" | "sh
     weightedPx += parseFloat(f.px || "0") * sz;
   }
   const exitPrice = totalSz > 0 ? weightedPx / totalSz : 0;
-  // netPnl = closedPnl - totalFee (closedPnl is gross before close-side fee)
-  // Actually HL's closedPnl already accounts for entry fee, so net = closedPnl - closeFee
   const netPnl = closedPnl - totalFee;
 
   return { closedPnl, totalFee, netPnl, exitPrice, exitSize: totalSz };
@@ -297,6 +263,45 @@ function getSessionInfo(): { session: string; isHighVolume: boolean; description
   return { session: "afterhours", isHighVolume: false, description: "After Hours" };
 }
 
+// ============ HORIZONTAL SUPPORT DETECTION ============
+
+function findHorizontalSupport(candles: OHLCVCandle[], currentPrice: number): { level: number; touches: number } | null {
+  if (candles.length < 20) return null;
+
+  const lows = candles.map(c => c.low);
+  const clusters: { level: number; touches: number }[] = [];
+  const used = new Set<number>();
+
+  for (let i = 0; i < lows.length; i++) {
+    if (used.has(i)) continue;
+    let sumPx = lows[i];
+    let count = 1;
+    const group = [i];
+
+    for (let j = i + 1; j < lows.length; j++) {
+      if (used.has(j)) continue;
+      const avg = sumPx / count;
+      if (Math.abs(lows[j] - avg) / avg <= 0.003) { // within 0.3%
+        sumPx += lows[j];
+        count++;
+        group.push(j);
+      }
+    }
+
+    if (count >= 3) {
+      const avgLevel = sumPx / count;
+      if (avgLevel < currentPrice) {
+        clusters.push({ level: parseFloat(avgLevel.toFixed(6)), touches: count });
+        group.forEach(idx => used.add(idx));
+      }
+    }
+  }
+
+  if (clusters.length === 0) return null;
+
+  clusters.sort((a, b) => Math.abs(currentPrice - a.level) - Math.abs(currentPrice - b.level));
+  return clusters[0];
+}
 
 // ============ TRADING ENGINE ============
 
@@ -309,29 +314,19 @@ class TradingEngine {
   private dayStartDate = "";
   private dailyTradeCount = 0;
   private dailyTradeDate = "";
-  private drawdownPaused = false;
   private scanCount = 0;
   private lastLearningReview = 0;
   private pnlResetTimestamp = "";
   private pnlResetEquity = 0;
-  // v11.0: RSI cross tracking — record price at the moment RSI first hits extreme
+  // RSI cross tracking — only enter once per RSI extreme event
   private rsiCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
-  // v10.9.3: Robust position sync — track consecutive "no position" readings per tradeId
+  // Robust position sync — track consecutive "no position" readings per tradeId
   private syncMissCount: Map<number, number> = new Map();
-  // v13.4: HSTAR strategy — consecutive loss counter for position sizing
-  private hstarConsecutiveLosses: number = 0;
-  // v13.4: Separate RSI cross state for HSTAR (different thresholds)
-  private hstarCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
-  // v13.5: AIWEEKLY — AI consensus strategy
-  private aiweeklyLastCycleTime: number = 0;
-  private aiweeklyIsRunning: boolean = false;
 
   private resetLossTrackers() {
-    this.drawdownPaused = false;
     this.dailyTradeCount = 0;
     this.dailyTradeDate = new Date().toISOString().split("T")[0];
   }
-
 
   async start() {
     const config = await storage.getConfig();
@@ -348,21 +343,23 @@ class TradingEngine {
       }
     }
 
-    // Restore persisted P&L baseline (survives restarts)
-    if (config.pnlBaselineTimestamp && config.pnlBaselineEquity && config.pnlBaselineEquity > 0) {
-      this.pnlResetTimestamp = config.pnlBaselineTimestamp;
-      this.pnlResetEquity = config.pnlBaselineEquity;
-      this.startingEquity = config.pnlBaselineEquity;
-      log(`[BASELINE] Restored P&L baseline: $${config.pnlBaselineEquity.toFixed(2)} from ${config.pnlBaselineTimestamp}`, "engine");
-    } else {
-      // First-time start: set baseline to current equity
+    // v14.0: Force fresh P&L baseline on first v14 deploy
+    const V14_DEPLOY = "2026-04-18T11:56:00.000Z";
+    if (!config.pnlBaselineTimestamp || config.pnlBaselineTimestamp < V14_DEPLOY) {
       this.pnlResetTimestamp = new Date().toISOString();
       this.pnlResetEquity = this.lastKnownEquity;
+      this.startingEquity = this.lastKnownEquity;
       await storage.updateConfig({
         pnlBaselineEquity: this.lastKnownEquity,
         pnlBaselineTimestamp: this.pnlResetTimestamp,
       });
-      log(`[BASELINE] Initial P&L baseline set: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+      log(`[v14.0] Fresh start — P&L baseline reset to $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    } else {
+      // Normal restore: baseline already set to v14 or later
+      this.pnlResetTimestamp = config.pnlBaselineTimestamp;
+      this.pnlResetEquity = config.pnlBaselineEquity;
+      this.startingEquity = config.pnlBaselineEquity;
+      log(`[BASELINE] Restored P&L baseline: $${config.pnlBaselineEquity.toFixed(2)} from ${config.pnlBaselineTimestamp}`, "engine");
     }
 
     // Restore last review time from DB
@@ -370,9 +367,6 @@ class TradingEngine {
     if (lastReviewTime) {
       this.lastLearningReview = new Date(lastReviewTime).getTime();
     }
-
-    const insights = await storage.getActiveInsights();
-
 
     // Clean stale scan rows for coins no longer in ALLOWED_ASSETS
     await storage.deleteScansNotIn(ALLOWED_ASSETS.map(a => a.coin));
@@ -389,17 +383,14 @@ class TradingEngine {
           const sz = Math.abs(parseFloat(pos?.szi || "0"));
           if (sz === 0) continue;
           if (dbCoins.has(pos.coin)) continue;
-          // This is an orphan — position on HL but no open trade in DB
           log(`[ORPHAN] Found orphan position: ${pos.coin} size=${pos.szi} entry=${pos.entryPx} — closing`, "engine");
           try {
-            // Cancel any orders first
             const openOrders = await executor.getOpenOrders();
             for (const order of openOrders.filter((o: any) => o.coin === pos.coin)) {
               await executor.cancelOrder(order.coin, order.oid);
               log(`[ORPHAN] Cancelled order ${order.coin} oid=${order.oid}`, "engine");
             }
-            // Close the position
-            const isBuy = parseFloat(pos.szi) < 0; // buy to close short, sell to close long
+            const isBuy = parseFloat(pos.szi) < 0;
             const midPx = parseFloat(pos.entryPx);
             const closePx = isBuy ? midPx * 1.05 : midPx * 0.95;
             const ac = ALLOWED_ASSETS.find(a => a.coin === pos.coin);
@@ -421,12 +412,13 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v13.5 started | TRIPLE: PURE_RSI (≤20/≥81, 2 slots) + HSTAR (≤25/≥75, 4 slots) + AIWEEKLY (72h cycle, AI consensus) | ${ALLOWED_ASSETS.length} assets | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v14.0 started | DEGEN_RSI: BTC LONG only, RSI ≤25 (5m+15m), 90% equity, 40x, SL -0.5%, TP +0.43%, BE @ +0.25% | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v13.5 started — TRIPLE: PURE_RSI + HSTAR + AIWEEKLY — ${ALLOWED_ASSETS.length} assets — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v14.0 started — DEGEN_RSI: BTC LONG | RSI ≤25 (5m+15m) | 90% equity | 40x | SL -0.5% | TP +0.43% | BE @ +0.25% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
+
   async stop() {
     if (this.scanTimer) { clearTimeout(this.scanTimer); this.scanTimer = null; }
     await storage.createLog({ type: "system", message: "Trading engine stopped", timestamp: new Date().toISOString() });
@@ -435,10 +427,8 @@ class TradingEngine {
   private checkNewDay() {
     const today = new Date().toISOString().split("T")[0];
     if (this.dayStartDate !== today) {
-      // New trading day — reset drawdown baseline to current equity
       this.dayStartEquity = this.lastKnownEquity;
       this.dayStartDate = today;
-      this.drawdownPaused = false;
       this.dailyTradeCount = 0;
       this.dailyTradeDate = today;
       log(`New trading day ${today} — AUM baseline: $${this.dayStartEquity.toFixed(2)}`, "engine");
@@ -471,6 +461,7 @@ class TradingEngine {
     } catch { /* use last known */ }
     return this.lastKnownEquity;
   }
+
   async runScanCycle() {
     if (this.isScanning) return;
     this.isScanning = true;
@@ -516,18 +507,9 @@ class TradingEngine {
         });
       }
 
-      // === AIWEEKLY: Check if it's time for a new research cycle (every 72 hours) ===
-      await this.checkAiweeklyCycle(config, equity);
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v14.0 DEGEN_RSI | LONG only | ${ALLOWED_ASSETS.length} assets`, "engine");
 
-      // === AIWEEKLY: Check exit conditions for open aiweekly positions ===
-      await this.checkAiweeklyExits(config, equity);
-
-      // Drawdown check removed — user disabled all exposure reduction
-      const canOpenNew = true;
-
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v13.5 TRIPLE: PURE_RSI + HSTAR + AIWEEKLY | Trades today: ${this.dailyTradeCount}`, "engine");
-
-      // Fetch market data (crypto only)
+      // Fetch market data
       const mainData = await fetchMetaAndAssetCtxs("");
       const assetCtxMap: Record<string, any> = {};
       if (mainData && mainData.length >= 2) {
@@ -538,36 +520,33 @@ class TradingEngine {
         }
       }
 
-      // Open positions — separate slot pools per strategy
+      // Open positions — DEGEN_RSI: 1 at a time
       const openTrades = await storage.getOpenTrades();
       const openCoins = new Set(openTrades.map(t => t.coin));
-      const pureRsiTrades = openTrades.filter(t => t.strategy === "pure_rsi" || t.strategy === "bb_rsi_reversion");
-      const hstarTrades = openTrades.filter(t => t.strategy === "hstar");
-      const maxPosPureRsi = 2;
-      const maxPosHstar = 4;
-      const slotsAvailable = maxPosPureRsi - pureRsiTrades.length;
+      const maxPositions = 1;
 
       // ======================================================================
-      // v11.0: PURE RSI STRATEGY
-      // LONG: RSI ≤ 20 on 5m or 15m → instant market buy, SL -0.5%, TP +0.43%, BE @ +0.2%
-      // SHORT: RSI ≥ 81 on 5m or 15m → instant market sell, SL -0.5%, TP +0.43%, BE @ +0.2%
-      // 80% margin, max leverage, all 9 assets
+      // v14.0: DEGEN_RSI STRATEGY
+      // BTC LONG only: RSI ≤ 25 on BOTH 5m AND 15m simultaneously
+      // 90% equity, 40x leverage, 1 position at a time
+      // SL -0.5% (placed immediately), TP +0.43%, BE SL @ +0.25%
       // ======================================================================
 
       let slotsUsed = 0;
+      const LONG_THRESHOLD = 25;
+      const asset = ALLOWED_ASSETS[0]; // BTC only
 
-      for (const asset of ALLOWED_ASSETS) {
-        const ctx = assetCtxMap[asset.coin];
-        if (!ctx?.midPx || ctx.midPx === "None") continue;
+      const ctx = assetCtxMap[asset.coin];
+      if (ctx?.midPx && ctx.midPx !== "None") {
         const price = parseFloat(ctx.midPx);
-        if (isNaN(price) || price <= 0) continue;
+        if (!isNaN(price) && price > 0) {
         const volume24h = parseFloat(ctx.dayNtlVlm || "0");
         const funding = parseFloat(ctx.funding || "0");
         const openInterest = parseFloat(ctx.openInterest || "0");
         const prevDayPx = parseFloat(ctx.prevDayPx || String(price));
         const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : 0;
 
-        // Fetch 5m and 15m candles for RSI only
+        // Fetch 5m and 15m candles for RSI
         const [ohlcv5m, ohlcv15m] = await Promise.all([
           fetchCandlesOHLCV(asset.coin, "5m", 30),
           fetchCandlesOHLCV(asset.coin, "15m", 30),
@@ -576,28 +555,23 @@ class TradingEngine {
         const c5m = ohlcv5m.map(c => c.close);
         const c15m = ohlcv15m.map(c => c.close);
 
-        if (c5m.length < 15 && c15m.length < 15) continue;
+        if (c5m.length >= 15 || c15m.length >= 15) {
 
         // Intra-candle RSI — append current live price
         const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
         const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
 
-        // Update dashboard scan row
-        let scanSignal: "neutral" | "oversold_long" | "overbought_short" = "neutral";
+        // Signal: BOTH 5m AND 15m must be ≤25 simultaneously
+        let scanSignal: "neutral" | "oversold_long" = "neutral";
         let scanDetails = "";
-        const LONG_THRESHOLD = 20;
-        const SHORT_THRESHOLD = 81;
 
-        if (rsi5m <= LONG_THRESHOLD || rsi15m <= LONG_THRESHOLD) {
+        if (rsi5m <= LONG_THRESHOLD && rsi15m <= LONG_THRESHOLD) {
           scanSignal = "oversold_long";
-          scanDetails = `RSI ≤20: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
-        } else if (rsi5m >= SHORT_THRESHOLD || rsi15m >= SHORT_THRESHOLD) {
-          scanSignal = "overbought_short";
-          scanDetails = `RSI ≥81: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
+          scanDetails = `RSI ≤25 BOTH: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
         } else {
-          const distToLong = Math.min(Math.abs(rsi5m - LONG_THRESHOLD), Math.abs(rsi15m - LONG_THRESHOLD));
-          const distToShort = Math.min(Math.abs(rsi5m - SHORT_THRESHOLD), Math.abs(rsi15m - SHORT_THRESHOLD));
-          scanDetails = `RSI 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Nearest: ${Math.min(distToLong, distToShort).toFixed(1)} pts`;
+          const dist5m = Math.abs(rsi5m - LONG_THRESHOLD);
+          const dist15m = Math.abs(rsi15m - LONG_THRESHOLD);
+          scanDetails = `RSI 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need BOTH ≤25 (5m: ${rsi5m <= LONG_THRESHOLD ? "✓" : dist5m.toFixed(1)+" away"}, 15m: ${rsi15m <= LONG_THRESHOLD ? "✓" : dist15m.toFixed(1)+" away"})`;
         }
 
         await storage.upsertMarketScan({
@@ -614,409 +588,160 @@ class TradingEngine {
 
         // --- ENTRY LOGIC ---
         if (scanSignal === "neutral") {
-          // Reset cross state when RSI recovers
+          // Reset cross state when BOTH RSIs recover above 30
           if (rsi5m > LONG_THRESHOLD + 5 && rsi15m > LONG_THRESHOLD + 5) {
-            this.rsiCrossState.delete(`${asset.coin}_5m_long`);
-            this.rsiCrossState.delete(`${asset.coin}_15m_long`);
+            this.rsiCrossState.delete(`${asset.coin}_dual_long`);
           }
-          if (rsi5m < SHORT_THRESHOLD - 5 && rsi15m < SHORT_THRESHOLD - 5) {
-            this.rsiCrossState.delete(`${asset.coin}_5m_short`);
-            this.rsiCrossState.delete(`${asset.coin}_15m_short`);
-          }
-          await new Promise(r => setTimeout(r, 100));
-          continue;
-        }
+        } else if (scanSignal === "oversold_long") {
+          // Check slot availability
+          if (!openCoins.has(asset.coin) && openTrades.length < maxPositions && slotsUsed < maxPositions) {
 
-        // Skip if already have an open trade on this coin
-        if (openCoins.has(asset.coin)) { await new Promise(r => setTimeout(r, 100)); continue; }
-        if (slotsAvailable <= slotsUsed) { await new Promise(r => setTimeout(r, 100)); continue; }
+          // Cross state — only enter once per dual RSI extreme event
+          const crossKey = `${asset.coin}_dual_long`;
+          if (!this.rsiCrossState.has(crossKey)) {
+            this.rsiCrossState.set(crossKey, { price, timestamp: Date.now(), rsi: Math.min(rsi5m, rsi15m) });
 
-        // Determine side and which TF triggered
-        let side: "long" | "short";
-        let triggerTF = "";
-        let triggerRSI = 50;
-        if (scanSignal === "oversold_long") {
-          side = "long";
-          if (rsi5m <= LONG_THRESHOLD) { triggerTF = "5m"; triggerRSI = rsi5m; }
-          else { triggerTF = "15m"; triggerRSI = rsi15m; }
-        } else {
-          side = "short";
-          if (rsi5m >= SHORT_THRESHOLD) { triggerTF = "5m"; triggerRSI = rsi5m; }
-          else { triggerTF = "15m"; triggerRSI = rsi15m; }
-        }
+            const triggerRSI = Math.min(rsi5m, rsi15m);
 
-        // Check cross state — only enter once per RSI extreme event
-        const crossKey = `${asset.coin}_${triggerTF}_${side}`;
-        if (this.rsiCrossState.has(crossKey)) { await new Promise(r => setTimeout(r, 100)); continue; }
-        this.rsiCrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
+            // TP +0.43%, SL -0.5% (placed immediately)
+            const tp = price * 1.0043;
+            const sl = price * 0.995;
 
-        // TP at +0.43%, SL at -0.5%
-        const tp = side === "long" ? price * 1.0043 : price * 0.9957;
-        const sl = side === "long" ? price * 0.995 : price * 1.005;
+            // Check horizontal support (informational)
+            const ohlcv1h = await fetchCandlesOHLCV(asset.coin, "1h", 100);
+            const support = findHorizontalSupport(ohlcv1h, price);
+            const supportInfo = support && (Math.abs(price - support.level) / price <= 0.005)
+              ? `NEAR SUPPORT $${support.level.toFixed(2)} (${support.touches} touches)`
+              : support ? `Support $${support.level.toFixed(2)} (${support.touches}t, ${((price - support.level)/price*100).toFixed(1)}% away)` : "No clear support";
 
-        log(`[PURE_RSI] ${asset.coin} ${triggerTF} RSI=${triggerRSI.toFixed(1)} → ${side.toUpperCase()} @ $${price} | TP: $${tp.toFixed(2)} (+0.43%) | SL: $${sl.toFixed(2)} (-0.5%)`, "engine");
+            log(`[DEGEN_RSI] BTC 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} BOTH ≤25 → LONG @ $${price} | TP +0.43% | SL -0.5% | BE @ +0.25% | ${supportInfo}`, "engine");
 
-        // Position sizing — 50% of remaining equity for PURE_RSI (2 slots = 25% each)
-        // v13.5: AIWEEKLY gets $100 fixed, remaining split 50/50
-        const leverage = asset.maxLeverage;
-        const aiweeklyReserve = Math.min(AIWEEKLY_ALLOCATION, equity * 0.15);
-        const remainingEquity = equity - aiweeklyReserve;
-        const capitalForTrade = (remainingEquity * 0.50) / maxPosPureRsi;
-        const notionalSize = capitalForTrade * leverage;
-        const assetSize = notionalSize / price;
+            // Position sizing — 90% of equity, 40x leverage
+            const leverage = asset.maxLeverage; // 40x
+            const capitalForTrade = equity * 0.90;
+            const notionalSize = capitalForTrade * leverage;
+            const assetSize = notionalSize / price;
 
-        if (capitalForTrade < 5) {
-          log(`[PURE_RSI] SKIP ${asset.coin}: Capital too low ($${capitalForTrade.toFixed(2)})`, "engine");
-          continue;
-        }
+            if (capitalForTrade >= 5) {
 
-        // Execute market order (IOC)
-        let fillPrice = price;
-        let filledSz = 0; // actual filled asset quantity from HL
-        if (config.apiSecret && config.walletAddress) {
-          try {
-            const executor = createExecutor(config.apiSecret, config.walletAddress);
-            const isCross = !asset.isolatedOnly;
-            await executor.setLeverage(asset.coin, leverage, isCross);
-            const slippageMult = side === "long" ? 1.01 : 0.99;
-            const orderPrice = price * slippageMult;
-            const roundedSize = parseFloat(formatHLSize(assetSize, asset.szDecimals));
-            if (roundedSize <= 0) { log(`[PURE_RSI] SKIP ${asset.coin}: Rounded size is 0`, "engine"); continue; }
-            const orderResult = await executor.placeOrder({
-              coin: asset.coin, isBuy: side === "long", sz: roundedSize,
-              limitPx: parseFloat(formatHLPrice(orderPrice, asset.szDecimals)),
-              orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
-            });
+            // Execute market order (IOC)
+            let fillPrice = price;
+            let filledSz = 0;
+            if (config.apiSecret && config.walletAddress) {
+              try {
+                const executor = createExecutor(config.apiSecret, config.walletAddress);
+                const isCross = !asset.isolatedOnly;
+                await executor.setLeverage(asset.coin, leverage, isCross);
+                const orderPrice = price * 1.01; // 1% slippage for long
+                const roundedSize = parseFloat(formatHLSize(assetSize, asset.szDecimals));
+                if (roundedSize <= 0) { log(`[DEGEN_RSI] SKIP BTC: Rounded size is 0`, "engine"); }
+                else {
+                const orderResult = await executor.placeOrder({
+                  coin: asset.coin, isBuy: true, sz: roundedSize,
+                  limitPx: parseFloat(formatHLPrice(orderPrice, asset.szDecimals)),
+                  orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
+                });
 
-            log(`[HL RAW] ${asset.coin} pure_rsi response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
-            const status = orderResult?.response?.data?.statuses?.[0];
-            const fillPx = status?.filled?.avgPx;
-            const totalSz = status?.filled?.totalSz;
-            const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
+                log(`[HL RAW] BTC degen_rsi response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
+                const status = orderResult?.response?.data?.statuses?.[0];
+                const fillPx = status?.filled?.avgPx;
+                const totalSz = status?.filled?.totalSz;
+                const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
 
-            if (errorMsg) {
-              log(`[PURE_RSI] ORDER REJECTED: ${asset.coin} — ${errorMsg}`, "engine");
-              await storage.createLog({ type: "order_error", message: `ORDER REJECTED: ${asset.coin} ${side} — ${errorMsg}`, timestamp: new Date().toISOString() });
-              continue;
+                if (errorMsg) {
+                  log(`[DEGEN_RSI] ORDER REJECTED: BTC — ${errorMsg}`, "engine");
+                  await storage.createLog({ type: "order_error", message: `DEGEN_RSI REJECTED: BTC LONG — ${errorMsg}`, timestamp: new Date().toISOString() });
+                } else if (fillPx && parseFloat(totalSz) > 0) {
+                  fillPrice = parseFloat(fillPx);
+                  filledSz = parseFloat(totalSz);
+                  log(`[DEGEN_RSI] FILLED: BTC LONG sz=${totalSz} @ $${fillPx}`, "engine");
+                } else {
+                  log(`[DEGEN_RSI] IOC NOT FILLED: BTC LONG`, "engine");
+                  await storage.createLog({ type: "order_unfilled", message: `DEGEN_RSI NOT FILLED: BTC LONG`, timestamp: new Date().toISOString() });
+                }
+                } // end roundedSize > 0
+              } catch (execErr) {
+                log(`[DEGEN_RSI] ORDER FAILED: BTC — ${execErr}`, "engine");
+                await storage.createLog({ type: "order_error", message: `DEGEN_RSI FAILED: BTC LONG — ${execErr}`, timestamp: new Date().toISOString() });
+              }
             }
 
-            if (fillPx && parseFloat(totalSz) > 0) {
-              fillPrice = parseFloat(fillPx);
-              filledSz = parseFloat(totalSz);
-              log(`[PURE_RSI] FILLED: ${asset.coin} ${side} sz=${totalSz} @ $${fillPx}`, "engine");
-            } else {
-              log(`[PURE_RSI] IOC NOT FILLED: ${asset.coin} ${side}`, "engine");
-              await storage.createLog({ type: "order_unfilled", message: `IOC NOT FILLED: ${asset.coin} ${side}`, timestamp: new Date().toISOString() });
-              continue;
-            }
-          } catch (execErr) {
-            log(`[PURE_RSI] ORDER FAILED: ${asset.coin} — ${execErr}`, "engine");
-            await storage.createLog({ type: "order_error", message: `ORDER FAILED: ${asset.coin} ${side} — ${execErr}`, timestamp: new Date().toISOString() });
-            continue;
-          }
-        }
+            if (filledSz > 0) {
+            // Recalculate TP and SL based on actual fill price
+            const actualTP = fillPrice * 1.0043;
+            const actualSL = fillPrice * 0.995;
+            const actualNotional = filledSz * fillPrice;
 
-        // Recalculate TP and SL based on actual fill price
-        const actualTP = side === "long" ? fillPrice * 1.0043 : fillPrice * 0.9957;
-        const actualSL = side === "long" ? fillPrice * 0.995 : fillPrice * 1.005;
-        // Actual notional = filled size * fill price (GROUND TRUTH for P&L)
-        const actualNotional = (filledSz > 0 ? filledSz : assetSize) * fillPrice;
-
-        const trade = await storage.createTrade({
-          coin: asset.coin, side, entryPrice: fillPrice, size: 80, leverage,
-          entryEquity: equity,
-          notionalValue: actualNotional,
-          rsiAtEntry: triggerRSI, rsi4h: 0, rsi1d: 0,
-          ema10: 0, ema21: 0, ema50: 0,
-          stopLoss: actualSL,
-          takeProfit1: actualTP,
-          takeProfit2: actualTP,
-          tp1Hit: false,
-          confluenceScore: 0,
-          confluenceDetails: `PURE RSI: ${triggerTF} RSI=${triggerRSI.toFixed(1)}`,
-          riskRewardRatio: 0.86,
-          status: "open",
-          reason: `[PURE_RSI] ${side.toUpperCase()} | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL -0.5% | TP +0.43% | ${leverage}x`,
-          setupType: "pure_rsi",
-          strategy: "pure_rsi",
-          openedAt: new Date().toISOString(),
-        });
-
-        // Place SL order on Hyperliquid as stop-market
-        if (config.apiSecret && config.walletAddress && filledSz > 0) {
-          try {
-            const executor = createExecutor(config.apiSecret, config.walletAddress);
-            const slTriggerPx = parseFloat(formatHLPrice(actualSL, asset.szDecimals));
-            // Stop-market: trigger at SL price, fill at slippage price
-            const slFillPx = side === "long"
-              ? parseFloat(formatHLPrice(actualSL * 0.98, asset.szDecimals))  // sell below SL
-              : parseFloat(formatHLPrice(actualSL * 1.02, asset.szDecimals)); // buy above SL
-            await executor.placeOrder({
-              coin: asset.coin,
-              isBuy: side === "short",  // close direction
-              sz: filledSz,
-              limitPx: slFillPx,
-              orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
-              reduceOnly: true,
-            });
-            log(`[SL ORDER] ${asset.coin} SL placed @ $${slTriggerPx} (-0.5%)`, "engine");
-          } catch (slErr) {
-            log(`[SL ORDER] FAILED ${asset.coin}: ${slErr} — will monitor in checkExits`, "engine");
-          }
-        }
-
-        await logDecision({
-          tradeId: trade.id, coin: asset.coin, action: "entry", side, price: fillPrice,
-          reasoning: `PURE RSI: ${side.toUpperCase()} ${asset.displayName} | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL $${actualSL.toFixed(2)} (-0.5%) | TP $${actualTP.toFixed(2)} (+0.43%) | ${leverage}x MAX | $${capitalForTrade.toFixed(0)} capital`,
-          equity, leverage, positionSizeUsd: capitalForTrade, strategy: "bb_rsi_reversion",
-        });
-
-        await storage.createLog({
-          type: "trade_open",
-          message: `[PURE_RSI] ${side.toUpperCase()} ${asset.displayName} @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | RSI ${triggerRSI.toFixed(1)} @${triggerTF} | SL -0.5% | TP +0.43% | $${capitalForTrade.toFixed(0)}`,
-          data: JSON.stringify(trade),
-          timestamp: new Date().toISOString(),
-        });
-
-        openCoins.add(asset.coin);
-        slotsUsed++;
-        this.dailyTradeCount++;
-
-        await new Promise(r => setTimeout(r, 100));
-      }
-
-      // ======================================================================
-      // v13.4: H★★ STRATEGY (parallel)
-      // LONG: RSI ≤ 25 on 5m or 15m, SHORT: RSI ≥ 75 on 5m or 15m
-      // TP +0.40%, SL -0.20% (2:1 R:R), 15x leverage cap, volume filter
-      // Consecutive-loss sizing: half after 2 losses, quarter after 3
-      // ======================================================================
-
-      const hstarSlotsAvailable = maxPosHstar - hstarTrades.length;
-      let hstarSlotsUsed = 0;
-      const HSTAR_LONG_THRESHOLD = 25;
-      const HSTAR_SHORT_THRESHOLD = 75;
-      const HSTAR_LEVERAGE_CAP = 15;
-      const HSTAR_TP_PCT = 0.0040;  // +0.40%
-      const HSTAR_SL_PCT = 0.0020;  // -0.20%
-      const HSTAR_MIN_VOLUME = 50_000_000; // $50M 24h volume minimum
-
-      for (const asset of ALLOWED_ASSETS) {
-        const ctx = assetCtxMap[asset.coin];
-        if (!ctx?.midPx || ctx.midPx === "None") continue;
-        const price = parseFloat(ctx.midPx);
-        if (isNaN(price) || price <= 0) continue;
-        const volume24h = parseFloat(ctx.dayNtlVlm || "0");
-
-        // Skip coins with low volume
-        if (volume24h < HSTAR_MIN_VOLUME) continue;
-
-        // We already have RSI from the PURE_RSI loop — re-fetch from scan row
-        // Actually, we have ohlcv cached above. Re-use the scan data.
-        const [ohlcv5m, ohlcv15m] = await Promise.all([
-          fetchCandlesOHLCV(asset.coin, "5m", 30),
-          fetchCandlesOHLCV(asset.coin, "15m", 30),
-        ]);
-        const c5m = ohlcv5m.map(c => c.close);
-        const c15m = ohlcv15m.map(c => c.close);
-        if (c5m.length < 15 && c15m.length < 15) continue;
-
-        const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
-        const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
-
-        // HSTAR signal check
-        let hstarSignal: "long" | "short" | null = null;
-        let hstarTriggerTF = "";
-        let hstarTriggerRSI = 50;
-
-        if (rsi5m <= HSTAR_LONG_THRESHOLD || rsi15m <= HSTAR_LONG_THRESHOLD) {
-          hstarSignal = "long";
-          if (rsi5m <= HSTAR_LONG_THRESHOLD) { hstarTriggerTF = "5m"; hstarTriggerRSI = rsi5m; }
-          else { hstarTriggerTF = "15m"; hstarTriggerRSI = rsi15m; }
-        } else if (rsi5m >= HSTAR_SHORT_THRESHOLD || rsi15m >= HSTAR_SHORT_THRESHOLD) {
-          hstarSignal = "short";
-          if (rsi5m >= HSTAR_SHORT_THRESHOLD) { hstarTriggerTF = "5m"; hstarTriggerRSI = rsi5m; }
-          else { hstarTriggerTF = "15m"; hstarTriggerRSI = rsi15m; }
-        }
-
-        if (!hstarSignal) {
-          // Reset HSTAR cross state when RSI recovers
-          if (rsi5m > HSTAR_LONG_THRESHOLD + 5 && rsi15m > HSTAR_LONG_THRESHOLD + 5) {
-            this.hstarCrossState.delete(`${asset.coin}_5m_long`);
-            this.hstarCrossState.delete(`${asset.coin}_15m_long`);
-          }
-          if (rsi5m < HSTAR_SHORT_THRESHOLD - 5 && rsi15m < HSTAR_SHORT_THRESHOLD - 5) {
-            this.hstarCrossState.delete(`${asset.coin}_5m_short`);
-            this.hstarCrossState.delete(`${asset.coin}_15m_short`);
-          }
-          await new Promise(r => setTimeout(r, 50));
-          continue;
-        }
-
-        // Skip if coin already has an open position (from either strategy)
-        if (openCoins.has(asset.coin)) { await new Promise(r => setTimeout(r, 50)); continue; }
-        if (hstarSlotsAvailable <= hstarSlotsUsed) { await new Promise(r => setTimeout(r, 50)); continue; }
-
-        // Check cross state — only enter once per RSI extreme event
-        const hstarCrossKey = `${asset.coin}_${hstarTriggerTF}_${hstarSignal}`;
-        if (this.hstarCrossState.has(hstarCrossKey)) { await new Promise(r => setTimeout(r, 50)); continue; }
-
-        // Also skip if PURE_RSI already flagged this same cross (RSI ≤20 is a subset of ≤25)
-        const pureRsiCrossKey = `${asset.coin}_${hstarTriggerTF}_${hstarSignal}`;
-        if (this.rsiCrossState.has(pureRsiCrossKey)) { await new Promise(r => setTimeout(r, 50)); continue; }
-
-        this.hstarCrossState.set(hstarCrossKey, { price, timestamp: Date.now(), rsi: hstarTriggerRSI });
-
-        // TP at +0.40%, SL at -0.20% (2:1 R:R)
-        const hTP = hstarSignal === "long" ? price * (1 + HSTAR_TP_PCT) : price * (1 - HSTAR_TP_PCT);
-        const hSL = hstarSignal === "long" ? price * (1 - HSTAR_SL_PCT) : price * (1 + HSTAR_SL_PCT);
-
-        // Leverage: min of asset max and 15x cap
-        const hLeverage = Math.min(asset.maxLeverage, HSTAR_LEVERAGE_CAP);
-
-        // Position sizing: 50% margin for HSTAR (4 slots = 12.5% each)
-        // Consecutive-loss adjustment: half after 2 losses, quarter after 3+
-        let sizeMult = 1.0;
-        if (this.hstarConsecutiveLosses >= 3) sizeMult = 0.25;
-        else if (this.hstarConsecutiveLosses >= 2) sizeMult = 0.5;
-
-        const hAiweeklyReserve = Math.min(AIWEEKLY_ALLOCATION, equity * 0.15);
-        const hRemainingEquity = equity - hAiweeklyReserve;
-        const hCapital = ((hRemainingEquity * 0.50) / maxPosHstar) * sizeMult;
-        const hNotional = hCapital * hLeverage;
-        const hAssetSize = hNotional / price;
-
-        if (hCapital < 5) {
-          log(`[HSTAR] SKIP ${asset.coin}: Capital too low ($${hCapital.toFixed(2)})`, "engine");
-          continue;
-        }
-
-        log(`[HSTAR] ${asset.coin} ${hstarTriggerTF} RSI=${hstarTriggerRSI.toFixed(1)} → ${hstarSignal.toUpperCase()} @ $${price} | TP: $${hTP.toFixed(4)} (+0.40%) | SL: $${hSL.toFixed(4)} (-0.20%) | ${hLeverage}x | sizeMult=${sizeMult}`, "engine");
-
-        // Execute market order (IOC)
-        let hFillPrice = price;
-        let hFilledSz = 0;
-        if (config.apiSecret && config.walletAddress) {
-          try {
-            const executor = createExecutor(config.apiSecret, config.walletAddress);
-            const isCross = !asset.isolatedOnly;
-            await executor.setLeverage(asset.coin, hLeverage, isCross);
-            const slippageMult = hstarSignal === "long" ? 1.01 : 0.99;
-            const orderPrice = price * slippageMult;
-            const roundedSize = parseFloat(formatHLSize(hAssetSize, asset.szDecimals));
-            if (roundedSize <= 0) { log(`[HSTAR] SKIP ${asset.coin}: Rounded size is 0`, "engine"); continue; }
-            const orderResult = await executor.placeOrder({
-              coin: asset.coin, isBuy: hstarSignal === "long", sz: roundedSize,
-              limitPx: parseFloat(formatHLPrice(orderPrice, asset.szDecimals)),
-              orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
+            const trade = await storage.createTrade({
+              coin: asset.coin, side: "long", entryPrice: fillPrice, size: 90, leverage,
+              entryEquity: equity,
+              notionalValue: actualNotional,
+              rsiAtEntry: triggerRSI, rsi4h: 0, rsi1d: 0,
+              ema10: 0, ema21: 0, ema50: 0,
+              stopLoss: actualSL,  // SL -0.5% placed immediately
+              takeProfit1: actualTP,
+              takeProfit2: actualTP,
+              tp1Hit: false,
+              confluenceScore: 0,
+              confluenceDetails: `DEGEN RSI: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} BOTH ≤25 | ${supportInfo}`,
+              riskRewardRatio: 0.86,
+              status: "open",
+              reason: `[DEGEN_RSI] BTC LONG | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | SL -0.5% | TP +0.43% | BE @ +0.25% | ${leverage}x | ${supportInfo}`,
+              setupType: "degen_rsi",
+              strategy: "degen_rsi",
+              openedAt: new Date().toISOString(),
             });
 
-            log(`[HL RAW] ${asset.coin} hstar response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
-            const status = orderResult?.response?.data?.statuses?.[0];
-            const fillPx = status?.filled?.avgPx;
-            const totalSz = status?.filled?.totalSz;
-            const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
-
-            if (errorMsg) {
-              log(`[HSTAR] ORDER REJECTED: ${asset.coin} — ${errorMsg}`, "engine");
-              await storage.createLog({ type: "order_error", message: `HSTAR REJECTED: ${asset.coin} ${hstarSignal} — ${errorMsg}`, timestamp: new Date().toISOString() });
-              continue;
+            // Place SL order on HL immediately (-0.5%)
+            if (config.apiSecret && config.walletAddress) {
+              try {
+                const executor = createExecutor(config.apiSecret, config.walletAddress);
+                const slTriggerPx = parseFloat(formatHLPrice(actualSL, asset.szDecimals));
+                const slFillPx = parseFloat(formatHLPrice(actualSL * 0.98, asset.szDecimals));
+                await executor.placeOrder({
+                  coin: asset.coin, isBuy: false, sz: filledSz,
+                  limitPx: slFillPx,
+                  orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+                  reduceOnly: true,
+                });
+                log(`[SL ORDER] BTC SL placed @ $${slTriggerPx} (-0.5%)`, "engine");
+              } catch (slErr) {
+                log(`[SL ORDER] FAILED BTC: ${slErr} — will monitor in checkExits`, "engine");
+              }
             }
 
-            if (fillPx && parseFloat(totalSz) > 0) {
-              hFillPrice = parseFloat(fillPx);
-              hFilledSz = parseFloat(totalSz);
-              log(`[HSTAR] FILLED: ${asset.coin} ${hstarSignal} sz=${totalSz} @ $${fillPx}`, "engine");
-            } else {
-              log(`[HSTAR] IOC NOT FILLED: ${asset.coin} ${hstarSignal}`, "engine");
-              await storage.createLog({ type: "order_unfilled", message: `HSTAR NOT FILLED: ${asset.coin} ${hstarSignal}`, timestamp: new Date().toISOString() });
-              continue;
-            }
-          } catch (execErr) {
-            log(`[HSTAR] ORDER FAILED: ${asset.coin} — ${execErr}`, "engine");
-            await storage.createLog({ type: "order_error", message: `HSTAR FAILED: ${asset.coin} ${hstarSignal} — ${execErr}`, timestamp: new Date().toISOString() });
-            continue;
-          }
-        }
-
-        // Recalculate TP and SL based on actual fill price
-        const hActualTP = hstarSignal === "long" ? hFillPrice * (1 + HSTAR_TP_PCT) : hFillPrice * (1 - HSTAR_TP_PCT);
-        const hActualSL = hstarSignal === "long" ? hFillPrice * (1 - HSTAR_SL_PCT) : hFillPrice * (1 + HSTAR_SL_PCT);
-        const hActualNotional = (hFilledSz > 0 ? hFilledSz : hAssetSize) * hFillPrice;
-
-        const hTrade = await storage.createTrade({
-          coin: asset.coin, side: hstarSignal, entryPrice: hFillPrice, size: 60, leverage: hLeverage,
-          entryEquity: equity,
-          notionalValue: hActualNotional,
-          rsiAtEntry: hstarTriggerRSI, rsi4h: 0, rsi1d: 0,
-          ema10: 0, ema21: 0, ema50: 0,
-          stopLoss: hActualSL,
-          takeProfit1: hActualTP,
-          takeProfit2: hActualTP,
-          tp1Hit: false,
-          confluenceScore: 0,
-          confluenceDetails: `HSTAR: ${hstarTriggerTF} RSI=${hstarTriggerRSI.toFixed(1)} | Vol $${(volume24h/1e6).toFixed(0)}M | streak=${this.hstarConsecutiveLosses}`,
-          riskRewardRatio: 2.0,
-          status: "open",
-          reason: `[HSTAR] ${hstarSignal.toUpperCase()} | RSI ${hstarTriggerRSI.toFixed(1)} @${hstarTriggerTF} | SL -0.20% | TP +0.40% | ${hLeverage}x | sizeMult=${sizeMult}`,
-          setupType: "hstar",
-          strategy: "hstar",
-          openedAt: new Date().toISOString(),
-        });
-
-        // Place SL order on Hyperliquid
-        if (config.apiSecret && config.walletAddress && hFilledSz > 0) {
-          try {
-            const executor = createExecutor(config.apiSecret, config.walletAddress);
-            const slTriggerPx = parseFloat(formatHLPrice(hActualSL, asset.szDecimals));
-            const slFillPx = hstarSignal === "long"
-              ? parseFloat(formatHLPrice(hActualSL * 0.98, asset.szDecimals))
-              : parseFloat(formatHLPrice(hActualSL * 1.02, asset.szDecimals));
-            await executor.placeOrder({
-              coin: asset.coin,
-              isBuy: hstarSignal === "short",
-              sz: hFilledSz,
-              limitPx: slFillPx,
-              orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
-              reduceOnly: true,
+            await logDecision({
+              tradeId: trade.id, coin: asset.coin, action: "entry", side: "long", price: fillPrice,
+              reasoning: `DEGEN RSI: BTC LONG | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} BOTH ≤25 | SL $${actualSL.toFixed(2)} (-0.5%) | TP $${actualTP.toFixed(2)} (+0.43%) | BE @ +0.25% | ${leverage}x | $${capitalForTrade.toFixed(0)} capital | ${supportInfo}`,
+              equity, leverage, positionSizeUsd: capitalForTrade, strategy: "degen_rsi",
             });
-            log(`[HSTAR SL] ${asset.coin} SL placed @ $${slTriggerPx} (-0.20%)`, "engine");
-          } catch (slErr) {
-            log(`[HSTAR SL] FAILED ${asset.coin}: ${slErr}`, "engine");
-          }
-        }
 
-        await logDecision({
-          tradeId: hTrade.id, coin: asset.coin, action: "entry", side: hstarSignal, price: hFillPrice,
-          reasoning: `HSTAR: ${hstarSignal.toUpperCase()} ${asset.displayName} | RSI ${hstarTriggerRSI.toFixed(1)} @${hstarTriggerTF} | SL $${hActualSL.toFixed(4)} (-0.20%) | TP $${hActualTP.toFixed(4)} (+0.40%) | ${hLeverage}x | $${hCapital.toFixed(0)} capital | streak=${this.hstarConsecutiveLosses}`,
-          equity, leverage: hLeverage, positionSizeUsd: hCapital, strategy: "hstar",
-        });
+            await storage.createLog({
+              type: "trade_open",
+              message: `[DEGEN_RSI] BTC LONG @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | SL -0.5% | TP +0.43% | BE @ +0.25% | $${capitalForTrade.toFixed(0)} | ${supportInfo}`,
+              data: JSON.stringify(trade),
+              timestamp: new Date().toISOString(),
+            });
 
-        await storage.createLog({
-          type: "trade_open",
-          message: `[HSTAR] ${hstarSignal.toUpperCase()} ${asset.displayName} @ $${displayPrice(hFillPrice, asset.szDecimals)} | ${hLeverage}x | RSI ${hstarTriggerRSI.toFixed(1)} @${hstarTriggerTF} | SL -0.20% | TP +0.40% | $${hCapital.toFixed(0)} | streak=${this.hstarConsecutiveLosses}`,
-          data: JSON.stringify(hTrade),
-          timestamp: new Date().toISOString(),
-        });
-
-        openCoins.add(asset.coin);
-        hstarSlotsUsed++;
-        slotsUsed++;
-        this.dailyTradeCount++;
-
-        await new Promise(r => setTimeout(r, 100));
-      }
+            slotsUsed++;
+            this.dailyTradeCount++;
+            } // end filledSz > 0
+            } // end capitalForTrade >= 5
+          } // end crossKey check
+          } // end slot check
+        } // end oversold_long
+        } // end c5m/c15m length check
+        } // end price valid
+      } // end ctx valid
 
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v13.5 TRIPLE (PURE_RSI + HSTAR + AIWEEKLY) ${ALLOWED_ASSETS.length} assets`,
+        message: `Scan #${this.scanCount}: ${slotsUsed} entries | AUM: $${equity.toLocaleString()} | v14.0 DEGEN_RSI | BTC LONG only | RSI 5m+15m ≤25`,
         timestamp: new Date().toISOString(),
       });
 
-      // =============================================
       // CHECK EXITS
-      // =============================================
       await this.checkExits(equity);
       await this.takePnlSnapshot(equity);
 
@@ -1028,6 +753,7 @@ class TradingEngine {
     this.isScanning = false;
     this.scheduleNextScan();
   }
+
   private async checkExits(equity?: number) {
     const config = await storage.getConfig();
     if (!config) return;
@@ -1036,12 +762,11 @@ class TradingEngine {
     const currentEquity = equity || this.lastKnownEquity || 0;
 
     // ============================================================
-    // v11.2: READ ALL P&L DIRECTLY FROM HYPERLIQUID
+    // READ ALL P&L DIRECTLY FROM HYPERLIQUID
     // Open positions: unrealizedPnl from clearinghouseState
     // Closed positions: closedPnl + fee from userFills
     // ============================================================
 
-    // Build map of HL positions: coin -> { unrealizedPnl, returnOnEquity, szi, entryPx, ... }
     const hlPosMap: Map<string, any> = new Map();
 
     if (config.apiSecret && config.walletAddress && openTrades.length > 0) {
@@ -1054,7 +779,6 @@ class TradingEngine {
           if (sz > 0) hlPosMap.set(pos.coin, pos);
         }
 
-        // Track which tradeIds we still see as open for cleanup
         const currentOpenIds = new Set(openTrades.map(t => t.id));
 
         for (const trade of openTrades) {
@@ -1067,7 +791,6 @@ class TradingEngine {
           }
 
           if (hlPosMap.has(trade.coin)) {
-            // Position confirmed on HL — reset miss count
             if (this.syncMissCount.has(trade.id)) {
               log(`[SYNC] Trade #${trade.id} ${trade.coin} — position confirmed on HL (was at ${this.syncMissCount.get(trade.id)} misses, reset)`, "engine");
               this.syncMissCount.delete(trade.id);
@@ -1080,7 +803,6 @@ class TradingEngine {
             if (misses < 3) continue;
 
             // 3 consecutive misses — position genuinely closed on HL
-            // v13 SAFETY: Cancel any lingering orders for this coin
             try {
               const openOrders = await syncExec.getOpenOrders();
               const coinOrders = openOrders.filter((o: any) => o.coin === trade.coin);
@@ -1089,7 +811,7 @@ class TradingEngine {
                 log(`[SYNC SAFETY] Cancelled lingering order ${order.coin} oid=${order.oid}`, "engine");
               }
             } catch (cancelErr) { log(`[SYNC SAFETY] Cancel error: ${cancelErr}`, "engine"); }
-            // Fetch actual P&L from HL fills
+
             this.syncMissCount.delete(trade.id);
             const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
             const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
@@ -1101,16 +823,14 @@ class TradingEngine {
             let closeFee = 0;
 
             if (hlPnl) {
-              // GROUND TRUTH: P&L straight from Hyperliquid
               netPnl = hlPnl.netPnl;
               exitPrice = hlPnl.exitPrice;
               closeFee = hlPnl.totalFee;
               log(`[SYNC] Trade #${trade.id} ${trade.coin} — HL fills P&L: gross=$${hlPnl.closedPnl.toFixed(4)} fee=$${hlPnl.totalFee.toFixed(4)} net=$${netPnl.toFixed(4)} exitPx=$${exitPrice.toFixed(2)}`, "engine");
             } else {
-              // Fallback: no fills found (rare) — estimate from mid price
               exitPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
               const pv = (trade as any).notionalValue || (syncEq * (trade.size / 100) * trade.leverage);
-              const rm = trade.side === "long" ? (exitPrice - trade.entryPrice) / trade.entryPrice : (trade.entryPrice - exitPrice) / trade.entryPrice;
+              const rm = (exitPrice - trade.entryPrice) / trade.entryPrice; // long only
               netPnl = pv * rm - pv * 0.00045 * 2;
               log(`[SYNC] Trade #${trade.id} ${trade.coin} — no HL fills found, estimated P&L: $${netPnl.toFixed(4)}`, "engine");
             }
@@ -1122,10 +842,10 @@ class TradingEngine {
               status: "closed", closeReason: `Position closed on HL (sync) | P&L: $${netPnl.toFixed(2)} (from HL)`,
               closedAt: new Date().toISOString(),
             });
-            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed | HL P&L: $${netPnl.toFixed(2)}`, "engine");
+            log(`[SYNC] Trade #${trade.id} ${trade.coin} long auto-closed | HL P&L: $${netPnl.toFixed(2)}`, "engine");
             await storage.createLog({
               type: "trade_close",
-              message: `[SYNC] Auto-closed ${trade.coin} ${trade.side} #${trade.id} | HL P&L: $${netPnl.toFixed(2)} USDC`,
+              message: `[SYNC] Auto-closed ${trade.coin} long #${trade.id} | HL P&L: $${netPnl.toFixed(2)} USDC`,
               timestamp: new Date().toISOString(),
             });
           }
@@ -1143,7 +863,7 @@ class TradingEngine {
     }
 
     // ============================================================
-    // OPEN TRADE MONITORING: read unrealizedPnl from HL + check TP
+    // OPEN TRADE MONITORING: read unrealizedPnl from HL + check TP/BE
     // ============================================================
     for (const trade of openTrades) {
       const currentPrice = parseFloat(mids[trade.coin] || "0");
@@ -1152,93 +872,84 @@ class TradingEngine {
       const szd = ac?.szDecimals ?? 2;
       const eqForTrade = (trade as any).entryEquity || currentEquity;
 
-      // v11.2: Read unrealizedPnl directly from HL position
+      // Read unrealizedPnl directly from HL position
       const hlPos = hlPosMap.get(trade.coin);
       let pnlUsd: number;
       if (hlPos?.unrealizedPnl !== undefined) {
-        // GROUND TRUTH: P&L straight from Hyperliquid
         pnlUsd = parseFloat(hlPos.unrealizedPnl);
       } else {
-        // Fallback: calculate (when HL data not available)
         const positionValue = (trade as any).notionalValue || (eqForTrade * (trade.size / 100) * trade.leverage);
-        const rawMove = trade.side === "long"
-          ? (currentPrice - trade.entryPrice) / trade.entryPrice
-          : (trade.entryPrice - currentPrice) / trade.entryPrice;
+        const rawMove = (currentPrice - trade.entryPrice) / trade.entryPrice; // long only
         pnlUsd = positionValue * rawMove - positionValue * 0.00045 * 2;
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // v13: Move SL to breakeven once price reaches +0.2% profit (PURE_RSI only, not HSTAR)
-      const isHstar = trade.strategy === "hstar";
-      const rawPricePct = trade.side === "long"
-        ? (currentPrice - trade.entryPrice) / trade.entryPrice
-        : (trade.entryPrice - currentPrice) / trade.entryPrice;
+      // DEGEN_RSI: Breakeven SL at +0.25%
+      // SL starts at -0.5% from entry — move to entry (BE) when price reaches +0.25%
+      const rawPricePct = (currentPrice - trade.entryPrice) / trade.entryPrice; // long only
       const beSL = trade.entryPrice; // breakeven = entry price
-      const currentSL = trade.stopLoss;
-      const isStillOriginalSL = trade.side === "long"
-        ? currentSL < trade.entryPrice * 0.999  // SL is below entry (original)
-        : currentSL > trade.entryPrice * 1.001;  // SL is above entry (original)
-      if (!isHstar && rawPricePct >= 0.002 && isStillOriginalSL) {
-        // Move SL to breakeven
+      const originalSL = trade.entryPrice * 0.995; // -0.5% from entry
+      const slStillAtOriginal = trade.stopLoss > 0 && Math.abs(trade.stopLoss - originalSL) < trade.entryPrice * 0.001; // SL is still near -0.5%
+
+      if (slStillAtOriginal && rawPricePct >= 0.0025) {
+        // Price moved +0.25% — activate BE SL at entry price
         await storage.updateTrade(trade.id, { stopLoss: beSL });
         trade.stopLoss = beSL;
-        log(`[BE] Trade #${trade.id} ${trade.coin} ${trade.side} | Price +${(rawPricePct*100).toFixed(2)}% → SL moved to BE @ $${displayPrice(beSL, szd)}`, "engine");
-        // Update SL order on HL
+        log(`[BE SL] Trade #${trade.id} ${trade.coin} LONG | Price +${(rawPricePct*100).toFixed(2)}% → BE SL activated @ $${displayPrice(beSL, szd)}`, "engine");
+
+        // Place stop-market SL on HL at entry price
         if (config.apiSecret && config.walletAddress) {
           try {
             const executor = createExecutor(config.apiSecret, config.walletAddress);
-            // Cancel existing SL order
+            // Cancel any existing orders for this coin
             const openOrders = await executor.getOpenOrders();
             for (const order of openOrders.filter((o: any) => o.coin === trade.coin)) {
               await executor.cancelOrder(order.coin, order.oid);
             }
-            // Place new SL at breakeven
-            const hlPos = hlPosMap.get(trade.coin);
-            const sz = hlPos ? Math.abs(parseFloat(hlPos.szi || "0")) : 0;
+            // Place BE SL
+            const posFromMap = hlPosMap.get(trade.coin);
+            const sz = posFromMap ? Math.abs(parseFloat(posFromMap.szi || "0")) : 0;
             if (sz > 0) {
               const slTriggerPx = parseFloat(formatHLPrice(beSL, szd));
-              const slFillPx = trade.side === "long"
-                ? parseFloat(formatHLPrice(beSL * 0.98, szd))
-                : parseFloat(formatHLPrice(beSL * 1.02, szd));
+              const slFillPx = parseFloat(formatHLPrice(beSL * 0.98, szd)); // sell slightly below BE
               await executor.placeOrder({
-                coin: trade.coin, isBuy: trade.side === "short", sz,
+                coin: trade.coin, isBuy: false, sz, // sell to close long
                 limitPx: slFillPx,
                 orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
                 reduceOnly: true,
               });
-              log(`[BE] ${trade.coin} new SL order @ $${slTriggerPx} (breakeven)`, "engine");
+              log(`[BE SL] ${trade.coin} SL order placed @ $${slTriggerPx} (entry price, BE SL activated @ +0.25%)`, "engine");
             }
-          } catch (beErr) { log(`[BE] SL update error: ${beErr}`, "engine"); }
+          } catch (beErr) { log(`[BE SL] SL update error: ${beErr}`, "engine"); }
         }
+
+        await storage.createLog({
+          type: "system",
+          message: `[DEGEN_RSI] BE SL activated @ +0.25% | ${trade.coin} LONG | SL now @ $${displayPrice(beSL, szd)}`,
+          timestamp: new Date().toISOString(),
+        });
       }
 
-      // Exit on TP or SL — strategy-aware labels
+      // Exit checks
       let shouldClose = false;
       let closeReason = "";
 
-      const tpHit = (trade.side === "long" && currentPrice >= (trade.takeProfit1 || Infinity)) ||
-                    (trade.side === "short" && currentPrice <= (trade.takeProfit1 || 0));
-      const slHit = trade.stopLoss > 0 && (
-        (trade.side === "long" && currentPrice <= trade.stopLoss) ||
-        (trade.side === "short" && currentPrice >= trade.stopLoss)
-      );
+      // TP hit: price >= takeProfit1
+      const tpHit = currentPrice >= (trade.takeProfit1 || Infinity);
+      // SL hit: either at original -0.5% or at BE (entry price)
+      const slActive = trade.stopLoss > 0;
+      const slHit = slActive && currentPrice <= trade.stopLoss;
 
-      const stratTag = isHstar ? "HSTAR" : "PURE_RSI";
-      const isBE = !isHstar && !isStillOriginalSL; // BE only for PURE_RSI
+      const isBE = slActive && trade.stopLoss >= trade.entryPrice * 0.999; // SL is at or near entry = BE was activated
       if (tpHit) {
         shouldClose = true;
-        const tpLabel = isHstar ? "+0.40%" : "+0.43%";
-        closeReason = `[${stratTag}] TP ${tpLabel} @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        closeReason = `[DEGEN_RSI] TP +0.43% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
       } else if (slHit) {
         shouldClose = true;
-        if (isHstar) {
-          closeReason = `[HSTAR] SL -0.20% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
-        } else {
-          closeReason = isBE
-            ? `[PURE_RSI] SL @ BE $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`
-            : `[PURE_RSI] SL -0.5% @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
-        }
-        log(`[SL HIT] Trade #${trade.id} ${trade.coin} ${trade.side} | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
+        closeReason = isBE
+          ? `[DEGEN_RSI] SL @ BE $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`
+          : `[DEGEN_RSI] SL -0.5% hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        log(`[SL HIT] Trade #${trade.id} ${trade.coin} LONG | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
       }
 
       if (shouldClose) {
@@ -1246,7 +957,7 @@ class TradingEngine {
         if (config.apiSecret && config.walletAddress) {
           try {
             const executor = createExecutor(config.apiSecret, config.walletAddress);
-            // v13 SAFETY: Cancel ALL open orders for this coin BEFORE closing
+            // Cancel ALL open orders for this coin BEFORE closing
             try {
               const openOrders = await executor.getOpenOrders();
               const coinOrders = openOrders.filter((o: any) => o.coin === trade.coin);
@@ -1259,39 +970,32 @@ class TradingEngine {
             const pos = hlPos || (await executor.getPositions()).find((p: any) => p.position?.coin === trade.coin)?.position;
             if (pos) {
               const sz = Math.abs(parseFloat(pos.szi || "0"));
-              const slippage = trade.side === "long" ? 0.99 : 1.01;
               await executor.placeOrder({
-                coin: trade.coin, isBuy: trade.side === "short", sz,
-                limitPx: parseFloat(formatHLPrice(currentPrice * slippage, szd)),
+                coin: trade.coin, isBuy: false, sz, // sell to close long
+                limitPx: parseFloat(formatHLPrice(currentPrice * 0.99, szd)), // 1% slippage
                 orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
               });
             }
           } catch (e) { log(`Close error: ${e}`, "engine"); }
 
-          // v11.2: After close, fetch actual P&L from HL fills
-          await new Promise(r => setTimeout(r, 1500)); // wait for fill to appear
+          // After close, fetch actual P&L from HL fills
+          await new Promise(r => setTimeout(r, 1500));
           try {
             const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
             const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
-            const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
+            const hlPnl = extractClosePnlFromFills(fills, trade.coin, "long", tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              let exitLabel: string;
-              if (isHstar) {
-                exitLabel = slHit ? "SL -0.20%" : "TP +0.40%";
-              } else {
-                exitLabel = slHit ? (isBE ? "SL @ BE" : "SL -0.5%") : "TP +0.43%";
-              }
-              closeReason = `[${stratTag}] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
+              const exitLabel = slHit ? (isBE ? "SL @ BE" : "SL -0.5%") : "TP +0.43%";
+              closeReason = `[DEGEN_RSI] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
                 exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: finalPnlOfAum,
                 hlPnlUsd: hlPnl.netPnl, hlCloseFee: hlPnl.totalFee,
                 peakPnlPct: 0, status: "closed", closeReason, closedAt: new Date().toISOString(),
               });
-              log(`[TP CLOSE] Trade #${trade.id} ${trade.coin} ${trade.side} | HL P&L: $${hlPnl.netPnl.toFixed(2)}`, "engine");
+              log(`[CLOSE] Trade #${trade.id} ${trade.coin} LONG | HL P&L: $${hlPnl.netPnl.toFixed(2)}`, "engine");
             } else {
-              // Fill not yet available — store estimate, sync will fix later
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
                 exitPrice: currentPrice, pnl: 0, pnlPct: finalPnlOfAum,
@@ -1300,7 +1004,7 @@ class TradingEngine {
               });
             }
           } catch (e) {
-            log(`[TP CLOSE] Fill fetch error: ${e}`, "engine");
+            log(`[CLOSE] Fill fetch error: ${e}`, "engine");
             const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
             await storage.updateTrade(trade.id, {
               exitPrice: currentPrice, pnl: 0, pnlPct: finalPnlOfAum,
@@ -1309,7 +1013,7 @@ class TradingEngine {
             });
           }
         } else {
-          // No API — paper mode
+          // Paper mode
           const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
           await storage.updateTrade(trade.id, {
             exitPrice: currentPrice, pnl: 0, pnlPct: finalPnlOfAum,
@@ -1318,28 +1022,15 @@ class TradingEngine {
           });
         }
 
-        // v13.4: Update HSTAR consecutive loss counter
-        if (isHstar) {
-          if (pnlUsd < 0) {
-            this.hstarConsecutiveLosses++;
-            log(`[HSTAR STREAK] Loss #${this.hstarConsecutiveLosses} | Next sizeMult=${this.hstarConsecutiveLosses >= 3 ? 0.25 : this.hstarConsecutiveLosses >= 2 ? 0.5 : 1.0}`, "engine");
-          } else {
-            if (this.hstarConsecutiveLosses > 0) {
-              log(`[HSTAR STREAK] Win resets streak (was ${this.hstarConsecutiveLosses})`, "engine");
-            }
-            this.hstarConsecutiveLosses = 0;
-          }
-        }
-
         await logDecision({
-          tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
-          reasoning: `EXIT [${stratTag}]: ${closeReason} | HL P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${(eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0).toFixed(3)}%`,
-          equity: currentEquity, leverage: trade.leverage, strategy: trade.strategy || "pure_rsi",
+          tradeId: trade.id, coin: trade.coin, action: "exit", side: "long", price: currentPrice,
+          reasoning: `EXIT [DEGEN_RSI]: ${closeReason} | HL P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${(eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0).toFixed(3)}%`,
+          equity: currentEquity, leverage: trade.leverage, strategy: "degen_rsi",
         });
 
         await storage.createLog({
           type: "trade_close",
-          message: `CLOSED [${stratTag}] ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
+          message: `CLOSED [DEGEN_RSI] LONG ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
           timestamp: new Date().toISOString(),
         });
       } else {
@@ -1348,6 +1039,7 @@ class TradingEngine {
       }
     }
   }
+
   private async takePnlSnapshot(equity?: number) {
     const allTrades = await storage.getAllTrades();
     const openTrades = await storage.getOpenTrades();
@@ -1355,7 +1047,6 @@ class TradingEngine {
     const currentEquity = equity || this.lastKnownEquity || 0;
     const startEq = this.pnlResetEquity || this.startingEquity || currentEquity;
 
-    // v11.2: Use hlPnlUsd directly for P&L snapshot
     const closedPnlUsd = closedTrades.reduce((s, t) => {
       if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
       return s + (startEq > 0 ? startEq * ((t.pnlPct || 0) / 100) : 0);
@@ -1373,422 +1064,11 @@ class TradingEngine {
       timestamp: new Date().toISOString(),
     });
   }
-  // ============ AIWEEKLY STRATEGY ============
-
-  private async checkAiweeklyCycle(config: any, equity: number) {
-    if (this.aiweeklyIsRunning) return;
-
-    const now = Date.now();
-    const cycleMs = AIWEEKLY_CYCLE_HOURS * 3600 * 1000;
-
-    // Check if enough time has passed since last cycle
-    if (this.aiweeklyLastCycleTime > 0 && (now - this.aiweeklyLastCycleTime) < cycleMs) return;
-
-    // Check if we have a PERPLEXITY_API_KEY
-    const pplxKey = process.env.PERPLEXITY_API_KEY;
-    if (!pplxKey) {
-      if (this.scanCount % 100 === 1) log("[AIWEEKLY] No PERPLEXITY_API_KEY set — skipping", "engine");
-      return;
-    }
-
-    // Check if previous cycle's positions are still open
-    const openTrades = await storage.getOpenTrades();
-    const aiweeklyOpen = openTrades.filter(t => t.strategy === "aiweekly");
-    if (aiweeklyOpen.length > 0) {
-      // Don't start new cycle while old positions are still open
-      return;
-    }
-
-    this.aiweeklyIsRunning = true;
-    log("=== AIWEEKLY CYCLE STARTING ===", "engine");
-
-    try {
-      const cycleId = new Date().toISOString();
-
-      // Create research record
-      const research = await storage.createAiweeklyResearch({
-        cycleId,
-        status: "researching",
-        researchStartedAt: cycleId,
-        createdAt: cycleId,
-      });
-
-      await storage.createLog({
-        type: "aiweekly",
-        message: `[AIWEEKLY] Research cycle #${research.id} starting — 3-model consensus (Sonar + Claude + GPT)`,
-        timestamp: cycleId,
-      });
-
-      // Run full 3-model research
-      const consensus = await runFullResearch(pplxKey);
-
-      // Save research results
-      await storage.updateAiweeklyResearch(research.id, {
-        status: "executing",
-        sonarResearch: "completed",
-        sonarPicks: JSON.stringify(consensus.sonarPicks),
-        claudePicks: JSON.stringify(consensus.claudePicks),
-        gptPicks: JSON.stringify(consensus.gptPicks),
-        consensusPicks: JSON.stringify(consensus),
-        researchCompletedAt: new Date().toISOString(),
-      });
-
-      log(`[AIWEEKLY] Research complete: ${consensus.longs.length}L / ${consensus.shorts.length}S / ${consensus.commodities.length} commodities`, "engine");
-
-      // Execute trades
-      const totalPositions = consensus.longs.length + consensus.shorts.length + consensus.commodities.length;
-      if (totalPositions === 0) {
-        log("[AIWEEKLY] No consensus picks — skipping execution", "engine");
-        await storage.updateAiweeklyResearch(research.id, {
-          status: "complete",
-          tradesOpened: 0,
-          nextCycleAt: new Date(Date.now() + AIWEEKLY_CYCLE_HOURS * 3600000).toISOString(),
-        });
-        this.aiweeklyLastCycleTime = Date.now();
-        this.aiweeklyIsRunning = false;
-        return;
-      }
-
-      const capitalPerPosition = Math.min(AIWEEKLY_ALLOCATION, equity * 0.15) / totalPositions;
-      let tradesOpened = 0;
-
-      // Open stock longs
-      for (const pick of consensus.longs) {
-        const asset = AIWEEKLY_STOCKS.find(s => s.coin === pick.coin);
-        if (!asset) continue;
-        const opened = await this.openAiweeklyPosition(config, asset.coin, "long", capitalPerPosition, asset.maxLev, asset.szDec, equity, pick.votes, pick.models);
-        if (opened) tradesOpened++;
-      }
-
-      // Open stock shorts
-      for (const pick of consensus.shorts) {
-        const asset = AIWEEKLY_STOCKS.find(s => s.coin === pick.coin);
-        if (!asset) continue;
-        const opened = await this.openAiweeklyPosition(config, asset.coin, "short", capitalPerPosition, asset.maxLev, asset.szDec, equity, pick.votes, pick.models);
-        if (opened) tradesOpened++;
-      }
-
-      // Open commodity positions
-      for (const pick of consensus.commodities) {
-        const asset = AIWEEKLY_COMMODITIES.find(c => c.coin === pick.coin);
-        if (!asset) continue;
-        const opened = await this.openAiweeklyPosition(config, pick.coin, pick.side, capitalPerPosition, asset.maxLev, asset.szDec, equity, pick.votes, pick.models);
-        if (opened) tradesOpened++;
-      }
-
-      await storage.updateAiweeklyResearch(research.id, {
-        status: "complete",
-        tradesOpened,
-        positionsOpenedAt: new Date().toISOString(),
-        nextCycleAt: new Date(Date.now() + AIWEEKLY_CYCLE_HOURS * 3600000).toISOString(),
-      });
-
-      this.aiweeklyLastCycleTime = Date.now();
-
-      await storage.createLog({
-        type: "aiweekly",
-        message: `[AIWEEKLY] Cycle complete: ${tradesOpened} positions opened | $${capitalPerPosition.toFixed(1)}/position | Next cycle in ${AIWEEKLY_CYCLE_HOURS}h`,
-        timestamp: new Date().toISOString(),
-      });
-
-      log(`[AIWEEKLY] Opened ${tradesOpened} positions, $${capitalPerPosition.toFixed(1)} each`, "engine");
-    } catch (err) {
-      log(`[AIWEEKLY] Research cycle error: ${err}`, "engine");
-      await storage.createLog({
-        type: "aiweekly_error",
-        message: `[AIWEEKLY] Cycle failed: ${err}`,
-        timestamp: new Date().toISOString(),
-      });
-    } finally {
-      this.aiweeklyIsRunning = false;
-    }
-  }
-
-  private async openAiweeklyPosition(
-    config: any, coin: string, side: "long" | "short",
-    capital: number, maxLev: number, szDec: number,
-    equity: number, votes: number, models: string[],
-  ): Promise<boolean> {
-    try {
-      const leverage = Math.min(AIWEEKLY_LEVERAGE, maxLev);
-      const notionalSize = capital * leverage;
-
-      // Fetch current price for xyz assets
-      const xyzData = await fetchMetaAndAssetCtxs("xyz");
-      let price = 0;
-      if (xyzData && xyzData.length >= 2) {
-        const universe = xyzData[0]?.universe || [];
-        const ctxs = xyzData[1] || [];
-        const coinName = coin.replace("xyz:", "");
-        const idx = universe.findIndex((a: any) => a.name === coinName);
-        if (idx >= 0 && ctxs[idx]?.midPx) {
-          price = parseFloat(ctxs[idx].midPx);
-        }
-      }
-
-      if (price <= 0) {
-        log(`[AIWEEKLY] Cannot get price for ${coin} — skipping`, "engine");
-        return false;
-      }
-
-      const assetSize = notionalSize / price;
-      const tp = side === "long" ? price * (1 + AIWEEKLY_TP_PCT) : price * (1 - AIWEEKLY_TP_PCT);
-      const sl = side === "long" ? price * (1 - AIWEEKLY_SL_PCT) : price * (1 + AIWEEKLY_SL_PCT);
-
-      let fillPrice = price;
-      let filledSz = 0;
-
-      if (config.apiSecret && config.walletAddress) {
-        const executor = createExecutor(config.apiSecret, config.walletAddress);
-        const isCross = true;
-        await executor.setLeverage(coin, leverage, isCross);
-
-        const slippageMult = side === "long" ? 1.01 : 0.99;
-        const orderPrice = price * slippageMult;
-        const roundedSize = parseFloat(formatHLSize(assetSize, szDec));
-        if (roundedSize <= 0) {
-          log(`[AIWEEKLY] SKIP ${coin}: Rounded size is 0`, "engine");
-          return false;
-        }
-
-        const orderResult = await executor.placeOrder({
-          coin, isBuy: side === "long", sz: roundedSize,
-          limitPx: parseFloat(formatHLPrice(orderPrice, szDec)),
-          orderType: { limit: { tif: "Ioc" } }, reduceOnly: false,
-        });
-
-        log(`[HL RAW] ${coin} aiweekly response: ${JSON.stringify(orderResult).slice(0, 500)}`, "engine");
-        const status = orderResult?.response?.data?.statuses?.[0];
-        const fillPx = status?.filled?.avgPx;
-        const totalSz = status?.filled?.totalSz;
-        const errorMsg = status?.error || orderResult?.response?.data?.error || (orderResult?.status !== "ok" ? JSON.stringify(orderResult) : undefined);
-
-        if (errorMsg) {
-          log(`[AIWEEKLY] ORDER REJECTED: ${coin} — ${errorMsg}`, "engine");
-          return false;
-        }
-
-        if (fillPx && parseFloat(totalSz) > 0) {
-          fillPrice = parseFloat(fillPx);
-          filledSz = parseFloat(totalSz);
-        } else {
-          log(`[AIWEEKLY] IOC NOT FILLED: ${coin} ${side}`, "engine");
-          return false;
-        }
-      }
-
-      const actualTP = side === "long" ? fillPrice * (1 + AIWEEKLY_TP_PCT) : fillPrice * (1 - AIWEEKLY_TP_PCT);
-      const actualSL = side === "long" ? fillPrice * (1 - AIWEEKLY_SL_PCT) : fillPrice * (1 + AIWEEKLY_SL_PCT);
-      const actualNotional = (filledSz > 0 ? filledSz : assetSize) * fillPrice;
-      const confidenceLabel = votes === 3 ? "3/3 UNANIMOUS" : "2/3 CONSENSUS";
-
-      const trade = await storage.createTrade({
-        coin, side, entryPrice: fillPrice, size: 80, leverage,
-        entryEquity: equity,
-        notionalValue: actualNotional,
-        rsiAtEntry: 0, rsi4h: 0, rsi1d: 0,
-        ema10: 0, ema21: 0, ema50: 0,
-        stopLoss: actualSL,
-        takeProfit1: actualTP,
-        takeProfit2: actualTP,
-        tp1Hit: false,
-        confluenceScore: votes,
-        confluenceDetails: `AIWEEKLY ${confidenceLabel}: ${models.join("+")}`,
-        riskRewardRatio: 5.0,
-        status: "open",
-        reason: `[AIWEEKLY] ${side.toUpperCase()} ${coin} | ${confidenceLabel} | TP +5% | SL -1% | ${leverage}x | $${capital.toFixed(1)}`,
-        setupType: "aiweekly",
-        strategy: "aiweekly",
-        openedAt: new Date().toISOString(),
-      });
-
-      // Place SL order on HL
-      if (config.apiSecret && config.walletAddress && filledSz > 0) {
-        try {
-          const executor = createExecutor(config.apiSecret, config.walletAddress);
-          const slTriggerPx = parseFloat(formatHLPrice(actualSL, szDec));
-          const slFillPx = side === "long"
-            ? parseFloat(formatHLPrice(actualSL * 0.98, szDec))
-            : parseFloat(formatHLPrice(actualSL * 1.02, szDec));
-          await executor.placeOrder({
-            coin, isBuy: side === "short", sz: filledSz,
-            limitPx: slFillPx,
-            orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
-            reduceOnly: true,
-          });
-          log(`[AIWEEKLY SL] ${coin} SL placed @ $${slTriggerPx} (-1%)`, "engine");
-        } catch (slErr) {
-          log(`[AIWEEKLY SL] FAILED ${coin}: ${slErr}`, "engine");
-        }
-      }
-
-      await logDecision({
-        tradeId: trade.id, coin, action: "entry", side, price: fillPrice,
-        reasoning: `AIWEEKLY: ${side.toUpperCase()} ${coin} | ${confidenceLabel} (${models.join("|")}) | TP +5% $${actualTP.toFixed(2)} | SL -1% $${actualSL.toFixed(2)} | ${leverage}x | $${capital.toFixed(1)} capital`,
-        equity, leverage, positionSizeUsd: capital, strategy: "aiweekly" as any,
-      });
-
-      await storage.createLog({
-        type: "trade_open",
-        message: `[AIWEEKLY] ${side.toUpperCase()} ${coin} @ $${displayPrice(fillPrice, szDec)} | ${leverage}x | ${confidenceLabel} | TP +5% | SL -1% | $${capital.toFixed(1)}`,
-        timestamp: new Date().toISOString(),
-      });
-
-      log(`[AIWEEKLY] Opened ${side.toUpperCase()} ${coin} @ $${fillPrice} | ${confidenceLabel}`, "engine");
-      return true;
-    } catch (err) {
-      log(`[AIWEEKLY] Failed to open ${coin}: ${err}`, "engine");
-      return false;
-    }
-  }
-
-  private async checkAiweeklyExits(config: any, equity: number) {
-    const openTrades = await storage.getOpenTrades();
-    const aiweeklyTrades = openTrades.filter(t => t.strategy === "aiweekly");
-    if (aiweeklyTrades.length === 0) return;
-
-    // Fetch xyz prices
-    const xyzData = await fetchMetaAndAssetCtxs("xyz");
-    const xyzPriceMap: Record<string, number> = {};
-    if (xyzData && xyzData.length >= 2) {
-      const universe = xyzData[0]?.universe || [];
-      const ctxs = xyzData[1] || [];
-      for (let i = 0; i < universe.length; i++) {
-        if (ctxs[i]?.midPx && ctxs[i].midPx !== "None") {
-          xyzPriceMap[`xyz:${universe[i].name}`] = parseFloat(ctxs[i].midPx);
-        }
-      }
-    }
-
-    for (const trade of aiweeklyTrades) {
-      const currentPrice = xyzPriceMap[trade.coin];
-      if (!currentPrice) continue;
-
-      const priceDelta = trade.side === "long"
-        ? (currentPrice - trade.entryPrice) / trade.entryPrice
-        : (trade.entryPrice - currentPrice) / trade.entryPrice;
-
-      const asset = [...AIWEEKLY_STOCKS, ...AIWEEKLY_COMMODITIES].find(a => a.coin === trade.coin);
-      const szd = asset?.szDec ?? 3;
-
-      // Get HL position for unrealized P&L
-      let hlPos: any = null;
-      if (config.apiSecret && config.walletAddress) {
-        try {
-          const executor = createExecutor(config.apiSecret, config.walletAddress);
-          const positions = await executor.getPositions();
-          const coinName = trade.coin.replace("xyz:", "");
-          hlPos = positions.find((p: any) => p.position?.coin === coinName || p.position?.coin === trade.coin)?.position;
-        } catch {}
-      }
-
-      let pnlUsd = 0;
-      if (hlPos) {
-        pnlUsd = parseFloat(hlPos.unrealizedPnl || "0");
-      } else {
-        const notional = trade.notionalValue || 0;
-        pnlUsd = notional * priceDelta;
-      }
-
-      const eqForTrade = trade.entryEquity || equity;
-      const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
-
-      const tpHit = priceDelta >= AIWEEKLY_TP_PCT;
-      const slHit = priceDelta <= -AIWEEKLY_SL_PCT;
-
-      if (tpHit || slHit) {
-        const exitLabel = tpHit ? "TP +5%" : "SL -1%";
-        const closeReason = `[AIWEEKLY] ${exitLabel} @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
-
-        // Close on HL
-        if (config.apiSecret && config.walletAddress) {
-          try {
-            const executor = createExecutor(config.apiSecret, config.walletAddress);
-            // Cancel open orders first
-            const openOrders = await executor.getOpenOrders();
-            const coinOrders = openOrders.filter((o: any) => o.coin === trade.coin || o.coin === trade.coin.replace("xyz:", ""));
-            for (const order of coinOrders) {
-              await executor.cancelOrder(order.coin, order.oid);
-            }
-
-            if (hlPos) {
-              const sz = Math.abs(parseFloat(hlPos.szi || "0"));
-              const slippage = trade.side === "long" ? 0.99 : 1.01;
-              await executor.placeOrder({
-                coin: trade.coin, isBuy: trade.side === "short", sz,
-                limitPx: parseFloat(formatHLPrice(currentPrice * slippage, szd)),
-                orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
-              });
-            }
-          } catch (e) { log(`[AIWEEKLY] Close error: ${e}`, "engine"); }
-
-          // Fetch actual P&L from fills
-          await new Promise(r => setTimeout(r, 1500));
-          try {
-            const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
-            const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
-            const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
-            if (hlPnl) {
-              pnlUsd = hlPnl.netPnl;
-              const finalReason = `[AIWEEKLY] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
-              const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
-              await storage.updateTrade(trade.id, {
-                exitPrice: hlPnl.exitPrice, pnl: 0, pnlPct: finalPnlOfAum,
-                hlPnlUsd: hlPnl.netPnl, hlCloseFee: hlPnl.totalFee,
-                status: "closed", closeReason: finalReason, closedAt: new Date().toISOString(),
-              });
-              log(`[AIWEEKLY CLOSE] Trade #${trade.id} ${trade.coin} | ${exitLabel} | $${hlPnl.netPnl.toFixed(2)}`, "engine");
-
-              await storage.createLog({
-                type: "trade_close",
-                message: `[AIWEEKLY] ${exitLabel} ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
-                timestamp: new Date().toISOString(),
-              });
-              continue;
-            }
-          } catch {}
-        }
-
-        // Fallback close without HL fills
-        const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
-        await storage.updateTrade(trade.id, {
-          exitPrice: currentPrice, pnl: 0, pnlPct: finalPnlOfAum,
-          hlPnlUsd: pnlUsd, hlCloseFee: 0,
-          status: "closed", closeReason, closedAt: new Date().toISOString(),
-        });
-
-        await storage.createLog({
-          type: "trade_close",
-          message: `[AIWEEKLY] ${exitLabel} ${trade.side.toUpperCase()} ${trade.coin} | $${pnlUsd.toFixed(2)} USDC`,
-          timestamp: new Date().toISOString(),
-        });
-      } else {
-        // Update unrealized P&L
-        await storage.updateTrade(trade.id, { hlPnlUsd: pnlUsd, pnlPct: pnlOfAum });
-      }
-    }
-  }
-
-  // Public method to trigger AIWEEKLY research manually
-  async triggerAiweeklyResearch(): Promise<{ success: boolean; message: string }> {
-    const pplxKey = process.env.PERPLEXITY_API_KEY;
-    if (!pplxKey) return { success: false, message: "No PERPLEXITY_API_KEY set" };
-    if (this.aiweeklyIsRunning) return { success: false, message: "Research already in progress" };
-
-    // Force cycle by resetting last cycle time
-    this.aiweeklyLastCycleTime = 0;
-    const config = await storage.getConfig();
-    const equity = this.lastKnownEquity || 0;
-
-    // Run in background
-    this.checkAiweeklyCycle(config, equity);
-    return { success: true, message: "AIWEEKLY research triggered" };
-  }
 
   async forceCloseTrade(tradeId: number) {
     const trade = await storage.getTradeById(tradeId);
     if (!trade || trade.status !== "open") return null;
-    const strategy: StrategyType = (trade.strategy as StrategyType) || "confluence";
+    const strategy: StrategyType = "degen_rsi";
     const mids: Record<string, string> = (await fetchAllMids()) || {};
     const currentPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
     const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
@@ -1800,21 +1080,19 @@ class TradingEngine {
         const pos = positions.find((p: any) => p.position?.coin === trade.coin);
         if (pos) {
           const sz = Math.abs(parseFloat(pos.position.szi || "0"));
-          const slippage = trade.side === "long" ? 0.99 : 1.01;
           await executor.placeOrder({
-            coin: trade.coin, isBuy: trade.side === "short", sz,
-            limitPx: parseFloat(formatHLPrice(currentPrice * slippage, ac?.szDecimals ?? 2)),
+            coin: trade.coin, isBuy: false, sz, // sell to close long
+            limitPx: parseFloat(formatHLPrice(currentPrice * 0.99, ac?.szDecimals ?? 2)),
             orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
           });
         }
       } catch (e) { log(`Close error: ${e}`, "engine"); }
 
-      // v11.2: After close, fetch actual P&L from HL fills
       await new Promise(r => setTimeout(r, 1500));
       try {
         const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
         const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
-        const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
+        const hlPnl = extractClosePnlFromFills(fills, trade.coin, "long", tradeOpenTime);
         if (hlPnl) {
           const eq = this.lastKnownEquity || 0;
           const eqForClose = (trade as any).entryEquity || eq;
@@ -1826,13 +1104,13 @@ class TradingEngine {
             closedAt: new Date().toISOString(),
           });
           await logDecision({
-            tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: hlPnl.exitPrice,
+            tradeId: trade.id, coin: trade.coin, action: "exit", side: "long", price: hlPnl.exitPrice,
             reasoning: `MANUAL CLOSE | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)}) | ROI/AUM: ${pnlOfAum.toFixed(3)}%`,
             equity: eq, leverage: trade.leverage, strategy,
           });
           await storage.createLog({
             type: "trade_close",
-            message: `Manual close ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
+            message: `Manual close LONG ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
             timestamp: new Date().toISOString(),
           });
           return updated;
@@ -1840,14 +1118,12 @@ class TradingEngine {
       } catch (e) { log(`[FORCE_CLOSE] Fill fetch error: ${e}`, "engine"); }
     }
 
-    // Fallback: no HL fills available — estimate P&L
+    // Fallback: estimate P&L
     const FEE_RATE_MC = 0.00045;
     const eq = this.lastKnownEquity || 0;
     const eqForClose = (trade as any).entryEquity || eq;
     const posValue = (trade as any).notionalValue || (eqForClose * (trade.size / 100) * trade.leverage);
-    const rawMove = trade.side === "long"
-      ? (currentPrice - trade.entryPrice) / trade.entryPrice
-      : (trade.entryPrice - currentPrice) / trade.entryPrice;
+    const rawMove = (currentPrice - trade.entryPrice) / trade.entryPrice; // long only
     const pnlUsd = posValue * rawMove - posValue * FEE_RATE_MC * 2;
     const pnlOfAum = eqForClose > 0 ? (pnlUsd / eqForClose) * 100 : 0;
 
@@ -1858,17 +1134,18 @@ class TradingEngine {
       closedAt: new Date().toISOString(),
     });
     await logDecision({
-      tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side as any, price: currentPrice,
+      tradeId: trade.id, coin: trade.coin, action: "exit", side: "long", price: currentPrice,
       reasoning: `MANUAL CLOSE | Est P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${pnlOfAum.toFixed(3)}%`,
       equity: eq, leverage: trade.leverage, strategy,
     });
     await storage.createLog({
       type: "trade_close",
-      message: `Manual close ${trade.side.toUpperCase()} ${trade.coin} | Est P&L: $${pnlUsd.toFixed(2)} USDC`,
+      message: `Manual close LONG ${trade.coin} | Est P&L: $${pnlUsd.toFixed(2)} USDC`,
       timestamp: new Date().toISOString(),
     });
     return updated;
   }
+
   async forceScan() { await this.runScanCycle(); }
 
   getLastKnownEquity(): number {
@@ -1881,7 +1158,6 @@ class TradingEngine {
     this.pnlResetEquity = equity;
     this.startingEquity = equity;
     this.dayStartEquity = equity;
-    // Persist baseline so it survives restarts
     await storage.updateConfig({
       pnlBaselineEquity: equity,
       pnlBaselineTimestamp: this.pnlResetTimestamp,
@@ -1899,14 +1175,11 @@ class TradingEngine {
     const config = await storage.getConfig();
     const openTrades = await storage.getOpenTrades();
     const allTrades = await storage.getAllTrades();
-    // Only count trades opened after the P&L reset for the main display
     const resetTs = this.pnlResetTimestamp;
     const activeTrades = resetTs
       ? allTrades.filter(t => t.openedAt >= resetTs)
       : allTrades;
     const activeClosedTrades = activeTrades.filter(t => t.status === "closed");
-    const allClosedTrades = allTrades.filter(t => t.status === "closed"); // for all-time stats
-    // v11.2: Win/loss uses hlPnlUsd (ground truth from HL) — falls back to pnlPct for legacy
     const winTrades = activeClosedTrades.filter(t => {
       if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return t.hlPnlUsd > 0;
       return (t.pnlPct || 0) > 0;
@@ -1918,31 +1191,23 @@ class TradingEngine {
     const currentEquity = this.lastKnownEquity || 0;
     const startEq = this.pnlResetEquity || this.startingEquity || currentEquity;
 
-    // v11.2: Use hlPnlUsd directly for USDC P&L totals — THE source of truth
-    // Closed trades: sum hlPnlUsd (net realized P&L from HL)
     const closedPnlUsd = activeClosedTrades.reduce((s, t) => {
       if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
-      // Legacy fallback: reconstruct from pnlPct
       return s + (startEq > 0 ? startEq * ((t.pnlPct || 0) / 100) : 0);
     }, 0);
-    // Open trades: sum hlPnlUsd (unrealized P&L from HL clearinghouseState)
     const openPnlUsd = openTrades.reduce((s, t) => {
       if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
-      // Legacy fallback
       return s + (currentEquity > 0 ? currentEquity * ((t.pnlPct || 0) / 100) : 0);
     }, 0);
     const combinedPnlUsd = closedPnlUsd + openPnlUsd;
 
-    // Derive % of AUM from USDC amounts
     const closedPnlOfAum = startEq > 0 ? (closedPnlUsd / startEq) * 100 : 0;
     const openPnlOfAum = currentEquity > 0 ? (openPnlUsd / currentEquity) * 100 : 0;
     const combinedPnlOfAum = startEq > 0 ? (combinedPnlUsd / startEq) * 100 : 0;
 
-    // Drawdown from day start
     const drawdownPct = this.dayStartEquity > 0 ? ((this.dayStartEquity - currentEquity) / this.dayStartEquity) * 100 : 0;
     const drawdownUsd = this.dayStartEquity - currentEquity;
 
-    // v11.2: Per-trade P&L for open positions — prefer hlPnlUsd
     const openTradesWithUsd = openTrades.map(t => {
       const eqForT = (t as any).entryEquity || currentEquity;
       const pnlUsd = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
@@ -1950,46 +1215,19 @@ class TradingEngine {
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)) };
     });
 
-    // Per-strategy stats (using post-reset trades only)
-    const closedTrades = activeClosedTrades;
-    const confluenceTrades = closedTrades.filter(t => (t.strategy || "confluence") === "confluence");
-    const extremeTrades = closedTrades.filter(t => t.strategy === "extreme_rsi");
-    const bbReversionTrades = closedTrades.filter(t => t.strategy === "bb_rsi_reversion");
-    const breakoutRetestTrades = closedTrades.filter(t => t.strategy === "breakout_retest");
-    // v11.2: Win rate uses hlPnlUsd
-    const winRateCalc = (trades: typeof closedTrades) => {
-      if (trades.length === 0) return 0;
-      const wins = trades.filter(t => {
-        if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return t.hlPnlUsd > 0;
-        return (t.pnlPct || 0) > 0;
-      });
-      return (wins.length / trades.length) * 100;
-    };
-    const confluenceWinRate = winRateCalc(confluenceTrades);
-    const extremeWinRate = winRateCalc(extremeTrades);
-    const bbReversionWinRate = winRateCalc(bbReversionTrades);
-    const breakoutRetestWinRate = winRateCalc(breakoutRetestTrades);
-
-    // v11.2: Per-strategy P&L from hlPnlUsd directly
-    const strategyPnlCalc = (trades: typeof closedTrades) => {
-      const pnlUsd = trades.reduce((s, t) => {
-        if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) return s + t.hlPnlUsd;
-        return s + (startEq > 0 ? startEq * ((t.pnlPct || 0) / 100) : 0);
-      }, 0);
-      const pnlOfAumPct = startEq > 0 ? (pnlUsd / startEq) * 100 : 0;
-      return { pnlOfAumPct, pnlUsd };
-    };
-    const confluenceStats = strategyPnlCalc(confluenceTrades);
-    const extremeStats = strategyPnlCalc(extremeTrades);
-    const bbReversionStats = strategyPnlCalc(bbReversionTrades);
-    const breakoutRetestStats = strategyPnlCalc(breakoutRetestTrades);
+    // DEGEN_RSI single strategy stats
+    const degenTrades = activeClosedTrades.filter(t => t.strategy === "degen_rsi" || !t.strategy);
+    const degenWins = degenTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
+    const degenWinRate = degenTrades.length > 0 ? (degenWins / degenTrades.length) * 100 : 0;
+    const degenPnlUsd = degenTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
+    const degenPnlOfAum = startEq > 0 ? (degenPnlUsd / startEq) * 100 : 0;
 
     return {
       isRunning: config?.isRunning || false,
       openPositions: openTrades.length,
       totalTrades: activeTrades.length,
       totalTradesAllTime: allTrades.length,
-      closedTrades: closedTrades.length,
+      closedTrades: activeClosedTrades.length,
       winRate: winRate.toFixed(1),
       totalPnl: closedPnlOfAum.toFixed(2),
       totalPnlUsd: closedPnlUsd.toFixed(4),
@@ -2011,12 +1249,15 @@ class TradingEngine {
       learningStats: stats,
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
-      // Per-strategy breakdown (post-reset only)
       strategyStats: {
-        confluence: { trades: confluenceTrades.length, winRate: confluenceWinRate.toFixed(1), openPositions: openTrades.filter(t => (t.strategy || "confluence") === "confluence").length, pnlUsd: confluenceStats.pnlUsd.toFixed(4), pnlOfAum: confluenceStats.pnlOfAumPct.toFixed(3), status: "disabled" },
-        extreme_rsi: { trades: extremeTrades.length, winRate: extremeWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "extreme_rsi").length, pnlUsd: extremeStats.pnlUsd.toFixed(4), pnlOfAum: extremeStats.pnlOfAumPct.toFixed(3), status: "active" },
-        bb_rsi_reversion: { trades: bbReversionTrades.length, winRate: bbReversionWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "bb_rsi_reversion").length, pnlUsd: bbReversionStats.pnlUsd.toFixed(4), pnlOfAum: bbReversionStats.pnlOfAumPct.toFixed(3), status: "active" },
-        breakout_retest: { trades: breakoutRetestTrades.length, winRate: breakoutRetestWinRate.toFixed(1), openPositions: openTrades.filter(t => t.strategy === "breakout_retest").length, pnlUsd: breakoutRetestStats.pnlUsd.toFixed(4), pnlOfAum: breakoutRetestStats.pnlOfAumPct.toFixed(3), status: "active" },
+        degen_rsi: {
+          trades: degenTrades.length,
+          winRate: degenWinRate.toFixed(1),
+          openPositions: openTrades.filter(t => t.strategy === "degen_rsi").length,
+          pnlUsd: degenPnlUsd.toFixed(4),
+          pnlOfAum: degenPnlOfAum.toFixed(3),
+          status: "active",
+        },
       },
     };
   }

@@ -13,27 +13,10 @@ import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
   LineChart, Line, Legend,
 } from "recharts";
-// Display-friendly asset names
-const ASSET_DISPLAY: Record<string, string> = {
-  "BTC": "Bitcoin",
-  "ETH": "Ethereum",
-  "SOL": "Solana",
-  "XRP": "XRP",
-  "xyz:GOLD": "Gold",
-  "xyz:SILVER": "Silver",
-  "xyz:CL": "WTI Oil",
-  "xyz:SP500": "S&P 500",
-  "xyz:EUR": "EUR/USD",
-};
-
-function getAssetLabel(coin: string): string {
-  return ASSET_DISPLAY[coin] || coin;
-}
 
 function getSessionInfo(): { session: string; color: string } {
   const now = new Date();
   const utcHour = now.getUTCHours();
-  // London: 07-16 UTC, NY: 13-21 UTC, overlap: 13-16 UTC, Asia: 23-08 UTC
   if (utcHour >= 13 && utcHour < 16) return { session: "London/NY Overlap", color: "text-emerald-400" };
   if (utcHour >= 7 && utcHour < 16) return { session: "London Session", color: "text-blue-400" };
   if (utcHour >= 13 && utcHour < 21) return { session: "New York Session", color: "text-yellow-400" };
@@ -87,20 +70,8 @@ export default function Dashboard() {
     queryFn: () => apiRequest("GET", "/api/strategies").then(r => r.json()),
     refetchInterval: 15000,
   });
-  const strategies = strategyData?.strategies || [];
+  const degenStrategy = strategyData?.strategies?.[0];
   const raceHours = strategyData?.raceHours || 0;
-  const raceStartedAt = strategyData?.raceStartedAt || "";
-
-  const { data: aiweeklyStatus } = useQuery<any>({
-    queryKey: ["/api/aiweekly/status"],
-    queryFn: () => apiRequest("GET", "/api/aiweekly/status").then(r => r.json()),
-    refetchInterval: 30000,
-  });
-
-  const triggerAiweekly = useMutation({
-    mutationFn: () => apiRequest("POST", "/api/aiweekly/trigger"),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/aiweekly/status"] }),
-  });
 
   const triggerScan = useMutation({
     mutationFn: () => apiRequest("POST", "/api/bot/scan"),
@@ -124,12 +95,6 @@ export default function Dashboard() {
     return `${sign}${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDC`;
   };
 
-  const pnlChartData = [...(pnlData || [])].reverse().slice(-50).map((p: any) => ({
-    time: new Date(p.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    pnl: p.totalPnlPct,
-    equity: p.totalEquity,
-  }));
-
   // Equity curve from actual trade P&L (ground truth)
   const equityChartData = (equityCurve || []).map((p: any) => {
     const d = new Date(p.timestamp);
@@ -141,7 +106,18 @@ export default function Dashboard() {
     };
   });
 
+  // DEGEN_RSI P&L line chart
+  const degenChartData = (degenStrategy?.cumPnlSeries || []).map((p: any) => {
+    const d = new Date(p.timestamp);
+    return {
+      time: `${d.getMonth()+1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+      pnl: p.cumPnl,
+      tradeNum: p.tradeNum,
+    };
+  });
+
   const sessionInfo = getSessionInfo();
+  const raceDays = raceHours >= 24 ? `${(raceHours / 24).toFixed(1)}d` : `${raceHours.toFixed(1)}h`;
 
   return (
     <div className="p-6 space-y-6 max-w-[1400px]">
@@ -150,7 +126,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">Real-time trading overview</p>
+            <p className="text-sm text-muted-foreground">v14.0 DEGEN_RSI — Real-time overview</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -218,7 +194,7 @@ export default function Dashboard() {
               <Activity className="w-4 h-4 text-muted-foreground" />
             </div>
             <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
-              {status?.openPositions || 0}
+              {status?.openPositions || 0} / 1
             </div>
             <p className={cn(
               "text-[10px] font-mono mt-1",
@@ -232,140 +208,143 @@ export default function Dashboard() {
         <Card>
           <CardContent className="p-4">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-muted-foreground font-medium">Win Rate / Pace</span>
+              <span className="text-xs text-muted-foreground font-medium">Win Rate / Trades</span>
               <Target className="w-4 h-4 text-muted-foreground" />
             </div>
             <div className="text-lg font-semibold font-mono" data-testid="text-win-rate">
               {status?.winRate || "0.0"}%
             </div>
             <p className="text-[10px] text-muted-foreground mt-1">
-              {status?.closedTrades || 0} closed | Today: {status?.dailyTradeCount || 0}/{status?.dailyTradeTarget || 20}
-            </p>
-            <p className={cn(
-              "text-[10px] font-mono mt-0.5",
-              parseFloat(status?.drawdownPct || "0") > 30 ? "text-red-400" : parseFloat(status?.drawdownPct || "0") > 15 ? "text-amber-400" : "text-muted-foreground"
-            )}>
-              DD: {status?.drawdownPct || "0.00"}% ({fmtUsd(-(parseFloat(status?.drawdownUsd || "0")))}) {status?.drawdownPaused ? "⏸ PAUSED" : ""}
+              {status?.closedTrades || 0} closed | Today: {status?.dailyTradeCount || 0}
             </p>
           </CardContent>
         </Card>
       </div>
 
-      {/* ========== TRIPLE STRATEGY RACE ========== */}
-      {(() => {
-        const pureRsi = strategies.find((s: any) => s.strategy === "pure_rsi");
-        const hstar = strategies.find((s: any) => s.strategy === "hstar");
-        const aiweeklyStrat = strategies.find((s: any) => s.strategy === "aiweekly");
-        const raceDays = raceHours >= 24 ? `${(raceHours / 24).toFixed(1)}d` : `${raceHours.toFixed(1)}h`;
-        const raceStart = raceStartedAt ? new Date(raceStartedAt).toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
-
-        // Determine leader
-        const prPnl = pureRsi?.totalPnlUsd || 0;
-        const hsPnl = hstar?.totalPnlUsd || 0;
-        const awPnl = aiweeklyStrat?.totalPnlUsd || 0;
-        const maxPnl = Math.max(prPnl, hsPnl, awPnl);
-        const leader = maxPnl === 0 ? "tie" : prPnl === maxPnl ? "pure_rsi" : hsPnl === maxPnl ? "hstar" : "aiweekly";
-
-        // 3-col stat row helper
-        const Stat3Row = ({ label, prVal, hsVal, awVal, fmt, higherBetter = true }: {
-          label: string; prVal: number; hsVal: number; awVal: number;
-          fmt: (v: number) => string; higherBetter?: boolean;
-        }) => {
-          const best = higherBetter ? Math.max(prVal, hsVal, awVal) : Math.min(prVal, hsVal, awVal);
-          const allSame = prVal === hsVal && hsVal === awVal;
-          return (
-            <div className="grid grid-cols-[1fr_auto_1fr_auto_1fr] items-center gap-1 py-1 border-b border-border/30 last:border-0">
-              <span className={cn("text-xs font-mono text-right", !allSame && prVal === best ? "text-blue-400 font-semibold" : "text-muted-foreground")}>{fmt(prVal)}</span>
-              <span className="text-[9px] text-muted-foreground text-center w-16 truncate">{label}</span>
-              <span className={cn("text-xs font-mono text-center", !allSame && hsVal === best ? "text-amber-400 font-semibold" : "text-muted-foreground")}>{fmt(hsVal)}</span>
-              <span className="text-[9px] text-muted-foreground text-center w-4">|</span>
-              <span className={cn("text-xs font-mono text-left", !allSame && awVal === best ? "text-emerald-400 font-semibold" : "text-muted-foreground")}>{fmt(awVal)}</span>
+      {/* ========== DEGEN RSI v14.0 Strategy Card ========== */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-sm font-medium">DEGEN RSI — v14.0</CardTitle>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                BTC only | LONG | RSI ≤25 (5m+15m) | 90% equity | 40x | SL -0.5% | TP +0.43% | BE @ +0.25% | {raceDays} running
+              </p>
             </div>
-          );
-        };
-
-        return (
-          <Card>
-            <CardHeader className="pb-2">
-              <div className="flex items-center justify-between">
-                <div>
-                  <CardTitle className="text-sm font-medium">Strategy Race: PURE RSI vs H★★ vs AIWEEKLY</CardTitle>
-                  <p className="text-[10px] text-muted-foreground">Triple strategy since v13.5{raceStart ? ` (${raceStart})` : ""} — {raceDays} elapsed</p>
-                </div>
-                <Badge variant="outline" className={cn(
-                  "text-[10px] px-2 py-0.5",
-                  leader === "pure_rsi" ? "bg-blue-500/10 text-blue-400 border-blue-500/30" :
-                  leader === "hstar" ? "bg-amber-500/10 text-amber-400 border-amber-500/30" :
-                  leader === "aiweekly" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" :
-                  "bg-zinc-500/10 text-zinc-400 border-zinc-500/30"
-                )}>
-                  {leader === "pure_rsi" ? "PURE RSI leads" : leader === "hstar" ? "H★★ leads" : leader === "aiweekly" ? "AIWEEKLY leads" : "Tied"}
-                </Badge>
+            <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+              Active
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
+              <div className="text-[10px] text-muted-foreground mb-1">Trades</div>
+              <div className="text-base font-semibold font-mono text-emerald-400">
+                {degenStrategy?.totalTrades || 0}
               </div>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-4">
-                {/* Column headers */}
-                <div className="grid grid-cols-[1fr_auto_1fr_auto_1fr] items-center gap-1">
-                  <div className="flex items-center justify-end gap-1.5">
-                    <div className="w-2 h-2 rounded-full bg-blue-400" />
-                    <span className="text-xs font-semibold text-blue-400">PURE RSI</span>
-                  </div>
-                  <span className="text-[9px] text-muted-foreground text-center w-16">vs</span>
-                  <div className="flex items-center justify-center gap-1.5">
-                    <div className="w-2 h-2 rounded-full bg-amber-400" />
-                    <span className="text-xs font-semibold text-amber-400">H★★</span>
-                  </div>
-                  <span className="text-[9px] text-muted-foreground text-center w-4">|</span>
-                  <div className="flex items-center gap-1.5">
-                    <div className="w-2 h-2 rounded-full bg-emerald-400" />
-                    <span className="text-xs font-semibold text-emerald-400">AI</span>
-                  </div>
-                </div>
-
-                {/* Stats comparison */}
-                <div>
-                  <Stat3Row label="Total P&L" prVal={prPnl} hsVal={hsPnl} awVal={awPnl} fmt={v => `${v >= 0 ? "+" : ""}$${v.toFixed(2)}`} />
-                  <Stat3Row label="P&L % AUM" prVal={pureRsi?.totalPnlPct || 0} hsVal={hstar?.totalPnlPct || 0} awVal={aiweeklyStrat?.totalPnlPct || 0} fmt={v => `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`} />
-                  <Stat3Row label="Trades" prVal={pureRsi?.totalTrades || 0} hsVal={hstar?.totalTrades || 0} awVal={aiweeklyStrat?.totalTrades || 0} fmt={v => `${v}`} />
-                  <Stat3Row label="Win Rate" prVal={pureRsi?.winRate || 0} hsVal={hstar?.winRate || 0} awVal={aiweeklyStrat?.winRate || 0} fmt={v => `${v.toFixed(1)}%`} />
-                  <Stat3Row label="Avg/Trade" prVal={pureRsi?.avgPnlPerTrade || 0} hsVal={hstar?.avgPnlPerTrade || 0} awVal={aiweeklyStrat?.avgPnlPerTrade || 0} fmt={v => `${v >= 0 ? "+" : ""}$${v.toFixed(2)}`} />
-                  <Stat3Row label="Best Trade" prVal={pureRsi?.bestTradeUsd || 0} hsVal={hstar?.bestTradeUsd || 0} awVal={aiweeklyStrat?.bestTradeUsd || 0} fmt={v => `+$${v.toFixed(2)}`} />
-                  <Stat3Row label="Worst" prVal={pureRsi?.worstTradeUsd || 0} hsVal={hstar?.worstTradeUsd || 0} awVal={aiweeklyStrat?.worstTradeUsd || 0} fmt={v => `$${v.toFixed(2)}`} higherBetter={false} />
-                  <Stat3Row label="Max DD" prVal={pureRsi?.maxDrawdownUsd || 0} hsVal={hstar?.maxDrawdownUsd || 0} awVal={aiweeklyStrat?.maxDrawdownUsd || 0} fmt={v => `-$${v.toFixed(2)}`} higherBetter={false} />
-                  <Stat3Row label="Profit F" prVal={pureRsi?.profitFactor || 0} hsVal={hstar?.profitFactor || 0} awVal={aiweeklyStrat?.profitFactor || 0} fmt={v => v >= 999 ? "∞" : v.toFixed(2)} />
-                  <Stat3Row label="Win Streak" prVal={pureRsi?.bestWinStreak || 0} hsVal={hstar?.bestWinStreak || 0} awVal={aiweeklyStrat?.bestWinStreak || 0} fmt={v => `${v}`} />
-                  <Stat3Row label="Loss Streak" prVal={pureRsi?.worstLossStreak || 0} hsVal={hstar?.worstLossStreak || 0} awVal={aiweeklyStrat?.worstLossStreak || 0} fmt={v => `${v}`} higherBetter={false} />
-                </div>
-
-                {/* W/L breakdown */}
-                <div className="grid grid-cols-3 gap-2">
-                  <div className="text-center p-2 rounded bg-blue-500/5 border border-blue-500/20">
-                    <div className="text-base font-semibold font-mono text-blue-400">{pureRsi?.wins || 0}W / {pureRsi?.losses || 0}L</div>
-                    <div className="text-[9px] text-muted-foreground">{pureRsi?.openPositions || 0} open</div>
-                  </div>
-                  <div className="text-center p-2 rounded bg-amber-500/5 border border-amber-500/20">
-                    <div className="text-base font-semibold font-mono text-amber-400">{hstar?.wins || 0}W / {hstar?.losses || 0}L</div>
-                    <div className="text-[9px] text-muted-foreground">{hstar?.openPositions || 0} open</div>
-                  </div>
-                  <div className="text-center p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
-                    <div className="text-base font-semibold font-mono text-emerald-400">{aiweeklyStrat?.wins || 0}W / {aiweeklyStrat?.losses || 0}L</div>
-                    <div className="text-[9px] text-muted-foreground">{aiweeklyStrat?.openPositions || 0} open</div>
-                  </div>
-                </div>
+              <div className="text-[9px] text-muted-foreground">{degenStrategy?.wins || 0}W / {degenStrategy?.losses || 0}L</div>
+            </div>
+            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
+              <div className="text-[10px] text-muted-foreground mb-1">Win Rate</div>
+              <div className="text-base font-semibold font-mono text-emerald-400">
+                {degenStrategy?.winRate || 0}%
               </div>
-            </CardContent>
-          </Card>
-        );
-      })()}
+              <div className="text-[9px] text-muted-foreground">Streak: {degenStrategy?.bestWinStreak || 0}W / {degenStrategy?.worstLossStreak || 0}L</div>
+            </div>
+            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
+              <div className="text-[10px] text-muted-foreground mb-1">Total P&L</div>
+              <div className={cn(
+                "text-base font-semibold font-mono",
+                (degenStrategy?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+              )}>
+                {(degenStrategy?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(degenStrategy?.totalPnlUsd || 0).toFixed(2)}
+              </div>
+              <div className="text-[9px] text-muted-foreground">
+                {(degenStrategy?.totalPnlPct || 0) >= 0 ? "+" : ""}{(degenStrategy?.totalPnlPct || 0).toFixed(2)}% AUM
+              </div>
+            </div>
+            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
+              <div className="text-[10px] text-muted-foreground mb-1">Avg / Trade</div>
+              <div className={cn(
+                "text-base font-semibold font-mono",
+                (degenStrategy?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+              )}>
+                {(degenStrategy?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(degenStrategy?.avgPnlPerTrade || 0).toFixed(2)}
+              </div>
+              <div className="text-[9px] text-muted-foreground">
+                Best: +${(degenStrategy?.bestTradeUsd || 0).toFixed(2)} | Worst: ${(degenStrategy?.worstTradeUsd || 0).toFixed(2)}
+              </div>
+            </div>
+          </div>
+
+          {/* Additional stats row */}
+          <div className="grid grid-cols-3 gap-2 mb-4">
+            <div className="p-2 rounded bg-muted/30 border border-border/50 text-center">
+              <div className="text-[9px] text-muted-foreground mb-0.5">Max Drawdown</div>
+              <div className="text-xs font-mono text-red-400">-${(degenStrategy?.maxDrawdownUsd || 0).toFixed(2)}</div>
+            </div>
+            <div className="p-2 rounded bg-muted/30 border border-border/50 text-center">
+              <div className="text-[9px] text-muted-foreground mb-0.5">Profit Factor</div>
+              <div className="text-xs font-mono">
+                {(degenStrategy?.profitFactor || 0) >= 999 ? "∞" : (degenStrategy?.profitFactor || 0).toFixed(2)}
+              </div>
+            </div>
+            <div className="p-2 rounded bg-muted/30 border border-border/50 text-center">
+              <div className="text-[9px] text-muted-foreground mb-0.5">Open Positions</div>
+              <div className="text-xs font-mono text-emerald-400">{degenStrategy?.openPositions || 0} / 1</div>
+            </div>
+          </div>
+
+          {/* DEGEN_RSI Cumulative P&L chart */}
+          {degenChartData.length > 1 ? (
+            <ResponsiveContainer width="100%" height={180}>
+              <LineChart data={degenChartData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
+                <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="hsl(220, 10%, 40%)" />
+                <YAxis
+                  tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)"
+                  tickFormatter={(v: number) => `$${v.toFixed(0)}`}
+                />
+                <Tooltip
+                  contentStyle={{
+                    background: "hsl(225, 18%, 10%)",
+                    border: "1px solid hsl(220, 15%, 15%)",
+                    borderRadius: "6px",
+                    fontSize: "11px",
+                  }}
+                  formatter={(value: number) => [
+                    `${value >= 0 ? "+" : ""}$${value.toFixed(2)}`, "Cumulative P&L"
+                  ]}
+                  labelFormatter={(label: string, payload: any[]) => {
+                    const item = payload?.[0]?.payload;
+                    return item ? `Trade #${item.tradeNum} — ${label}` : label;
+                  }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="pnl"
+                  stroke="hsl(145, 65%, 50%)"
+                  strokeWidth={2}
+                  dot={{ r: 3, fill: "hsl(145, 65%, 50%)", stroke: "hsl(225, 18%, 10%)", strokeWidth: 1 }}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[180px] flex items-center justify-center text-sm text-muted-foreground">
+              P&L chart builds as trades close
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Charts Row */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Equity Curve — from actual trade P&L */}
+      <div className="grid grid-cols-1 lg:grid-cols-1 gap-4">
+        {/* Equity Curve */}
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "265.14").toFixed(2)} USDC baseline</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "658").toFixed(2)} USDC baseline (v14.0)</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
@@ -421,81 +400,6 @@ export default function Dashboard() {
             )}
           </CardContent>
         </Card>
-
-
-
-        {/* Cumulative P&L Race Chart */}
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Cumulative P&L Race</CardTitle>
-            <p className="text-[10px] text-muted-foreground">PURE RSI vs H★★ vs AIWEEKLY — since v13.5 deploy</p>
-          </CardHeader>
-          <CardContent>
-            {(() => {
-              const pureRsi = strategies.find((s: any) => s.strategy === "pure_rsi");
-              const hstar = strategies.find((s: any) => s.strategy === "hstar");
-              const aiweeklyStrat = strategies.find((s: any) => s.strategy === "aiweekly");
-
-              // Build time-based merged series using actual timestamps
-              const allEvents: { ts: number; pure_rsi: number; hstar: number; aiweekly: number; label: string }[] = [];
-              let prCum = 0, hsCum = 0, awCum = 0;
-              const prSeries = (pureRsi?.cumPnlSeries || []).map((p: any) => ({ ...p, strat: "pr" }));
-              const hsSeries = (hstar?.cumPnlSeries || []).map((p: any) => ({ ...p, strat: "hs" }));
-              const awSeries = (aiweeklyStrat?.cumPnlSeries || []).map((p: any) => ({ ...p, strat: "aw" }));
-              const merged = [...prSeries, ...hsSeries, ...awSeries].sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-              for (const evt of merged) {
-                if (evt.strat === "pr") prCum = evt.cumPnl;
-                else if (evt.strat === "hs") hsCum = evt.cumPnl;
-                else awCum = evt.cumPnl;
-                const d = new Date(evt.timestamp);
-                allEvents.push({
-                  ts: d.getTime(),
-                  pure_rsi: prCum,
-                  hstar: hsCum,
-                  aiweekly: awCum,
-                  label: `${d.getMonth()+1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
-                });
-              }
-
-              return allEvents.length > 0 ? (
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={allEvents}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
-                    <XAxis dataKey="label" tick={{ fontSize: 9 }} stroke="hsl(220, 10%, 40%)" />
-                    <YAxis
-                      tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)"
-                      tickFormatter={(v: number) => `$${v.toFixed(0)}`}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        background: "hsl(225, 18%, 10%)",
-                        border: "1px solid hsl(220, 15%, 15%)",
-                        borderRadius: "6px",
-                        fontSize: "11px",
-                      }}
-                      formatter={(value: number, name: string) => [
-                        `${value >= 0 ? "+" : ""}$${value.toFixed(2)}`,
-                        name === "pure_rsi" ? "PURE RSI" : name === "hstar" ? "H★★" : "AIWEEKLY"
-                      ]}
-                    />
-                    <Legend
-                      formatter={(value: string) => value === "pure_rsi" ? "PURE RSI" : value === "hstar" ? "H★★" : "AIWEEKLY"}
-                      wrapperStyle={{ fontSize: "11px" }}
-                    />
-                    <Line type="monotone" dataKey="pure_rsi" stroke="hsl(210, 70%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
-                    <Line type="monotone" dataKey="hstar" stroke="hsl(40, 90%, 55%)" strokeWidth={2} dot={{ r: 2 }} />
-                    <Line type="monotone" dataKey="aiweekly" stroke="hsl(145, 65%, 50%)" strokeWidth={2} dot={{ r: 2 }} />
-                  </LineChart>
-                </ResponsiveContainer>
-              ) : (
-                <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
-                  Chart builds as trades close from all three strategies
-                </div>
-              );
-            })()}
-          </CardContent>
-        </Card>
       </div>
 
       {/* Open Positions */}
@@ -515,34 +419,17 @@ export default function Dashboard() {
                   >
                     <div className="flex items-center gap-2.5">
                       <Badge
-                        variant={trade.side === "long" ? "default" : "destructive"}
+                        variant="default"
                         className="text-[10px] px-1.5 py-0 uppercase"
                       >
-                        {trade.side}
+                        LONG
                       </Badge>
                       <div>
-                        <span className="text-sm font-medium">{getAssetLabel(trade.coin)}</span>
+                        <span className="text-sm font-medium">{trade.coin}</span>
                         <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
-                        {(trade.strategy === "bb_rsi_reversion" || trade.strategy === "pure_rsi") && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-blue-500/10 text-blue-400 border-blue-500/30">
-                            PURE RSI
-                          </Badge>
-                        )}
-                        {trade.strategy === "hstar" && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-amber-500/10 text-amber-400 border-amber-500/30">
-                            H★★
-                          </Badge>
-                        )}
-                        {trade.strategy === "aiweekly" && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-                            AI 🤖
-                          </Badge>
-                        )}
-                        {(trade.strategy === "extreme_rsi" || trade.strategy === "confluence" || (!trade.strategy && trade.confluenceScore != null)) && (
-                          <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-zinc-500/10 text-zinc-400 border-zinc-500/30">
-                            Legacy
-                          </Badge>
-                        )}
+                        <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                          DEGEN RSI
+                        </Badge>
                       </div>
                     </div>
                     <div className="text-right">
@@ -565,9 +452,9 @@ export default function Dashboard() {
                         <span className="text-[10px] text-muted-foreground font-mono">
                           ${trade.entryPrice?.toFixed(2)}
                         </span>
-                        {trade.tp1Hit && (
-                          <Badge className="text-[8px] px-1 py-0 bg-emerald-500/20 text-emerald-400 border-0">
-                            TP1
+                        {trade.stopLoss > 0 && (
+                          <Badge className="text-[8px] px-1 py-0 bg-amber-500/20 text-amber-400 border-0">
+                            BE SL
                           </Badge>
                         )}
                       </div>
@@ -609,7 +496,12 @@ export default function Dashboard() {
                     const net = (trade.hlPnlUsd || 0) - (trade.hlCloseFee || 0);
                     const openDate = trade.openedAt ? new Date(trade.openedAt) : null;
                     const closeDate = trade.closedAt ? new Date(trade.closedAt) : null;
-                    const reason = (trade.closeReason || "").replace(/\[PURE_RSI\]\s*/g, "").replace(/\s*\|\s*HL P&L.*$/g, "").replace(/Position closed on HL \(sync\)\s*\|?\s*/g, "Sync").replace(/P&L:.*$/g, "").trim();
+                    const reason = (trade.closeReason || "")
+                      .replace(/\[DEGEN_RSI\]\s*/g, "")
+                      .replace(/\s*\|\s*HL P&L.*$/g, "")
+                      .replace(/Position closed on HL \(sync\)\s*\|?\s*/g, "Sync")
+                      .replace(/P&L:.*$/g, "")
+                      .trim();
                     return (
                       <tr key={trade.id} className="border-b border-border/30 hover:bg-muted/30">
                         <td className="py-1.5 px-1 font-mono text-muted-foreground whitespace-nowrap">
@@ -619,10 +511,10 @@ export default function Dashboard() {
                             {closeDate ? " → " + closeDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}
                           </div>
                         </td>
-                        <td className="py-1.5 px-1 font-medium">{getAssetLabel(trade.coin)}</td>
+                        <td className="py-1.5 px-1 font-medium">{trade.coin}</td>
                         <td className="py-1.5 px-1">
                           <Badge
-                            variant={trade.side === "long" ? "default" : "destructive"}
+                            variant="default"
                             className="text-[9px] px-1 py-0 uppercase"
                           >
                             {trade.side}
@@ -651,74 +543,6 @@ export default function Dashboard() {
         </CardContent>
       </Card>
 
-      {/* ========== AIWEEKLY AI STATUS ========== */}
-      <Card>
-        <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle className="text-sm font-medium">AIWEEKLY — 3-Model AI Strategy</CardTitle>
-              <p className="text-[10px] text-muted-foreground">Sonar research + Claude + GPT consensus — stocks & commodities on Hyperliquid xyz</p>
-            </div>
-            <div className="flex items-center gap-2">
-              {aiweeklyStatus?.hasApiKey ? (
-                <Badge variant="outline" className="text-[9px] px-1.5 py-0 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-                  API key set
-                </Badge>
-              ) : (
-                <Badge variant="outline" className="text-[9px] px-1.5 py-0 bg-red-500/10 text-red-400 border-red-500/30">
-                  No PERPLEXITY_API_KEY
-                </Badge>
-              )}
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => triggerAiweekly.mutate()}
-                disabled={triggerAiweekly.isPending || !aiweeklyStatus?.hasApiKey}
-                className="text-[10px] h-6 px-2"
-              >
-                {triggerAiweekly.isPending ? "Running..." : "Trigger Now"}
-              </Button>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
-            <div className="p-2 rounded bg-muted/40 border border-border/50">
-              <div className="text-[10px] text-muted-foreground mb-0.5">Open Positions</div>
-              <div className="text-sm font-semibold font-mono text-emerald-400">{aiweeklyStatus?.openPositions ?? 0}</div>
-            </div>
-            <div className="p-2 rounded bg-muted/40 border border-border/50">
-              <div className="text-[10px] text-muted-foreground mb-0.5">Closed Trades</div>
-              <div className="text-sm font-semibold font-mono">{aiweeklyStatus?.totalClosed ?? 0}</div>
-            </div>
-            <div className="p-2 rounded bg-muted/40 border border-border/50">
-              <div className="text-[10px] text-muted-foreground mb-0.5">Total P&L</div>
-              <div className={cn("text-sm font-semibold font-mono", (aiweeklyStatus?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400")}>
-                {(aiweeklyStatus?.totalPnlUsd || 0) >= 0 ? "+" : ""}{(aiweeklyStatus?.totalPnlUsd || 0).toFixed(2)} USDC
-              </div>
-            </div>
-            <div className="p-2 rounded bg-muted/40 border border-border/50">
-              <div className="text-[10px] text-muted-foreground mb-0.5">Win Rate</div>
-              <div className="text-sm font-semibold font-mono">{aiweeklyStatus?.winRate ?? 0}%</div>
-            </div>
-          </div>
-          {aiweeklyStatus?.latestCycle && (
-            <div className="text-[10px] text-muted-foreground space-y-0.5">
-              <div>Last cycle: <span className="text-foreground">{new Date(aiweeklyStatus.latestCycle.createdAt).toLocaleString()}</span> — status: <span className={cn("font-medium", aiweeklyStatus.latestCycle.status === "complete" ? "text-emerald-400" : aiweeklyStatus.latestCycle.status === "researching" ? "text-amber-400" : "text-muted-foreground")}>{aiweeklyStatus.latestCycle.status}</span></div>
-              {aiweeklyStatus.latestCycle.nextCycleAt && (
-                <div>Next cycle: <span className="text-foreground">{new Date(aiweeklyStatus.latestCycle.nextCycleAt).toLocaleString()}</span></div>
-              )}
-              {aiweeklyStatus.latestCycle.tradesOpened != null && (
-                <div>Positions opened: <span className="text-foreground font-medium">{aiweeklyStatus.latestCycle.tradesOpened}</span> | TP +5% | SL -1% | 5x leverage | $100 allocation</div>
-              )}
-            </div>
-          )}
-          {!aiweeklyStatus?.latestCycle && (
-            <div className="text-[10px] text-muted-foreground">No research cycles run yet. Cycles run automatically every 72h when PERPLEXITY_API_KEY is set.</div>
-          )}
-        </CardContent>
-      </Card>
-
       {/* Recent Activity */}
       <Card>
         <CardHeader className="pb-2">
@@ -739,11 +563,10 @@ export default function Dashboard() {
                   log.type === "scan" && "bg-yellow-500",
                   log.type === "system" && "bg-muted-foreground",
                   log.type === "config_change" && "bg-purple-500",
-                  log.type === "circuit_breaker" && "bg-orange-500",
                   log.type === "learning" && "bg-cyan-500",
                   log.type === "learning_24h" && "bg-cyan-400",
-                  log.type === "aiweekly" && "bg-emerald-500",
-                  log.type === "aiweekly_error" && "bg-red-400",
+                  log.type === "order_error" && "bg-red-400",
+                  log.type === "order_unfilled" && "bg-orange-400",
                 )} />
                 <div className="flex-1 min-w-0">
                   <p className="text-xs truncate">{log.message}</p>

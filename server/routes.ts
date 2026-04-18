@@ -5,7 +5,6 @@ import { tradingEngine } from "./trading-engine";
 import { getLearningStats, reviewClosedTrades, generateInsights, run24hReview } from "./learning-engine";
 import { insertBotConfigSchema } from "@shared/schema";
 import { WebSocketServer, WebSocket } from "ws";
-import { AIWEEKLY_STOCKS, AIWEEKLY_COMMODITIES } from "./ai-researcher";
 
 export async function registerRoutes(
   httpServer: Server,
@@ -77,7 +76,6 @@ export async function registerRoutes(
 
   app.post("/api/bot/scan", async (_req, res) => {
     try {
-      // Temporarily set running to allow scan
       const config = await storage.getConfig();
       const wasRunning = config?.isRunning;
       if (!wasRunning) await storage.updateConfig({ isRunning: true });
@@ -99,8 +97,7 @@ export async function registerRoutes(
       ? await storage.getOpenTrades()
       : await storage.getAllTrades(200);
 
-    // v11.2: Use hlPnlUsd directly from Hyperliquid as THE source of truth
-    // Falls back to calculated P&L only for legacy trades without hlPnlUsd
+    // Use hlPnlUsd directly from Hyperliquid as THE source of truth
     const currentEquity = tradingEngine.getLastKnownEquity();
     const FEE_RATE = 0.00045;
     const enriched = trades.map((t: any) => {
@@ -108,10 +105,8 @@ export async function registerRoutes(
       let eqForTrade = t.entryEquity || currentEquity;
 
       if (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) {
-        // GROUND TRUTH: P&L straight from Hyperliquid
         pnlUsd = t.hlPnlUsd;
       } else {
-        // Legacy fallback for old trades without hlPnlUsd
         if (!eqForTrade && t.reason) {
           const capMatch = t.reason.match(/AUM \(\$(\d+)\)/);
           if (capMatch) {
@@ -139,15 +134,14 @@ export async function registerRoutes(
     res.json(enriched);
   });
 
-  // ============ STRATEGY COMPARISON ============
-  // Head-to-head race: only counts trades opened AFTER v13.4 deploy
-  const V134_RACE_START = "2026-04-17T22:23:00.000Z";
+  // ============ STRATEGY STATS ============
+  // v14.0: Single DEGEN_RSI strategy — only counts trades after v14 deploy
+  const V140_START = "2026-04-18T11:56:00.000Z";
 
   app.get("/api/strategies", async (req, res) => {
     const allTrades = await storage.getAllTrades(500);
     const currentEquity = tradingEngine.getLastKnownEquity();
 
-    // Group trades by strategy
     type StratBucket = {
       trades: any[]; wins: number; losses: number; totalPnl: number;
       grossProfit: number; grossLoss: number;
@@ -164,32 +158,16 @@ export async function registerRoutes(
       cumPnlSeries: [],
       streakCurrent: 0, streakBest: 0, streakWorst: 0, streakType: "none",
     });
-    const stratMap: Record<string, StratBucket> = {
-      pure_rsi: makeBucket(),
-      hstar: makeBucket(),
-      aiweekly: makeBucket(),
-    };
 
-    // Sort closed trades by closedAt ascending — only trades opened after v13.4 deploy
+    const degenBucket = makeBucket();
+
     const closedTrades = allTrades
-      .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V134_RACE_START)
+      .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V140_START)
       .sort((a: any, b: any) => new Date(a.closedAt).getTime() - new Date(b.closedAt).getTime());
 
     for (const t of closedTrades) {
       const pnl = t.hlPnlUsd ?? 0;
-
-      // Determine strategy bucket
-      let strat = t.strategy || "";
-      if (strat === "aiweekly") {
-        strat = "aiweekly";
-      } else if (strat === "bb_rsi_reversion" || strat === "confluence" || strat === "extreme_rsi" || strat === "pure_rsi") {
-        strat = "pure_rsi";
-      } else if (strat !== "hstar") {
-        strat = "pure_rsi";
-      }
-
-      const bucket = stratMap[strat];
-      if (!bucket) continue;
+      const bucket = degenBucket;
 
       bucket.trades.push(t);
       bucket.totalPnl += pnl;
@@ -201,16 +179,13 @@ export async function registerRoutes(
         bucket.grossLoss += Math.abs(pnl);
       }
 
-      // Best / worst single trade
       if (pnl > bucket.bestTrade) bucket.bestTrade = pnl;
       if (pnl < bucket.worstTrade) bucket.worstTrade = pnl;
 
-      // Max drawdown (peak-to-trough on cumulative P&L)
       if (bucket.totalPnl > bucket.peakPnl) bucket.peakPnl = bucket.totalPnl;
       const dd = bucket.peakPnl - bucket.totalPnl;
       if (dd > bucket.maxDrawdownUsd) bucket.maxDrawdownUsd = dd;
 
-      // Win/loss streaks
       if (pnl > 0) {
         if (bucket.streakType === "win") {
           bucket.streakCurrent++;
@@ -236,38 +211,35 @@ export async function registerRoutes(
       });
     }
 
-    // Also count open trades (all open, not just post-v13.4)
     const openTrades = allTrades.filter((t: any) => t.status === "open");
-    const openPureRsi = openTrades.filter((t: any) => (t.strategy || "") !== "hstar" && (t.strategy || "") !== "aiweekly").length;
-    const openHstar = openTrades.filter((t: any) => t.strategy === "hstar").length;
-    const openAiweekly = openTrades.filter((t: any) => t.strategy === "aiweekly").length;
+    const openDegen = openTrades.filter((t: any) => t.strategy === "degen_rsi" || !t.strategy).length;
 
-    // Race runtime
-    const raceStartMs = new Date(V134_RACE_START).getTime();
+    const raceStartMs = new Date(V140_START).getTime();
     const raceHours = parseFloat(((Date.now() - raceStartMs) / 3600000).toFixed(1));
 
-    const result = Object.entries(stratMap).map(([name, data]) => ({
-      strategy: name,
-      label: name === "hstar" ? "H\u2605\u2605 (2:1 R:R)" : name === "aiweekly" ? "AIWEEKLY (3-Model AI)" : "PURE RSI (Conservative)",
-      totalTrades: data.trades.length,
-      wins: data.wins,
-      losses: data.losses,
-      winRate: data.trades.length > 0 ? parseFloat(((data.wins / data.trades.length) * 100).toFixed(1)) : 0,
-      totalPnlUsd: parseFloat(data.totalPnl.toFixed(2)),
-      totalPnlPct: currentEquity > 0 ? parseFloat(((data.totalPnl / currentEquity) * 100).toFixed(2)) : 0,
-      avgPnlPerTrade: data.trades.length > 0 ? parseFloat((data.totalPnl / data.trades.length).toFixed(2)) : 0,
-      bestTradeUsd: parseFloat(data.bestTrade.toFixed(2)),
-      worstTradeUsd: parseFloat(data.worstTrade.toFixed(2)),
-      maxDrawdownUsd: parseFloat(data.maxDrawdownUsd.toFixed(2)),
-      maxDrawdownPct: currentEquity > 0 ? parseFloat(((data.maxDrawdownUsd / currentEquity) * 100).toFixed(2)) : 0,
-      profitFactor: data.grossLoss > 0 ? parseFloat((data.grossProfit / data.grossLoss).toFixed(2)) : data.grossProfit > 0 ? 999 : 0,
-      bestWinStreak: data.streakBest,
-      worstLossStreak: data.streakWorst,
-      openPositions: name === "hstar" ? openHstar : name === "aiweekly" ? openAiweekly : openPureRsi,
-      cumPnlSeries: data.cumPnlSeries,
-    }));
+    const d = degenBucket;
+    const result = [{
+      strategy: "degen_rsi",
+      label: "DEGEN RSI (LONG only)",
+      totalTrades: d.trades.length,
+      wins: d.wins,
+      losses: d.losses,
+      winRate: d.trades.length > 0 ? parseFloat(((d.wins / d.trades.length) * 100).toFixed(1)) : 0,
+      totalPnlUsd: parseFloat(d.totalPnl.toFixed(2)),
+      totalPnlPct: currentEquity > 0 ? parseFloat(((d.totalPnl / currentEquity) * 100).toFixed(2)) : 0,
+      avgPnlPerTrade: d.trades.length > 0 ? parseFloat((d.totalPnl / d.trades.length).toFixed(2)) : 0,
+      bestTradeUsd: parseFloat(d.bestTrade.toFixed(2)),
+      worstTradeUsd: parseFloat(d.worstTrade.toFixed(2)),
+      maxDrawdownUsd: parseFloat(d.maxDrawdownUsd.toFixed(2)),
+      maxDrawdownPct: currentEquity > 0 ? parseFloat(((d.maxDrawdownUsd / currentEquity) * 100).toFixed(2)) : 0,
+      profitFactor: d.grossLoss > 0 ? parseFloat((d.grossProfit / d.grossLoss).toFixed(2)) : d.grossProfit > 0 ? 999 : 0,
+      bestWinStreak: d.streakBest,
+      worstLossStreak: d.streakWorst,
+      openPositions: openDegen,
+      cumPnlSeries: d.cumPnlSeries,
+    }];
 
-    res.json({ raceStartedAt: V134_RACE_START, raceHours, strategies: result });
+    res.json({ raceStartedAt: V140_START, raceHours, strategies: result });
   });
 
   app.get("/api/trades/:id", async (req, res) => {
@@ -308,7 +280,6 @@ export async function registerRoutes(
   });
 
   // ============ SYNC POSITIONS FROM HL ============
-  // v11.0: Creates DB entries for HL positions — NO SL, TP +0.5% from entry
   app.post("/api/trades/sync-from-hl", async (_req, res) => {
     try {
       const config = await storage.getConfig();
@@ -324,37 +295,35 @@ export async function registerRoutes(
         const sz = Math.abs(parseFloat(pos?.szi || "0"));
         if (sz <= 0) continue;
         const coin = pos.coin;
-        if (openCoins.has(coin)) continue; // already tracked
+        if (openCoins.has(coin)) continue;
         const side = parseFloat(pos.szi) > 0 ? "long" : "short";
         const entryPrice = parseFloat(pos.entryPx || "0");
         const leverage = parseInt(pos.leverage?.value || "1");
         const equity = tradingEngine.getLastKnownEquity();
-        // GROUND TRUTH: actual notional = abs(szi) * entryPrice
         const actualNotional = sz * entryPrice;
-        // v11.0: NO SL, TP at +0.5% from entry
-        const tp = side === "long" ? entryPrice * 1.005 : entryPrice * 0.995;
+        const tp = entryPrice * 1.0043; // TP +0.43%
+        const sl = entryPrice * 0.995; // SL -0.5%
         const trade = await storage.createTrade({
-          coin, side, entryPrice, size: 80, leverage,
+          coin, side, entryPrice, size: 90, leverage,
           entryEquity: equity,
           notionalValue: actualNotional,
           rsiAtEntry: 0, rsi4h: 0, rsi1d: 0,
           ema10: 0, ema21: 0, ema50: 0,
-          stopLoss: 0,  // NO SL
+          stopLoss: sl,  // SL -0.5% from entry
           takeProfit1: tp,
           takeProfit2: tp,
           tp1Hit: false,
           confluenceScore: 0, confluenceDetails: "Synced from HL position",
           riskRewardRatio: 0, status: "open",
-          reason: `[SYNC] Imported from HL: ${coin} ${side} ${leverage}x @ $${entryPrice} | NO SL | TP +0.5%`,
-          setupType: "bb_rsi_reversion", strategy: "bb_rsi_reversion",
+          reason: `[SYNC] Imported from HL: ${coin} ${side} ${leverage}x @ $${entryPrice} | SL -0.5% | TP +0.43%`,
+          setupType: "degen_rsi", strategy: "degen_rsi",
           openedAt: new Date().toISOString(),
         });
         synced.push({ id: trade.id, coin, side, entryPrice, leverage, tp });
-        await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id} | NO SL | TP $${tp.toFixed(2)}`, timestamp: new Date().toISOString() });
+        await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id} | SL $${sl.toFixed(2)} | TP $${tp.toFixed(2)}`, timestamp: new Date().toISOString() });
       }
-      // v11.0: No SL orders placed on HL — strategy uses no stop loss
       broadcast({ type: "status", data: await tradingEngine.getStatus() });
-      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v11.0: NO SL, TP +0.5%)` });
+      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v14.0: SL -0.5%, TP +0.43%)` });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -381,19 +350,15 @@ export async function registerRoutes(
   app.get("/api/equity-curve", async (_req, res) => {
     try {
       const config = await storage.getConfig();
-      const baselineEquity = config?.pnlBaselineEquity || 265.14;
-      const baselineTs = config?.pnlBaselineTimestamp || "2026-04-16T14:40:00.000Z";
+      const baselineEquity = config?.pnlBaselineEquity || 658;
+      const baselineTs = config?.pnlBaselineTimestamp || V140_START;
 
       const allTrades = await storage.getAllTrades(500);
-      // Only trades after baseline, sorted by close time
       const closedAfterBaseline = allTrades
         .filter(t => t.status === "closed" && t.closedAt && t.openedAt >= baselineTs)
         .sort((a, b) => (a.closedAt || "").localeCompare(b.closedAt || ""));
 
-      // Build equity curve: start at baseline, add each trade's P&L
       const curve: { timestamp: string; equity: number; trade: string; pnl: number }[] = [];
-
-      // Starting point
       curve.push({ timestamp: baselineTs, equity: baselineEquity, trade: "Baseline", pnl: 0 });
 
       let runningEquity = baselineEquity;
@@ -408,7 +373,6 @@ export async function registerRoutes(
         });
       }
 
-      // Add current point (live equity)
       const currentEquity = tradingEngine.getLastKnownEquity();
       if (currentEquity > 0) {
         curve.push({
@@ -441,7 +405,6 @@ export async function registerRoutes(
   });
 
   // ============ ACCOUNT INFO (proxied from Hyperliquid) ============
-  // Supports both Standard and Unified Account modes
   app.get("/api/account", async (req, res) => {
     const config = await storage.getConfig();
     if (!config?.walletAddress) {
@@ -471,14 +434,12 @@ export async function registerRoutes(
       const perpsData: any = await perpsResponse.json();
       const spotData: any = await spotResponse.json();
       
-      // Unified account: balance is in spot state, perps shows $0
       const perpsEquity = parseFloat(perpsData?.marginSummary?.accountValue || "0");
       const spotBalances = spotData?.balances || [];
       const usdcBalance = spotBalances.find((b: any) => b.coin === "USDC");
       const spotEquity = parseFloat(usdcBalance?.total || "0");
       const effectiveEquity = Math.max(perpsEquity, spotEquity);
       
-      // Override marginSummary with correct values for unified accounts
       if (spotEquity > perpsEquity) {
         perpsData.marginSummary = {
           ...perpsData.marginSummary,
@@ -546,36 +507,27 @@ export async function registerRoutes(
   // ============ MARKET OVERVIEW ============
   app.get("/api/market/overview", async (_req, res) => {
     try {
-      // Fetch both main perps and HIP-3 xyz dex
-      const [mainRes, xyzRes] = await Promise.all([
-        fetch("https://api.hyperliquid.xyz/info", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type: "metaAndAssetCtxs" }),
-        }),
-        fetch("https://api.hyperliquid.xyz/info", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type: "metaAndAssetCtxs", dex: "xyz" }),
-        }),
-      ]);
+      const mainRes = await fetch("https://api.hyperliquid.xyz/info", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "metaAndAssetCtxs" }),
+      });
       const overview: any[] = [];
-      for (const resp of [mainRes, xyzRes]) {
-        const data: any = await resp.json();
-        if (data && data.length === 2) {
-          const universe = data[0]?.universe || [];
-          const ctxs = data[1] || [];
-          for (let i = 0; i < universe.length; i++) {
-            if (!ctxs[i]?.midPx || ctxs[i].midPx === "None") continue;
-            overview.push({
-              name: universe[i].name,
-              price: ctxs[i].midPx || "0",
-              volume24h: ctxs[i].dayNtlVlm || "0",
-              funding: ctxs[i].funding || "0",
-              openInterest: ctxs[i].openInterest || "0",
-              change24h: ctxs[i].prevDayPx
-                ? (((parseFloat(ctxs[i].midPx) - parseFloat(ctxs[i].prevDayPx)) / parseFloat(ctxs[i].prevDayPx)) * 100).toFixed(2)
-                : "0",
-            });
-          }
+      const data: any = await mainRes.json();
+      if (data && data.length === 2) {
+        const universe = data[0]?.universe || [];
+        const ctxs = data[1] || [];
+        for (let i = 0; i < universe.length; i++) {
+          if (!ctxs[i]?.midPx || ctxs[i].midPx === "None") continue;
+          overview.push({
+            name: universe[i].name,
+            price: ctxs[i].midPx || "0",
+            volume24h: ctxs[i].dayNtlVlm || "0",
+            funding: ctxs[i].funding || "0",
+            openInterest: ctxs[i].openInterest || "0",
+            change24h: ctxs[i].prevDayPx
+              ? (((parseFloat(ctxs[i].midPx) - parseFloat(ctxs[i].prevDayPx)) / parseFloat(ctxs[i].prevDayPx)) * 100).toFixed(2)
+              : "0",
+          });
         }
       }
       res.json(overview);
@@ -584,36 +536,7 @@ export async function registerRoutes(
     }
   });
 
-  // ============ AIWEEKLY STRATEGY ============
-  app.get("/api/aiweekly/status", async (_req, res) => {
-    const latest = await storage.getLatestAiweeklyResearch();
-    const openTrades = await storage.getOpenTrades();
-    const aiweeklyTrades = openTrades.filter((t: any) => t.strategy === "aiweekly");
-    const allTrades = await storage.getAllTrades(500);
-    const aiweeklyClosed = allTrades.filter((t: any) => t.strategy === "aiweekly" && t.status === "closed");
-
-    const totalPnl = aiweeklyClosed.reduce((s: number, t: any) => s + (t.hlPnlUsd || 0), 0);
-    const wins = aiweeklyClosed.filter((t: any) => (t.hlPnlUsd || 0) > 0).length;
-
-    res.json({
-      hasApiKey: !!process.env.PERPLEXITY_API_KEY,
-      latestCycle: latest || null,
-      openPositions: aiweeklyTrades.length,
-      totalClosed: aiweeklyClosed.length,
-      totalPnlUsd: parseFloat(totalPnl.toFixed(2)),
-      winRate: aiweeklyClosed.length > 0 ? parseFloat(((wins / aiweeklyClosed.length) * 100).toFixed(1)) : 0,
-      stocks: AIWEEKLY_STOCKS.map(s => s.coin),
-      commodities: AIWEEKLY_COMMODITIES.map(c => c.coin),
-    });
-  });
-
-  app.post("/api/aiweekly/trigger", async (_req, res) => {
-    const result = await tradingEngine.triggerAiweeklyResearch();
-    res.json(result);
-  });
-
   // ============ AUTO-START ON DEPLOY ============
-  // If the engine was running before a deploy/restart, auto-resume it
   (async () => {
     try {
       const config = await storage.getConfig();
