@@ -377,7 +377,7 @@ export async function registerRoutes(
       for (const t of closedAfterBaseline) {
         const tradePnl = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
         runningEquity += tradePnl;
-        const stratTag = t.strategy === "divergence" ? " [DIV]" : t.strategy === "rsi18" ? " [RSI18]" : "";
+        const stratTag = " [RSI18]";
         curve.push({
           timestamp: t.closedAt || t.openedAt,
           equity: parseFloat(runningEquity.toFixed(2)),
