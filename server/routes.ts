@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import { type Server } from "http";
 import { storage } from "./storage";
-import { tradingEngine } from "./trading-engine";
+import { tradingEngine, OIL_ASSET } from "./trading-engine";
 import { getLearningStats, reviewClosedTrades, generateInsights, run24hReview } from "./learning-engine";
 import { insertBotConfigSchema } from "@shared/schema";
 import { WebSocketServer, WebSocket } from "ws";
@@ -154,7 +154,7 @@ export async function registerRoutes(
   });
 
   // ============ STRATEGY STATS ============
-  // v15.0: Dual strategy — B&R + OBOS — fresh start
+  // v15.1: Triple strategy — B&R + OBOS + Oil News
   const V15_START = "2026-04-20T12:00:00.000Z";
 
   app.get("/api/strategies", async (req, res) => {
@@ -180,6 +180,7 @@ export async function registerRoutes(
 
     const brBucket = makeBucket();
     const obosBucket = makeBucket();
+    const oilBucket = makeBucket();
 
     const closedTrades = allTrades
       .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V15_START)
@@ -187,7 +188,7 @@ export async function registerRoutes(
 
     for (const t of closedTrades) {
       const pnl = t.hlPnlUsd ?? 0;
-      const bucket = (t.strategy === "breakout" || t.strategy === "trendline") ? brBucket : obosBucket;
+      const bucket = t.strategy === "oil_news" ? oilBucket : ((t.strategy === "breakout" || t.strategy === "trendline") ? brBucket : obosBucket);
 
       bucket.trades.push(t);
       bucket.totalPnl += pnl;
@@ -234,6 +235,7 @@ export async function registerRoutes(
     const openTrades = allTrades.filter((t: any) => t.status === "open");
     const openBr = openTrades.filter((t: any) => t.strategy === "breakout" || t.strategy === "trendline").length;
     const openObos = openTrades.filter((t: any) => t.strategy === "obos").length;
+    const openOil = openTrades.filter((t: any) => t.strategy === "oil_news").length;
 
     const raceStartMs = new Date(V15_START).getTime();
     const raceHours = parseFloat(((Date.now() - raceStartMs) / 3600000).toFixed(1));
@@ -264,6 +266,7 @@ export async function registerRoutes(
     const result = [
       formatBucket(brBucket, "breakout", "Breakout & Retest (BTC)", openBr),
       formatBucket(obosBucket, "obos", "Overbought / Oversold (BTC)", openObos),
+      formatBucket(oilBucket, "oil_news", "Oil News Sentiment (WTI)", openOil),
     ];
 
     res.json({ raceStartedAt: V15_START, raceHours, strategies: result });
@@ -328,11 +331,16 @@ export async function registerRoutes(
         const leverage = parseInt(pos.leverage?.value || "1");
         const equity = tradingEngine.getLastKnownEquity();
         const actualNotional = sz * entryPrice;
-        // Default to obos strategy for synced positions
-        const strategy = "obos";
-        const tp = side === "long" ? entryPrice * 1.0045 : entryPrice * 0.9955; // TP +0.45%
-        const sl = side === "long" ? entryPrice * 0.995 : entryPrice * 1.005; // SL -0.5%
-        const tpLabel = "+0.45%";
+        // Determine strategy from coin
+        const isOil = coin === OIL_ASSET.coin;
+        const strategy = isOil ? "oil_news" : "obos";
+        const tp = isOil
+          ? (side === "long" ? entryPrice * 1.05 : entryPrice * 0.95)   // TP +5%
+          : (side === "long" ? entryPrice * 1.0045 : entryPrice * 0.9955); // TP +0.45%
+        const sl = isOil
+          ? (side === "long" ? entryPrice * 0.98 : entryPrice * 1.02)   // SL -2%
+          : (side === "long" ? entryPrice * 0.995 : entryPrice * 1.005); // SL -0.5%
+        const tpLabel = isOil ? "+5%" : "+0.45%";
         const trade = await storage.createTrade({
           coin, side, entryPrice, size: 50, leverage,
           entryEquity: equity,
@@ -353,7 +361,7 @@ export async function registerRoutes(
         await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id} | SL $${sl.toFixed(2)} | TP $${tp.toFixed(2)} | ${strategy.toUpperCase()}`, timestamp: new Date().toISOString() });
       }
       broadcast({ type: "status", data: await tradingEngine.getStatus() });
-      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v15.0: B&R + OBOS)` });
+      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v15.1: B&R + OBOS + Oil)` });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -395,7 +403,7 @@ export async function registerRoutes(
       for (const t of closedAfterBaseline) {
         const tradePnl = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
         runningEquity += tradePnl;
-        const stratTag = (t.strategy === "breakout" || t.strategy === "trendline") ? " [B&R]" : " [OBOS]";
+        const stratTag = t.strategy === "oil_news" ? " [OIL]" : ((t.strategy === "breakout" || t.strategy === "trendline") ? " [B&R]" : " [OBOS]");
         curve.push({
           timestamp: t.closedAt || t.openedAt,
           equity: parseFloat(runningEquity.toFixed(2)),

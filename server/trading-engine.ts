@@ -1,26 +1,38 @@
 /**
- * HyperTrader — Trading Engine v15.0
+ * HyperTrader — Trading Engine v15.1
  *
- * DUAL STRATEGY: Breakout & Retest + Overbought/Oversold
+ * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
  * STRATEGY A — Breakout & Retest (TV Webhook):
  *   - BTC only — LONG only
- *   - 50% of equity, max leverage, max 1 position
+ *   - 1/3 of (equity - $100) for margin, max leverage, max 1 position
  *   - Signals from TradingView AlgoAlpha Breakout & Retest webhook
  *   - SL -0.35%, TP +0.35%
  *   - No BE rule
  *
  * STRATEGY B — Overbought / Oversold (RSI):
  *   - BTC only — LONG + SHORT
- *   - 50% of equity, max leverage, max 1 position
+ *   - 1/3 of (equity - $100) for margin, max leverage, max 1 position
  *   - LONG: 5m RSI ≤ 15 OR 15m RSI ≤ 15
  *   - SHORT: 5m RSI ≥ 88 OR 15m RSI ≥ 88
  *   - SL -0.5%, TP +0.45%
  *   - BE rule: after +0.3% profit → move SL to +0.2% (profit zone)
  *
+ * STRATEGY C — Oil News Sentiment:
+ *   - WTI Crude Oil (xyz:CL) via XYZ DEX perps — LONG + SHORT
+ *   - $100 fixed allocation, 20x leverage, isolated margin
+ *   - Every 15 min: Sonar API scans macro/political news → sentiment → direction
+ *   - SL -2%, TP +5%, no BE
+ *   - Max 1 position, 1-hour cooldown after loss
+ *   - Confidence threshold: ≥ 7/10 to trade
+ *
+ * Equity Split:
+ *   - Oil gets $100 fixed
+ *   - Remaining (equity - $100) splits equally: B&R 50% / OBOS 50%
+ *
  * Shared:
- *   - 50/50 equity split
- *   - Scan every 5 seconds
+ *   - Scan every 5 seconds (BTC strategies)
+ *   - Oil scans every 15 minutes (separate timer)
  *   - Cancel all orders on close (ghost position prevention)
  *   - Orphan detector on startup
  *   - SL + TP orders placed on HL immediately at fill
@@ -52,8 +64,151 @@ const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",  displayName: "Bitcoin",     dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
 ];
 
+// Oil asset — XYZ DEX perp (separate from ALLOWED_ASSETS to avoid BTC scan logic)
+const OIL_ASSET: AssetConfig = {
+  coin: "xyz:CL", displayName: "WTI Crude Oil", dex: "xyz", maxLeverage: 20, szDecimals: 3,
+  category: "commodity", minNotional: 10, isolatedOnly: true,
+};
+
+// All tradeable assets (for orphan detection)
+const ALL_TRADEABLE_COINS = [...ALLOWED_ASSETS.map(a => a.coin), OIL_ASSET.coin];
+
 // ============ STRATEGY TYPE ============
-type StrategyType = "breakout" | "obos";
+type StrategyType = "breakout" | "obos" | "oil_news";
+
+// ============ OIL NEWS SENTIMENT ============
+
+const OIL_SCAN_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const OIL_FIXED_CAPITAL = 100; // $100 fixed allocation
+const OIL_LEVERAGE = 20;
+const OIL_TP_PCT = 0.05;  // +5%
+const OIL_SL_PCT = 0.02;  // -2%
+const OIL_CONFIDENCE_THRESHOLD = 7;
+const OIL_LOSS_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour after loss
+
+interface OilSentiment {
+  direction: "long" | "short" | "skip";
+  confidence: number;
+  headlines: string[];
+  reasoning: string;
+}
+
+async function fetchOilSentiment(apiKey: string): Promise<OilSentiment> {
+  const systemPrompt = `You are an elite commodities analyst specializing in crude oil markets. Your job is to evaluate the latest macroeconomic, geopolitical, and energy market news and determine the short-term directional bias for WTI crude oil.
+
+Focus on:
+- OPEC+ decisions, production cuts/increases
+- Middle East geopolitical tensions (Iran, Saudi, Iraq)
+- US inventory data (EIA, API reports)
+- US Dollar strength/weakness (DXY)
+- China demand signals
+- Sanctions, trade wars, embargoes
+- Hurricane/weather disruptions to Gulf production
+- Fed policy / interest rate expectations
+- Recession signals or economic growth data
+- Russia-Ukraine conflict energy implications
+
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no explanation outside JSON):
+{
+  "direction": "long" | "short" | "skip",
+  "confidence": 1-10,
+  "headlines": ["headline1", "headline2", "headline3"],
+  "reasoning": "2-3 sentence explanation of the directional thesis"
+}
+
+Rules:
+- "skip" if no clear directional signal or mixed signals
+- confidence 1-4 = weak signal, 5-6 = moderate, 7-8 = strong, 9-10 = very strong
+- Only return "long" or "short" with confidence >= 5
+- Search for news from the past 2-4 hours specifically`;
+
+  const prompt = `Search for the latest macro, geopolitical, and energy market news from the past 2-4 hours. Evaluate the combined sentiment specifically for WTI crude oil price direction over the next 1-4 hours.
+
+Return ONLY the JSON object. No markdown code blocks.`;
+
+  try {
+    const res = await fetch("https://api.perplexity.ai/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "perplexity/sonar",
+        input: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: prompt },
+        ],
+        max_output_tokens: 1024,
+        tools: [{ type: "web_search" }],
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      log(`[OIL NEWS] Sonar API error: ${res.status} ${errText.slice(0, 300)}`, "engine");
+      return { direction: "skip", confidence: 0, headlines: [], reasoning: `API error: ${res.status}` };
+    }
+
+    const data: any = await res.json();
+    let text = "";
+    if (data.output && Array.isArray(data.output)) {
+      for (const block of data.output) {
+        if (block.type === "message" && block.content) {
+          for (const c of block.content) {
+            if (c.type === "output_text") text = c.text;
+          }
+        }
+      }
+    }
+    if (!text && data.output_text) text = data.output_text;
+    if (!text) {
+      log(`[OIL NEWS] No text output from Sonar`, "engine");
+      return { direction: "skip", confidence: 0, headlines: [], reasoning: "No output" };
+    }
+
+    // Parse JSON
+    let jsonStr = text.trim();
+    if (jsonStr.startsWith("```")) {
+      jsonStr = jsonStr.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
+    }
+    const parsed = JSON.parse(jsonStr);
+
+    const direction = parsed.direction === "long" || parsed.direction === "short" ? parsed.direction : "skip";
+    const confidence = typeof parsed.confidence === "number" ? Math.min(10, Math.max(0, parsed.confidence)) : 0;
+    const headlines = Array.isArray(parsed.headlines) ? parsed.headlines.slice(0, 5) : [];
+    const reasoning = String(parsed.reasoning || "").slice(0, 500);
+
+    log(`[OIL NEWS] Sonar verdict: ${direction.toUpperCase()} confidence=${confidence}/10 | ${reasoning.slice(0, 100)}`, "engine");
+    return { direction, confidence, headlines, reasoning };
+  } catch (e) {
+    log(`[OIL NEWS] Sentiment fetch error: ${e}`, "engine");
+    return { direction: "skip", confidence: 0, headlines: [], reasoning: `Error: ${e}` };
+  }
+}
+
+async function fetchXyzMidPrice(coin: string): Promise<number> {
+  try {
+    const res = await fetch(HL_INFO_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "metaAndAssetCtxs", dex: "xyz" }),
+    });
+    const data: any = await res.json();
+    if (!data || data.length < 2) return 0;
+    const universe = data[0]?.universe || [];
+    const ctxs = data[1] || [];
+    for (let i = 0; i < universe.length; i++) {
+      if (universe[i].name === coin && ctxs[i]?.midPx && ctxs[i].midPx !== "None") {
+        return parseFloat(ctxs[i].midPx);
+      }
+    }
+    return 0;
+  } catch (e) {
+    log(`[OIL] XYZ mid price error for ${coin}: ${e}`, "engine");
+    return 0;
+  }
+}
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -278,7 +433,9 @@ function getSessionInfo(): { session: string; isHighVolume: boolean; description
 
 class TradingEngine {
   private scanTimer: NodeJS.Timeout | null = null;
+  private oilScanTimer: NodeJS.Timeout | null = null;
   private isScanning = false;
+  private isOilScanning = false;
   private lastKnownEquity = 0;
   private startingEquity = 0;
   private dayStartEquity = 0;
@@ -286,6 +443,7 @@ class TradingEngine {
   private dailyTradeCount = 0;
   private dailyTradeDate = "";
   private scanCount = 0;
+  private oilScanCount = 0;
   private lastLearningReview = 0;
   private pnlResetTimestamp = "";
   private pnlResetEquity = 0;
@@ -302,6 +460,10 @@ class TradingEngine {
 
   // OBOS BE tracking — track whether BE has been applied per tradeId
   private beApplied: Set<number> = new Set();
+
+  // Oil News strategy state
+  private oilLossCooldownUntil = 0; // timestamp: don't trade oil until this time
+  private lastOilSentiment: OilSentiment | null = null;
 
   private resetLossTrackers() {
     this.dailyTradeCount = 0;
@@ -323,7 +485,7 @@ class TradingEngine {
       }
     }
 
-    // v15.0: Force fresh P&L baseline on v15 deploy
+    // v15.1: Force fresh P&L baseline on v15 deploy
     const V15_DEPLOY = "2026-04-20T12:00:00.000Z";
     if (!config.pnlBaselineTimestamp || config.pnlBaselineTimestamp < V15_DEPLOY) {
       this.pnlResetTimestamp = new Date().toISOString();
@@ -333,7 +495,7 @@ class TradingEngine {
         pnlBaselineEquity: this.lastKnownEquity,
         pnlBaselineTimestamp: this.pnlResetTimestamp,
       });
-      log(`[v15.0] Fresh start — P&L baseline reset to $${this.lastKnownEquity.toFixed(2)}`, "engine");
+      log(`[v15.1] Fresh start — P&L baseline reset to $${this.lastKnownEquity.toFixed(2)}`, "engine");
     } else {
       this.pnlResetTimestamp = config.pnlBaselineTimestamp;
       this.pnlResetEquity = config.pnlBaselineEquity;
@@ -347,8 +509,8 @@ class TradingEngine {
       this.lastLearningReview = new Date(lastReviewTime).getTime();
     }
 
-    // Clean stale scan rows for coins no longer in ALLOWED_ASSETS
-    await storage.deleteScansNotIn(ALLOWED_ASSETS.map(a => a.coin));
+    // Clean stale scan rows for coins no longer in allowed list
+    await storage.deleteScansNotIn(ALL_TRADEABLE_COINS);
 
     // SAFETY: Orphan position detector — close HL positions not tracked in DB
     if (config.apiSecret && config.walletAddress) {
@@ -372,7 +534,7 @@ class TradingEngine {
             const isBuy = parseFloat(pos.szi) < 0;
             const midPx = parseFloat(pos.entryPx);
             const closePx = isBuy ? midPx * 1.05 : midPx * 0.95;
-            const ac = ALLOWED_ASSETS.find(a => a.coin === pos.coin);
+            const ac = ALLOWED_ASSETS.find(a => a.coin === pos.coin) || (pos.coin === OIL_ASSET.coin ? OIL_ASSET : null);
             const szd = ac?.szDecimals ?? 2;
             await executor.placeOrder({
               coin: pos.coin, isBuy, sz,
@@ -391,15 +553,17 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.0 started | DUAL: B&R (TV webhook) + OBOS (RSI ≤15/≥88) | BTC only | 50/50 split | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v15.1 started | TRIPLE: B&R + OBOS (BTC) + Oil News (xyz:CL) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.0 started | DUAL: B&R + OBOS | BTC only — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.1 started | TRIPLE: B&R + OBOS + Oil News | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
+    this.scheduleOilScan();
   }
 
   async stop() {
     if (this.scanTimer) { clearTimeout(this.scanTimer); this.scanTimer = null; }
+    if (this.oilScanTimer) { clearTimeout(this.oilScanTimer); this.oilScanTimer = null; }
     await storage.createLog({ type: "system", message: "Trading engine stopped", timestamp: new Date().toISOString() });
   }
 
@@ -651,7 +815,11 @@ class TradingEngine {
         });
       }
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.0 DUAL: B&R + OBOS | BTC only | 50/50`, "engine");
+      // Equity split: $100 reserved for oil, rest split 50/50 between B&R and OBOS
+      const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
+      const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies * 0.50) / equity : 0;
+
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.1 TRIPLE: B&R + OBOS + Oil | BTC eq: $${equityForBtcStrategies.toFixed(0)} (${(btcStrategyPct*100).toFixed(0)}% each)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -705,7 +873,7 @@ class TradingEngine {
               asset,
               strategy: "breakout",
               side: "long",
-              equityPct: 0.50,
+              equityPct: btcStrategyPct,
               leverage: asset.maxLeverage,
               tpPct: 0.0035,         // +0.35%
               slPct: 0.0035,         // -0.35%
@@ -816,7 +984,7 @@ class TradingEngine {
                   asset,
                   strategy: "obos",
                   side: "long",
-                  equityPct: 0.50,
+                  equityPct: btcStrategyPct,
                   leverage: asset.maxLeverage,
                   tpPct: 0.0045,         // +0.45%
                   slPct: 0.005,          // -0.5%
@@ -855,7 +1023,7 @@ class TradingEngine {
                   asset,
                   strategy: "obos",
                   side: "short",
-                  equityPct: 0.50,
+                  equityPct: btcStrategyPct,
                   leverage: asset.maxLeverage,
                   tpPct: 0.0045,         // +0.45%
                   slPct: 0.005,          // -0.5%
@@ -879,7 +1047,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.0 DUAL: B&R + OBOS | BTC only`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.1 TRIPLE: B&R + OBOS + Oil`,
         timestamp: new Date().toISOString(),
       });
 
@@ -901,6 +1069,12 @@ class TradingEngine {
     if (!config) return;
     let openTrades = await storage.getOpenTrades();
     const mids: Record<string, string> = (await fetchAllMids()) || {};
+    // allMids doesn't include xyz DEX — fetch oil price separately if needed
+    const hasOilTrade = openTrades.some(t => t.coin === OIL_ASSET.coin);
+    if (hasOilTrade) {
+      const oilPrice = await fetchXyzMidPrice(OIL_ASSET.coin);
+      if (oilPrice > 0) mids[OIL_ASSET.coin] = String(oilPrice);
+    }
     const currentEquity = equity || this.lastKnownEquity || 0;
 
     // ============================================================
@@ -986,11 +1160,16 @@ class TradingEngine {
               status: "closed", closeReason: `Position closed on HL (sync) | P&L: $${netPnl.toFixed(2)} (from HL)`,
               closedAt: new Date().toISOString(),
             });
-            const stratLabel = trade.strategy === "breakout" || trade.strategy === "trendline" ? "B&R" : "OBOS";
-            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed [${stratLabel}] | HL P&L: $${netPnl.toFixed(2)}`, "engine");
+            const syncStratLabel = trade.strategy === "oil_news" ? "OIL" : (trade.strategy === "breakout" || trade.strategy === "trendline" ? "B&R" : "OBOS");
+            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed [${syncStratLabel}] | HL P&L: $${netPnl.toFixed(2)}`, "engine");
+            // Oil loss cooldown on sync close
+            if (trade.strategy === "oil_news" && netPnl < 0) {
+              this.oilLossCooldownUntil = Date.now() + OIL_LOSS_COOLDOWN_MS;
+              log(`[OIL NEWS] Sync loss ($${netPnl.toFixed(2)}) — cooldown 1 hour`, "engine");
+            }
             await storage.createLog({
               type: "trade_close",
-              message: `[SYNC] Auto-closed [${stratLabel}] ${trade.coin} ${trade.side} #${trade.id} | HL P&L: $${netPnl.toFixed(2)} USDC`,
+              message: `[SYNC] Auto-closed [${syncStratLabel}] ${trade.coin} ${trade.side} #${trade.id} | HL P&L: $${netPnl.toFixed(2)} USDC`,
               timestamp: new Date().toISOString(),
             });
           }
@@ -1013,12 +1192,13 @@ class TradingEngine {
     for (const trade of openTrades) {
       const currentPrice = parseFloat(mids[trade.coin] || "0");
       if (currentPrice === 0) continue;
-      const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
+      const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin) || (trade.coin === OIL_ASSET.coin ? OIL_ASSET : null);
       const szd = ac?.szDecimals ?? 2;
       const eqForTrade = (trade as any).entryEquity || currentEquity;
 
       const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
-      const stratLabel = isBreakout ? "B&R" : "OBOS";
+      const isOilNews = trade.strategy === "oil_news";
+      const stratLabel = isOilNews ? "OIL" : (isBreakout ? "B&R" : "OBOS");
       const isLong = trade.side === "long";
 
       // Read unrealizedPnl directly from HL position
@@ -1207,6 +1387,12 @@ class TradingEngine {
           equity: currentEquity, leverage: trade.leverage, strategy: (trade.strategy as StrategyType) || "obos",
         });
 
+        // Oil loss cooldown
+        if (trade.strategy === "oil_news" && pnlUsd < 0) {
+          this.oilLossCooldownUntil = Date.now() + OIL_LOSS_COOLDOWN_MS;
+          log(`[OIL NEWS] Loss detected ($${pnlUsd.toFixed(2)}) — cooldown 1 hour until ${new Date(this.oilLossCooldownUntil).toISOString()}`, "engine");
+        }
+
         await storage.createLog({
           type: "trade_close",
           message: `CLOSED [${stratLabel}] ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
@@ -1249,13 +1435,19 @@ class TradingEngine {
     if (!trade || trade.status !== "open") return null;
 
     const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
-    const stratLabel = isBreakout ? "B&R" : "OBOS";
+    const isOilNews = trade.strategy === "oil_news";
+    const stratLabel = isOilNews ? "OIL" : (isBreakout ? "B&R" : "OBOS");
     const tradeStrategy = (trade.strategy as StrategyType) || "obos";
     const isLong = trade.side === "long";
 
     const mids: Record<string, string> = (await fetchAllMids()) || {};
+    // Fetch xyz mid for oil if needed
+    if (trade.coin === OIL_ASSET.coin) {
+      const oilPx = await fetchXyzMidPrice(OIL_ASSET.coin);
+      if (oilPx > 0) mids[OIL_ASSET.coin] = String(oilPx);
+    }
     const currentPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
-    const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
+    const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin) || (trade.coin === OIL_ASSET.coin ? OIL_ASSET : null);
     const config = await storage.getConfig();
 
     this.beApplied.delete(tradeId);
@@ -1396,6 +1588,151 @@ class TradingEngine {
 
   async forceScan() { await this.runScanCycle(); }
 
+  // ============ OIL NEWS SCAN CYCLE (every 15 min) ============
+
+  private async scheduleOilScan() {
+    const config = await storage.getConfig();
+    if (!config?.isRunning) return;
+    // First oil scan after 30 seconds (let BTC strategies initialize first)
+    const delay = this.oilScanCount === 0 ? 30_000 : OIL_SCAN_INTERVAL_MS;
+    this.oilScanTimer = setTimeout(() => this.runOilScanCycle(), delay);
+  }
+
+  private async runOilScanCycle() {
+    if (this.isOilScanning) return;
+    this.isOilScanning = true;
+    this.oilScanCount++;
+
+    try {
+      const config = await storage.getConfig();
+      if (!config?.isRunning) { this.isOilScanning = false; return; }
+
+      const pplxKey = process.env.PERPLEXITY_API_KEY || "";
+      if (!pplxKey) {
+        log(`[OIL NEWS] No PERPLEXITY_API_KEY set — skipping oil scan`, "engine");
+        this.isOilScanning = false;
+        this.scheduleOilScan();
+        return;
+      }
+
+      const equity = await this.refreshEquity();
+      const openTrades = await storage.getOpenTrades();
+      const oilOpen = openTrades.filter(t => t.strategy === "oil_news");
+
+      log(`[OIL NEWS] Scan #${this.oilScanCount} | AUM: $${equity.toFixed(0)} | Oil positions: ${oilOpen.length}/1`, "engine");
+
+      // Skip if already in an oil position
+      if (oilOpen.length >= 1) {
+        log(`[OIL NEWS] Already have oil position — skipping sentiment check`, "engine");
+        await storage.createLog({
+          type: "scan",
+          message: `[OIL NEWS] Scan #${this.oilScanCount}: skip (position open) | AUM: $${equity.toFixed(0)}`,
+          timestamp: new Date().toISOString(),
+        });
+        this.isOilScanning = false;
+        this.scheduleOilScan();
+        return;
+      }
+
+      // Check cooldown after loss
+      if (Date.now() < this.oilLossCooldownUntil) {
+        const remainMin = ((this.oilLossCooldownUntil - Date.now()) / 60000).toFixed(1);
+        log(`[OIL NEWS] Cooldown active — ${remainMin} min remaining`, "engine");
+        await storage.createLog({
+          type: "scan",
+          message: `[OIL NEWS] Scan #${this.oilScanCount}: cooldown (${remainMin}m left) | AUM: $${equity.toFixed(0)}`,
+          timestamp: new Date().toISOString(),
+        });
+        this.isOilScanning = false;
+        this.scheduleOilScan();
+        return;
+      }
+
+      // Check we have enough equity for oil
+      if (equity < OIL_FIXED_CAPITAL + 20) {
+        log(`[OIL NEWS] Equity $${equity.toFixed(0)} too low for $${OIL_FIXED_CAPITAL} oil allocation`, "engine");
+        this.isOilScanning = false;
+        this.scheduleOilScan();
+        return;
+      }
+
+      // Fetch sentiment from Sonar
+      const sentiment = await fetchOilSentiment(pplxKey);
+      this.lastOilSentiment = sentiment;
+
+      await storage.createLog({
+        type: "system",
+        message: `[OIL NEWS] Sonar: ${sentiment.direction.toUpperCase()} confidence=${sentiment.confidence}/10 | ${sentiment.reasoning.slice(0, 150)}`,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Check if signal is strong enough
+      if (sentiment.direction === "skip" || sentiment.confidence < OIL_CONFIDENCE_THRESHOLD) {
+        log(`[OIL NEWS] No trade — direction=${sentiment.direction} confidence=${sentiment.confidence} (need ≥${OIL_CONFIDENCE_THRESHOLD})`, "engine");
+        await storage.createLog({
+          type: "scan",
+          message: `[OIL NEWS] Scan #${this.oilScanCount}: no trade (${sentiment.direction} conf=${sentiment.confidence}) | AUM: $${equity.toFixed(0)}`,
+          timestamp: new Date().toISOString(),
+        });
+        this.isOilScanning = false;
+        this.scheduleOilScan();
+        return;
+      }
+
+      // Get current oil price
+      const oilPrice = await fetchXyzMidPrice(OIL_ASSET.coin);
+      if (oilPrice <= 0) {
+        log(`[OIL NEWS] Cannot get oil price — skipping`, "engine");
+        this.isOilScanning = false;
+        this.scheduleOilScan();
+        return;
+      }
+
+      // Execute oil trade
+      const side = sentiment.direction as "long" | "short";
+      const capitalPct = OIL_FIXED_CAPITAL / equity; // e.g. $100/$325 = 0.307
+
+      const entryReason = `OIL NEWS: ${side.toUpperCase()} conf=${sentiment.confidence}/10 | ${sentiment.reasoning.slice(0, 80)}`;
+
+      const entered = await this.executeEntry({
+        asset: OIL_ASSET,
+        strategy: "oil_news",
+        side,
+        equityPct: capitalPct,
+        leverage: OIL_LEVERAGE,
+        tpPct: OIL_TP_PCT,    // +5%
+        slPct: OIL_SL_PCT,    // -2%
+        rsi5m: 50, rsi15m: 50, triggerRSI: 0,
+        price: oilPrice,
+        equity,
+        entryReason,
+        config,
+      });
+
+      if (entered) {
+        this.dailyTradeCount++;
+        log(`[OIL NEWS] Entered ${side.toUpperCase()} xyz:CL @ $${oilPrice.toFixed(2)} | confidence=${sentiment.confidence}`, "engine");
+      } else {
+        log(`[OIL NEWS] Entry failed for ${side.toUpperCase()} xyz:CL`, "engine");
+        // Don't cooldown on entry failure — might be a temporary issue
+      }
+
+      await storage.createLog({
+        type: "scan",
+        message: `[OIL NEWS] Scan #${this.oilScanCount}: ${entered ? "ENTERED" : "FAILED"} ${side.toUpperCase()} xyz:CL @ $${oilPrice.toFixed(2)} conf=${sentiment.confidence} | AUM: $${equity.toFixed(0)}`,
+        timestamp: new Date().toISOString(),
+      });
+
+    } catch (e) {
+      const stack = e instanceof Error ? e.stack : String(e);
+      log(`[OIL NEWS] Scan error: ${stack}`, "engine");
+      await storage.createLog({ type: "error", message: `[OIL NEWS] Scan error: ${stack}`.slice(0, 500), timestamp: new Date().toISOString() }).catch(() => {});
+    }
+
+    this.isOilScanning = false;
+    this.scheduleOilScan();
+  }
+
   getLastKnownEquity(): number {
     return this.lastKnownEquity;
   }
@@ -1461,7 +1798,8 @@ class TradingEngine {
       const pnlUsd = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
       const pnlOfAum = eqForT > 0 ? (pnlUsd / eqForT) * 100 : 0;
       const isBreakout = t.strategy === "breakout" || t.strategy === "trendline";
-      const stratBadge = isBreakout ? "B&R" : "OBOS";
+      const isOilNews = t.strategy === "oil_news";
+      const stratBadge = isOilNews ? "OIL" : (isBreakout ? "B&R" : "OBOS");
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)), stratBadge };
     });
 
@@ -1478,6 +1816,13 @@ class TradingEngine {
     const obosWinRate = obosTrades.length > 0 ? (obosWins / obosTrades.length) * 100 : 0;
     const obosPnlUsd = obosTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
     const obosPnlOfAum = startEq > 0 ? (obosPnlUsd / startEq) * 100 : 0;
+
+    // Strategy C: Oil News stats
+    const oilTrades = activeClosedTrades.filter(t => t.strategy === "oil_news");
+    const oilWins = oilTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
+    const oilWinRate = oilTrades.length > 0 ? (oilWins / oilTrades.length) * 100 : 0;
+    const oilPnlUsd = oilTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
+    const oilPnlOfAum = startEq > 0 ? (oilPnlUsd / startEq) * 100 : 0;
 
     return {
       isRunning: config?.isRunning || false,
@@ -1504,8 +1849,10 @@ class TradingEngine {
       startingEquity: startEq.toFixed(2),
       pnlResetTimestamp: this.pnlResetTimestamp || null,
       learningStats: stats,
-      allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
+      allowedAssets: [...ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })), { coin: OIL_ASSET.coin, name: OIL_ASSET.displayName, category: OIL_ASSET.category, maxLev: OIL_ASSET.maxLeverage }],
       openTradesWithUsd,
+      lastOilSentiment: this.lastOilSentiment,
+      oilScanCount: this.oilScanCount,
       strategyStats: {
         breakout: {
           trades: brTrades.length,
@@ -1524,7 +1871,18 @@ class TradingEngine {
           pnlOfAum: obosPnlOfAum.toFixed(3),
           status: "active",
           direction: "LONG + SHORT",
-          riskReward: "SL -0.5% / TP +0.45% / BE @ +0.3%→+0.2%",
+          riskReward: "SL -0.5% / TP +0.45% / BE @ +0.3%\u2192+0.2%",
+        },
+        oil_news: {
+          trades: oilTrades.length,
+          winRate: oilWinRate.toFixed(1),
+          openPositions: openTrades.filter(t => t.strategy === "oil_news").length,
+          pnlUsd: oilPnlUsd.toFixed(4),
+          pnlOfAum: oilPnlOfAum.toFixed(3),
+          status: "active",
+          asset: "xyz:CL (WTI)",
+          allocation: `$${OIL_FIXED_CAPITAL} fixed`,
+          riskReward: "SL -2% / TP +5%",
         },
       },
     };
@@ -1532,4 +1890,4 @@ class TradingEngine {
 }
 
 export const tradingEngine = new TradingEngine();
-export { ALLOWED_ASSETS };
+export { ALLOWED_ASSETS, OIL_ASSET };

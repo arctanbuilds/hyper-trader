@@ -65,6 +65,7 @@ export default function Dashboard() {
   });
   const brStrat = strategyData?.strategies?.find((s: any) => s.strategy === "breakout");
   const obosStrat = strategyData?.strategies?.find((s: any) => s.strategy === "obos");
+  const oilStrat = strategyData?.strategies?.find((s: any) => s.strategy === "oil_news");
   const raceHours = strategyData?.raceHours || 0;
 
   const triggerScan = useMutation({
@@ -103,6 +104,7 @@ export default function Dashboard() {
 
   const brOpen = status?.strategyStats?.breakout?.openPositions || 0;
   const obosOpenCount = status?.strategyStats?.obos?.openPositions || 0;
+  const oilOpenCount = status?.strategyStats?.oil_news?.openPositions || 0;
   const totalOpen = (status?.openPositions || 0);
 
   return (
@@ -112,7 +114,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v15.0 — B&R + OBOS (BTC)</p>
+            <p className="text-sm text-muted-foreground">v15.1 — B&R + OBOS (BTC) + Oil News (WTI)</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -180,10 +182,10 @@ export default function Dashboard() {
               <Activity className="w-4 h-4 text-muted-foreground" />
             </div>
             <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
-              {totalOpen} / 2
+              {totalOpen} / 3
             </div>
             <p className="text-[10px] text-muted-foreground mt-1">
-              B&R: {brOpen}/1 | OBOS: {obosOpenCount}/1
+              B&R: {brOpen}/1 | OBOS: {obosOpenCount}/1 | Oil: {oilOpenCount}/1
             </p>
           </CardContent>
         </Card>
@@ -204,8 +206,8 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* ========== DUAL STRATEGY STATS ========== */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {/* ========== TRIPLE STRATEGY STATS ========== */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* B&R Strategy */}
         <Card>
           <CardHeader className="pb-3">
@@ -213,7 +215,7 @@ export default function Dashboard() {
               <div>
                 <CardTitle className="text-sm font-medium">Breakout & Retest</CardTitle>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  BTC | LONG | TV Webhook | 50% equity | SL -0.35% | TP +0.35%
+                  BTC | LONG | TV Webhook | SL -0.35% | TP +0.35%
                 </p>
               </div>
               <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-blue-500/10 text-blue-400 border-blue-500/30">
@@ -222,7 +224,7 @@ export default function Dashboard() {
             </div>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 gap-2">
               <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
                 <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
                 <div className="text-sm font-semibold font-mono text-blue-400">
@@ -270,7 +272,7 @@ export default function Dashboard() {
               <div>
                 <CardTitle className="text-sm font-medium">Overbought / Oversold</CardTitle>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  BTC | L+S | RSI ≤15/≥88 | 50% eq | SL -0.5% | TP +0.45% | BE +0.3%→+0.2%
+                  BTC | L+S | RSI ≤15/≥88 | SL -0.5% | TP +0.45% | BE
                 </p>
               </div>
               <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-amber-500/10 text-amber-400 border-amber-500/30">
@@ -279,7 +281,7 @@ export default function Dashboard() {
             </div>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 gap-2">
               <div className="p-2 rounded bg-amber-500/5 border border-amber-500/20">
                 <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
                 <div className="text-sm font-semibold font-mono text-amber-400">
@@ -319,6 +321,84 @@ export default function Dashboard() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Oil News Strategy */}
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <CardTitle className="text-sm font-medium">Oil News Sentiment</CardTitle>
+                <p className="text-[10px] text-muted-foreground mt-0.5">
+                  WTI | L+S | Sonar 15m | $100 | SL -2% | TP +5%
+                </p>
+              </div>
+              <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                OIL
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
+                <div className="text-sm font-semibold font-mono text-emerald-400">
+                  {oilStrat?.totalTrades || 0}
+                </div>
+                <div className="text-[8px] text-muted-foreground">{oilStrat?.wins || 0}W / {oilStrat?.losses || 0}L</div>
+              </div>
+              <div className="p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Win Rate</div>
+                <div className="text-sm font-semibold font-mono text-emerald-400">
+                  {oilStrat?.winRate || 0}%
+                </div>
+                <div className="text-[8px] text-muted-foreground">PF: {(oilStrat?.profitFactor || 0) >= 999 ? "∞" : (oilStrat?.profitFactor || 0).toFixed(2)}</div>
+              </div>
+              <div className="p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Total P&L</div>
+                <div className={cn(
+                  "text-sm font-semibold font-mono",
+                  (oilStrat?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                )}>
+                  {(oilStrat?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(oilStrat?.totalPnlUsd || 0).toFixed(2)}
+                </div>
+                <div className="text-[8px] text-muted-foreground">
+                  {(oilStrat?.totalPnlPct || 0) >= 0 ? "+" : ""}{(oilStrat?.totalPnlPct || 0).toFixed(2)}% AUM
+                </div>
+              </div>
+              <div className="p-2 rounded bg-emerald-500/5 border border-emerald-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Avg / Trade</div>
+                <div className={cn(
+                  "text-sm font-semibold font-mono",
+                  (oilStrat?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                )}>
+                  {(oilStrat?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(oilStrat?.avgPnlPerTrade || 0).toFixed(2)}
+                </div>
+                <div className="text-[8px] text-muted-foreground">{oilStrat?.bestWinStreak || 0}W / {oilStrat?.worstLossStreak || 0}L streak</div>
+              </div>
+            </div>
+            {status?.lastOilSentiment && (
+              <div className="mt-2 p-2 rounded bg-muted/50 border border-border">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Last Sentiment</div>
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className={cn(
+                    "text-[9px] px-1 py-0",
+                    status.lastOilSentiment.direction === "LONG" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" :
+                    status.lastOilSentiment.direction === "SHORT" ? "bg-red-500/10 text-red-400 border-red-500/30" :
+                    "bg-muted text-muted-foreground border-border"
+                  )}>
+                    {status.lastOilSentiment.direction}
+                  </Badge>
+                  <span className="text-[10px] font-mono text-muted-foreground">
+                    Confidence: {status.lastOilSentiment.confidence}/10
+                  </span>
+                </div>
+                <p className="text-[9px] text-muted-foreground mt-1 truncate">
+                  {status.lastOilSentiment.reasoning}
+                </p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       {/* Charts Row — Equity Curve */}
@@ -326,7 +406,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.0) | {raceDays} running</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.1) | {raceDays} running</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
@@ -394,10 +474,13 @@ export default function Dashboard() {
             <div className="space-y-2">
               {openTrades.map((trade: any) => {
                 const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
-                const stratLabel = isBreakout ? "B&R" : "OBOS";
-                const badgeBg = isBreakout
-                  ? "bg-blue-500/10 text-blue-400 border-blue-500/30"
-                  : "bg-amber-500/10 text-amber-400 border-amber-500/30";
+                const isOilNews = trade.strategy === "oil_news";
+                const stratLabel = isOilNews ? "OIL" : (isBreakout ? "B&R" : "OBOS");
+                const badgeBg = isOilNews
+                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                  : isBreakout
+                    ? "bg-blue-500/10 text-blue-400 border-blue-500/30"
+                    : "bg-amber-500/10 text-amber-400 border-amber-500/30";
                 const isLong = trade.side === "long";
                 return (
                   <div
@@ -471,8 +554,8 @@ export default function Dashboard() {
         </CardHeader>
         <CardContent>
           {(closedTrades as any[]).filter((t: any) => {
-            // Only show trades from v15.0 onwards
-            return t.strategy === "breakout" || t.strategy === "obos" || t.strategy === "trendline";
+            // Only show trades from v15.0+ onwards
+            return t.strategy === "breakout" || t.strategy === "obos" || t.strategy === "trendline" || t.strategy === "oil_news";
           }).length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
@@ -490,7 +573,7 @@ export default function Dashboard() {
                 </thead>
                 <tbody>
                   {(closedTrades as any[])
-                    .filter((t: any) => t.strategy === "breakout" || t.strategy === "obos" || t.strategy === "trendline")
+                    .filter((t: any) => t.strategy === "breakout" || t.strategy === "obos" || t.strategy === "trendline" || t.strategy === "oil_news")
                     .sort((a: any, b: any) => (b.closedAt || "").localeCompare(a.closedAt || ""))
                     .slice(0, 30)
                     .map((trade: any) => {
@@ -498,9 +581,10 @@ export default function Dashboard() {
                     const openDate = trade.openedAt ? new Date(trade.openedAt) : null;
                     const closeDate = trade.closedAt ? new Date(trade.closedAt) : null;
                     const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
+                    const isOilTrade = trade.strategy === "oil_news";
                     const isLong = trade.side === "long";
                     const reason = (trade.closeReason || "")
-                      .replace(/\[(B&R|OBOS)\]\s*/g, "")
+                      .replace(/\[(B&R|OBOS|OIL)\]\s*/g, "")
                       .replace(/\s*\|\s*HL P&L.*$/g, "")
                       .replace(/Position closed on HL \(sync\)\s*\|?\s*/g, "Sync")
                       .replace(/P&L:.*$/g, "")
@@ -531,10 +615,12 @@ export default function Dashboard() {
                             variant="outline"
                             className={cn(
                               "text-[9px] px-1 py-0",
-                              isBreakout ? "bg-blue-500/10 text-blue-400 border-blue-500/30" : "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                              isOilTrade ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                                : isBreakout ? "bg-blue-500/10 text-blue-400 border-blue-500/30"
+                                : "bg-amber-500/10 text-amber-400 border-amber-500/30"
                             )}
                           >
-                            {isBreakout ? "B&R" : "OBOS"}
+                            {isOilTrade ? "OIL" : isBreakout ? "B&R" : "OBOS"}
                           </Badge>
                         </td>
                         <td className="py-1.5 px-1 text-right font-mono">${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}</td>
