@@ -6,14 +6,13 @@
  * STRATEGY A — RSI16:
  *   - BTC, ETH, SOL — LONG only, RSI ≤ 16 on 5m OR 15m
  *   - 50% equity, max leverage, max 1 position
- *   - SL -0.35%, TP +0.45%, BE @ +0.25%
+ *   - SL -0.35%, TP +0.35%
  *
- * STRATEGY B — TRENDLINE (AI + TradingView webhook):
- *   - BTC, ETH, SOL — LONG only
+ * STRATEGY B — TRENDLINE (TradingView webhook):
+ *   - BTC — LONG only
  *   - 50% equity, max leverage, max 1 position
- *   - Signals from: (1) Claude AI via Perplexity API (2) TradingView webhook
- *   - SL -0.35%, TP +0.45%, BE @ +0.25%
- *   - AI scans every 30s (cost control), webhook instant
+ *   - Signals from TradingView AlgoAlpha Breakout & Retest
+ *   - SL -0.35%, TP +0.35%
  *
  * Shared:
  *   - Scan every 5 seconds (RSI18)
@@ -427,10 +426,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v14.3 started | DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL | SL -0.35% | TP +0.45% | BE @ +0.25% | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v14.3 started | DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL | SL -0.35% | TP +0.35% | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v14.3 started | DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL | SL -0.35% | TP +0.45% | BE @ +0.25% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v14.3 started | DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL | SL -0.35% | TP +0.35% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
 
@@ -515,7 +514,7 @@ class TradingEngine {
     const tpPctLabel = `+${(tpPct * 100).toFixed(1)}%`;
     const slPctLabel = customSL ? `SL @ $${sl.toFixed(1)}` : `SL -${(slPct * 100).toFixed(1)}%`;
 
-    log(`[${stratLabel}] ${asset.coin} ${side.toUpperCase()} @ $${price} | TP ${tpPctLabel} | ${slPctLabel} | BE @ +0.25% | ${leverage}x | ${entryReason}`, "engine");
+    log(`[${stratLabel}] ${asset.coin} ${side.toUpperCase()} @ $${price} | TP ${tpPctLabel} | ${slPctLabel} | ${leverage}x | ${entryReason}`, "engine");
 
     let fillPrice = price;
     let filledSz = 0;
@@ -589,7 +588,7 @@ class TradingEngine {
       confluenceDetails: `${stratLabel}: ${entryReason} | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`,
       riskRewardRatio: 1.0,
       status: "open",
-      reason: `[${stratLabel}] ${asset.coin} ${side.toUpperCase()} | ${entryReason} | ${slPctLabel} | TP ${tpPctLabel} | BE @ +0.25% | ${leverage}x`,
+      reason: `[${stratLabel}] ${asset.coin} ${side.toUpperCase()} | ${entryReason} | ${slPctLabel} | TP ${tpPctLabel} | ${leverage}x`,
       setupType: strategy,
       strategy,
       openedAt: new Date().toISOString(),
@@ -615,13 +614,13 @@ class TradingEngine {
 
     await logDecision({
       tradeId: trade.id, coin: asset.coin, action: "entry", side, price: fillPrice,
-      reasoning: `${stratLabel}: ${asset.coin} ${side.toUpperCase()} | ${entryReason} | SL $${actualSL.toFixed(2)} (${slPctLabel}) | TP $${actualTP.toFixed(2)} (${tpPctLabel}) | BE @ +0.25% | ${leverage}x | $${capitalForTrade.toFixed(0)} capital`,
+      reasoning: `${stratLabel}: ${asset.coin} ${side.toUpperCase()} | ${entryReason} | SL $${actualSL.toFixed(2)} (${slPctLabel}) | TP $${actualTP.toFixed(2)} (${tpPctLabel}) | ${leverage}x | $${capitalForTrade.toFixed(0)} capital`,
       equity, leverage, positionSizeUsd: capitalForTrade, strategy,
     });
 
     await storage.createLog({
       type: "trade_open",
-      message: `[${stratLabel}] ${asset.coin} ${side.toUpperCase()} @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | ${entryReason} | ${slPctLabel} | TP ${tpPctLabel} | BE @ +0.25% | $${capitalForTrade.toFixed(0)}`,
+      message: `[${stratLabel}] ${asset.coin} ${side.toUpperCase()} @ $${displayPrice(fillPrice, asset.szDecimals)} | ${leverage}x | ${entryReason} | ${slPctLabel} | TP ${tpPctLabel} | $${capitalForTrade.toFixed(0)}`,
       data: JSON.stringify(trade),
       timestamp: new Date().toISOString(),
     });
@@ -703,7 +702,7 @@ class TradingEngine {
       // STRATEGY A: RSI16 — BTC, ETH, SOL
       // Signal: 5m RSI ≤ 16 OR 15m RSI ≤ 16
       // LONG only, 50% equity, max leverage, max 1 position
-      // SL -0.35%, TP +0.45%, BE @ +0.25%
+      // SL -0.35%, TP +0.35%
       // ================================================================
       {
         const RSI_THRESHOLD = 16;
@@ -785,7 +784,7 @@ class TradingEngine {
                   side: "long",
                   equityPct: 0.50,
                   leverage: asset.maxLeverage,
-                  tpPct: 0.0045,         // +0.45%
+                  tpPct: 0.0035,         // +0.35%
                   slPct: 0.0035,         // -0.35%
                   rsi5m, rsi15m, triggerRSI, price, equity,
                   entryReason,
@@ -808,7 +807,7 @@ class TradingEngine {
       // STRATEGY B: TRENDLINE — TradingView Webhook Only
       // Signal: TradingView AlgoAlpha Breakout & Retest indicator
       // LONG only, 50% equity, max leverage, max 1 position
-      // SL -0.35%, TP +0.45%, BE @ +0.25%
+      // SL -0.35%, TP +0.35%
       // ================================================================
       if (this.pendingWebhookSignal && trendlineOpen.length < TRENDLINE_MAX_POSITIONS) {
         const ws = this.pendingWebhookSignal;
@@ -843,7 +842,7 @@ class TradingEngine {
                 side: "long",
                 equityPct: 0.50,
                 leverage: asset.maxLeverage,
-                tpPct: 0.0045,         // +0.45%
+                tpPct: 0.0035,         // +0.35%
                 slPct: 0.0035,         // -0.35%
                 rsi5m: 50, rsi15m: 50, triggerRSI: 0,
                 price, equity,
@@ -993,7 +992,7 @@ class TradingEngine {
 
     // ============================================================
     // OPEN TRADE MONITORING: read unrealizedPnl from HL + check TP/BE
-    // RSI18: LONG only, SL -0.5%, TP +0.5%, BE @ +0.25%
+    // RSI16: LONG only, SL -0.35%, TP +0.35% | TRENDLINE: LONG only, SL -0.35%, TP +0.35%
     // ============================================================
     for (const trade of openTrades) {
       const currentPrice = parseFloat(mids[trade.coin] || "0");
@@ -1021,53 +1020,7 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // Breakeven SL at +0.25%
-      // SL starts at -0.5% from entry — move to entry (BE) when price reaches +0.25%
-      const rawPricePct = isLong
-        ? (currentPrice - trade.entryPrice) / trade.entryPrice
-        : (trade.entryPrice - currentPrice) / trade.entryPrice;
-      const beSL = trade.entryPrice; // breakeven = entry price
-      const originalSL = isLong ? trade.entryPrice * 0.995 : trade.entryPrice * 1.005;
-      const slStillAtOriginal = trade.stopLoss > 0 && Math.abs(trade.stopLoss - originalSL) < trade.entryPrice * 0.001;
-
-      if (slStillAtOriginal && rawPricePct >= 0.0025) {
-        // Price moved +0.25% — activate BE SL at entry price
-        await storage.updateTrade(trade.id, { stopLoss: beSL });
-        trade.stopLoss = beSL;
-        log(`[BE SL] Trade #${trade.id} ${trade.coin} LONG [${stratLabel}] | Price +${(rawPricePct*100).toFixed(2)}% → BE SL activated @ $${displayPrice(beSL, szd)}`, "engine");
-
-        // Place stop-market SL on HL at entry price
-        if (config.apiSecret && config.walletAddress) {
-          try {
-            const executor = createExecutor(config.apiSecret, config.walletAddress);
-            // Cancel any existing orders for this coin
-            const openOrders = await executor.getOpenOrders();
-            for (const order of openOrders.filter((o: any) => o.coin === trade.coin)) {
-              await executor.cancelOrder(order.coin, order.oid);
-            }
-            // Place BE SL
-            const posFromMap = hlPosMap.get(trade.coin);
-            const sz = posFromMap ? Math.abs(parseFloat(posFromMap.szi || "0")) : 0;
-            if (sz > 0) {
-              const slTriggerPx = parseFloat(formatHLPrice(beSL, szd));
-              const slFillPx = parseFloat(formatHLPrice(isLong ? beSL * 0.98 : beSL * 1.02, szd));
-              await executor.placeOrder({
-                coin: trade.coin, isBuy: !isLong, sz, // opposite side to close
-                limitPx: slFillPx,
-                orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
-                reduceOnly: true,
-              });
-              log(`[BE SL] ${trade.coin} SL order placed @ $${slTriggerPx} (entry price, BE SL activated @ +0.25%) [${stratLabel}]`, "engine");
-            }
-          } catch (beErr) { log(`[BE SL] SL update error: ${beErr}`, "engine"); }
-        }
-
-        await storage.createLog({
-          type: "system",
-          message: `[${stratLabel}] BE SL activated @ +0.25% | ${trade.coin} LONG | SL now @ $${displayPrice(beSL, szd)}`,
-          timestamp: new Date().toISOString(),
-        });
-      }
+      // No BE rule — SL stays at original level until TP or SL hit
 
       // Exit checks
       let shouldClose = false;
@@ -1081,8 +1034,6 @@ class TradingEngine {
       const slActive = trade.stopLoss > 0;
       const slHit = slActive && (isLong ? currentPrice <= trade.stopLoss : currentPrice >= trade.stopLoss);
 
-      const isBE = slActive && Math.abs(trade.stopLoss - trade.entryPrice) < trade.entryPrice * 0.001; // SL is at or near entry = BE was activated
-
       const slPctFromEntry = trade.entryPrice > 0 ? (Math.abs(trade.stopLoss - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
 
       if (tpHit) {
@@ -1090,9 +1041,7 @@ class TradingEngine {
         closeReason = `[${stratLabel}] ${tpPctLabel} @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
       } else if (slHit) {
         shouldClose = true;
-        closeReason = isBE
-          ? `[${stratLabel}] SL @ BE $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`
-          : `[${stratLabel}] SL -${slPctFromEntry}% hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        closeReason = `[${stratLabel}] SL -${slPctFromEntry}% hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
         log(`[SL HIT] Trade #${trade.id} ${trade.coin} LONG [${stratLabel}] | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
       }
 
@@ -1131,7 +1080,7 @@ class TradingEngine {
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as "long" | "short", tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              const exitLabel = slHit ? (isBE ? "SL @ BE" : `SL -${slPctFromEntry}%`) : tpPctLabel;
+              const exitLabel = slHit ? `SL -${slPctFromEntry}%` : tpPctLabel;
               closeReason = `[${stratLabel}] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
