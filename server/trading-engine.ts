@@ -51,7 +51,7 @@ const ALLOWED_ASSETS: AssetConfig[] = [
 ];
 
 // ============ STRATEGY TYPE ============
-type StrategyType = "rsi18" | "trendline";
+type StrategyType = "rsi16" | "trendline";
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -497,7 +497,7 @@ class TradingEngine {
     customSL?: number;    // trendline invalidation price for custom SL
   }): Promise<boolean> {
     const { asset, strategy, side, equityPct, leverage, tpPct, slPct, rsi5m, rsi15m, triggerRSI, price, equity, entryReason, config, customSL } = params;
-    const stratLabel = strategy === "rsi18" ? "RSI18" : "TRENDLINE";
+    const stratLabel = strategy === "rsi16" ? "RSI16" : "TRENDLINE";
     const isBuy = side === "long";
 
     // Position sizing — equityPct of equity, at leverage
@@ -691,7 +691,7 @@ class TradingEngine {
 
       // Open positions
       const openTrades = await storage.getOpenTrades();
-      const rsi18Open = openTrades.filter(t => t.strategy === "rsi18");
+      const rsi18Open = openTrades.filter(t => t.strategy === "rsi16" || t.strategy === "rsi18");
       const trendlineOpen = openTrades.filter(t => t.strategy === "trendline");
 
       const RSI18_MAX_POSITIONS = 1;
@@ -781,7 +781,7 @@ class TradingEngine {
                 const entryReason = `RSI16: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ 16`;
                 const entered = await this.executeEntry({
                   asset,
-                  strategy: "rsi18",
+                  strategy: "rsi16",
                   side: "long",
                   equityPct: 0.50,
                   leverage: asset.maxLeverage,
@@ -1002,8 +1002,9 @@ class TradingEngine {
       const szd = ac?.szDecimals ?? 2;
       const eqForTrade = (trade as any).entryEquity || currentEquity;
 
-      const stratLabel = trade.strategy === "trendline" ? "TRENDLINE" : "RSI18";
-      const tpPctLabel = "TP +0.5%";
+      const stratLabel = trade.strategy === "trendline" ? "TRENDLINE" : "RSI16";
+      const tpPctFromEntry = trade.entryPrice > 0 && trade.takeProfit1 ? (Math.abs(trade.takeProfit1 - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
+      const tpPctLabel = `TP +${tpPctFromEntry}%`;
       const isLong = trade.side === "long";
 
       // Read unrealizedPnl directly from HL position
@@ -1413,12 +1414,12 @@ class TradingEngine {
       const eqForT = (t as any).entryEquity || currentEquity;
       const pnlUsd = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
       const pnlOfAum = eqForT > 0 ? (pnlUsd / eqForT) * 100 : 0;
-      const stratBadge = t.strategy === "trendline" ? "TRENDLINE" : "RSI18";
+      const stratBadge = t.strategy === "trendline" ? "TRENDLINE" : "RSI16";
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)), stratBadge };
     });
 
     // Strategy A: RSI18 stats
-    const rsi18Trades = activeClosedTrades.filter(t => t.strategy === "rsi18");
+    const rsi18Trades = activeClosedTrades.filter(t => t.strategy === "rsi16" || t.strategy === "rsi18");
     const rsi18Wins = rsi18Trades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
     const rsi18WinRate = rsi18Trades.length > 0 ? (rsi18Wins / rsi18Trades.length) * 100 : 0;
     const rsi18PnlUsd = rsi18Trades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
@@ -1461,7 +1462,7 @@ class TradingEngine {
         rsi18: {
           trades: rsi18Trades.length,
           winRate: rsi18WinRate.toFixed(1),
-          openPositions: openTrades.filter(t => t.strategy === "rsi18").length,
+          openPositions: openTrades.filter(t => t.strategy === "rsi16" || t.strategy === "rsi18").length,
           pnlUsd: rsi18PnlUsd.toFixed(4),
           pnlOfAum: rsi18PnlOfAum.toFixed(3),
           status: "active",
