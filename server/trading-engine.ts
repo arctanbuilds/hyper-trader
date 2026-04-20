@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v15.1
+ * HyperTrader — Trading Engine v15.2
  *
  * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
@@ -553,10 +553,11 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.1 started | TRIPLE: B&R + OBOS (BTC) + Oil News (xyz:CL) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+      message: `Engine v15.2 started | DUAL: OBOS (BTC) + Oil News (xyz:CL) | B&R disabled | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.1 started | TRIPLE: B&R + OBOS + Oil News | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.2 started | DUAL: OBOS + Oil News | B&R disabled | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleOilScan();
   }
@@ -815,11 +816,11 @@ class TradingEngine {
         });
       }
 
-      // Equity split: $100 reserved for oil, rest split 50/50 between B&R and OBOS
+      // Equity split: $100 reserved for oil, rest goes 100% to OBOS (B&R disabled)
       const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
-      const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies * 0.50) / equity : 0;
+      const btcStrategyPct = equityForBtcStrategies > 0 ? equityForBtcStrategies / equity : 0;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.1 TRIPLE: B&R + OBOS + Oil | BTC eq: $${equityForBtcStrategies.toFixed(0)} (${(btcStrategyPct*100).toFixed(0)}% each)`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.2 DUAL: OBOS (BTC) + Oil News (WTI) | OBOS eq: $${equityForBtcStrategies.toFixed(0)} (${(btcStrategyPct*100).toFixed(0)}%)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -843,55 +844,12 @@ class TradingEngine {
       let totalEntries = 0;
 
       // ================================================================
-      // STRATEGY A: Breakout & Retest — TradingView Webhook
-      // BTC only, LONG only, 50% equity, SL -0.35%, TP +0.35%
+      // STRATEGY A: Breakout & Retest — DISABLED (v15.2)
+      // Webhook signals are discarded. Historical trades still display.
       // ================================================================
-      if (this.pendingWebhookSignal && breakoutOpen.length < BREAKOUT_MAX_POSITIONS) {
-        const ws = this.pendingWebhookSignal;
-        this.pendingWebhookSignal = null; // consume immediately
-
-        const signalAge = Date.now() - ws.time;
-
-        if (Date.now() < this.breakoutCooldown) {
-          log(`[B&R] Cooldown active — discarding ${ws.signal} signal`, "engine");
-        } else if (signalAge >= 60_000) {
-          log(`[B&R] Stale webhook (${(signalAge/1000).toFixed(0)}s old) — discarding`, "engine");
-        } else if (ws.signal !== "LONG") {
-          log(`[B&R] ${ws.signal} signal — skipping (LONG only)`, "engine");
-        } else if (ws.coin !== "BTC") {
-          log(`[B&R] ${ws.coin} signal — skipping (BTC only)`, "engine");
-        } else {
-          const asset = ALLOWED_ASSETS.find(a => a.coin === "BTC")!;
-          const coinHasPosition = openTrades.some(t => t.coin === ws.coin);
-          if (coinHasPosition) {
-            log(`[B&R] ${ws.coin} already has open position — skipping`, "engine");
-          } else {
-            const price = parseFloat(assetCtxMap[ws.coin]?.midPx || String(ws.price));
-            const entryReason = `TV Webhook: LONG @ $${ws.price.toFixed(1)} (${ws.source})`;
-
-            const entered = await this.executeEntry({
-              asset,
-              strategy: "breakout",
-              side: "long",
-              equityPct: btcStrategyPct,
-              leverage: asset.maxLeverage,
-              tpPct: 0.0035,         // +0.35%
-              slPct: 0.0035,         // -0.35%
-              rsi5m: 50, rsi15m: 50, triggerRSI: 0,
-              price, equity,
-              entryReason,
-              config,
-            });
-
-            if (entered) {
-              totalEntries++;
-              this.dailyTradeCount++;
-            } else {
-              this.breakoutCooldown = Date.now() + 5 * 60 * 1000;
-              log(`[B&R] Entry failed — cooldown 5min`, "engine");
-            }
-          }
-        }
+      if (this.pendingWebhookSignal) {
+        log(`[B&R] Strategy disabled (v15.2) — discarding ${this.pendingWebhookSignal.signal} signal`, "engine");
+        this.pendingWebhookSignal = null;
       }
 
       // ================================================================

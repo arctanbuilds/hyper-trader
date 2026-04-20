@@ -114,7 +114,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v15.1 — B&R + OBOS (BTC) + Oil News (WTI)</p>
+            <p className="text-sm text-muted-foreground">v15.2 — OBOS (BTC) + Oil News (WTI)</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -182,10 +182,10 @@ export default function Dashboard() {
               <Activity className="w-4 h-4 text-muted-foreground" />
             </div>
             <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
-              {totalOpen} / 3
+              {totalOpen} / 2
             </div>
             <p className="text-[10px] text-muted-foreground mt-1">
-              B&R: {brOpen}/1 | OBOS: {obosOpenCount}/1 | Oil: {oilOpenCount}/1
+              OBOS: {obosOpenCount}/1 | Oil: {oilOpenCount}/1
             </p>
           </CardContent>
         </Card>
@@ -206,64 +206,8 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* ========== TRIPLE STRATEGY STATS ========== */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* B&R Strategy */}
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="text-sm font-medium">Breakout & Retest</CardTitle>
-                <p className="text-[10px] text-muted-foreground mt-0.5">
-                  BTC | LONG | TV Webhook | SL -0.35% | TP +0.35%
-                </p>
-              </div>
-              <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-blue-500/10 text-blue-400 border-blue-500/30">
-                B&R
-              </Badge>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
-                <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
-                <div className="text-sm font-semibold font-mono text-blue-400">
-                  {brStrat?.totalTrades || 0}
-                </div>
-                <div className="text-[8px] text-muted-foreground">{brStrat?.wins || 0}W / {brStrat?.losses || 0}L</div>
-              </div>
-              <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
-                <div className="text-[9px] text-muted-foreground mb-0.5">Win Rate</div>
-                <div className="text-sm font-semibold font-mono text-blue-400">
-                  {brStrat?.winRate || 0}%
-                </div>
-                <div className="text-[8px] text-muted-foreground">PF: {(brStrat?.profitFactor || 0) >= 999 ? "∞" : (brStrat?.profitFactor || 0).toFixed(2)}</div>
-              </div>
-              <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
-                <div className="text-[9px] text-muted-foreground mb-0.5">Total P&L</div>
-                <div className={cn(
-                  "text-sm font-semibold font-mono",
-                  (brStrat?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
-                )}>
-                  {(brStrat?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(brStrat?.totalPnlUsd || 0).toFixed(2)}
-                </div>
-                <div className="text-[8px] text-muted-foreground">
-                  {(brStrat?.totalPnlPct || 0) >= 0 ? "+" : ""}{(brStrat?.totalPnlPct || 0).toFixed(2)}% AUM
-                </div>
-              </div>
-              <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
-                <div className="text-[9px] text-muted-foreground mb-0.5">Avg / Trade</div>
-                <div className={cn(
-                  "text-sm font-semibold font-mono",
-                  (brStrat?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
-                )}>
-                  {(brStrat?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(brStrat?.avgPnlPerTrade || 0).toFixed(2)}
-                </div>
-                <div className="text-[8px] text-muted-foreground">{brStrat?.bestWinStreak || 0}W / {brStrat?.worstLossStreak || 0}L streak</div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+      {/* ========== DUAL STRATEGY STATS ========== */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
 
         {/* OBOS Strategy */}
         <Card>
@@ -272,7 +216,7 @@ export default function Dashboard() {
               <div>
                 <CardTitle className="text-sm font-medium">Overbought / Oversold</CardTitle>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  BTC | L+S | RSI ≤15/≥88 | SL -0.5% | TP +0.45% | BE
+                  BTC | L+S | RSI ≤15/≥88 | 100% remaining eq | SL -0.5% | TP +0.45% | BE
                 </p>
               </div>
               <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-amber-500/10 text-amber-400 border-amber-500/30">
@@ -406,7 +350,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.1) | {raceDays} running</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.2) | {raceDays} running</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
