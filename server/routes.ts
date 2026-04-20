@@ -154,8 +154,8 @@ export async function registerRoutes(
   });
 
   // ============ STRATEGY STATS ============
-  // v14.1: Dual strategy — RSI18 + DIVERGENCE — counts trades after v14.1 deploy
-  const V141_START = "2026-04-18T17:30:00.000Z";
+  // v15.0: Dual strategy — B&R + OBOS — fresh start
+  const V15_START = "2026-04-20T12:00:00.000Z";
 
   app.get("/api/strategies", async (req, res) => {
     const allTrades = await storage.getAllTrades(500);
@@ -178,17 +178,16 @@ export async function registerRoutes(
       streakCurrent: 0, streakBest: 0, streakWorst: 0, streakType: "none",
     });
 
-    const rsi18Bucket = makeBucket();
-    const divBucket = makeBucket();
-    const newBucket = makeBucket();
+    const brBucket = makeBucket();
+    const obosBucket = makeBucket();
 
     const closedTrades = allTrades
-      .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V141_START)
+      .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V15_START)
       .sort((a: any, b: any) => new Date(a.closedAt).getTime() - new Date(b.closedAt).getTime());
 
     for (const t of closedTrades) {
       const pnl = t.hlPnlUsd ?? 0;
-      const bucket = t.strategy === "new" ? newBucket : (t.strategy === "divergence" || t.strategy === "trendline") ? divBucket : rsi18Bucket;
+      const bucket = (t.strategy === "breakout" || t.strategy === "trendline") ? brBucket : obosBucket;
 
       bucket.trades.push(t);
       bucket.totalPnl += pnl;
@@ -233,11 +232,10 @@ export async function registerRoutes(
     }
 
     const openTrades = allTrades.filter((t: any) => t.status === "open");
-    const openRsi18 = openTrades.filter((t: any) => t.strategy === "rsi16" || t.strategy === "rsi18").length;
-    const openTl = openTrades.filter((t: any) => t.strategy === "trendline" || t.strategy === "divergence").length;
-    const openNew = openTrades.filter((t: any) => t.strategy === "new").length;
+    const openBr = openTrades.filter((t: any) => t.strategy === "breakout" || t.strategy === "trendline").length;
+    const openObos = openTrades.filter((t: any) => t.strategy === "obos").length;
 
-    const raceStartMs = new Date(V141_START).getTime();
+    const raceStartMs = new Date(V15_START).getTime();
     const raceHours = parseFloat(((Date.now() - raceStartMs) / 3600000).toFixed(1));
 
     function formatBucket(d: StratBucket, strategy: string, label: string, openCount: number) {
@@ -264,12 +262,11 @@ export async function registerRoutes(
     }
 
     const result = [
-      formatBucket(rsi18Bucket, "rsi16", "RSI16 (BTC ETH SOL)", openRsi18),
-      formatBucket(divBucket, "trendline", "TRENDLINE (BTC)", openTl),
-      formatBucket(newBucket, "new", "NEW — RCE ($100, 1:4 R:R)", openNew),
+      formatBucket(brBucket, "breakout", "Breakout & Retest (BTC)", openBr),
+      formatBucket(obosBucket, "obos", "Overbought / Oversold (BTC)", openObos),
     ];
 
-    res.json({ raceStartedAt: V141_START, raceHours, strategies: result });
+    res.json({ raceStartedAt: V15_START, raceHours, strategies: result });
   });
 
   app.get("/api/trades/:id", async (req, res) => {
@@ -331,12 +328,11 @@ export async function registerRoutes(
         const leverage = parseInt(pos.leverage?.value || "1");
         const equity = tradingEngine.getLastKnownEquity();
         const actualNotional = sz * entryPrice;
-        // Default to divergence strategy for non-BTC, rsi18 for BTC
-        const strategy = coin === "BTC" ? "rsi18" : "divergence";
-        const tpMult = strategy === "rsi18" ? 1.005 : 1.0043;
-        const tp = entryPrice * tpMult;
-        const sl = entryPrice * 0.995; // SL -0.5%
-        const tpLabel = strategy === "rsi18" ? "+0.5%" : "+0.43%";
+        // Default to obos strategy for synced positions
+        const strategy = "obos";
+        const tp = side === "long" ? entryPrice * 1.0045 : entryPrice * 0.9955; // TP +0.45%
+        const sl = side === "long" ? entryPrice * 0.995 : entryPrice * 1.005; // SL -0.5%
+        const tpLabel = "+0.45%";
         const trade = await storage.createTrade({
           coin, side, entryPrice, size: 50, leverage,
           entryEquity: equity,
@@ -349,7 +345,7 @@ export async function registerRoutes(
           tp1Hit: false,
           confluenceScore: 0, confluenceDetails: "Synced from HL position",
           riskRewardRatio: 0, status: "open",
-          reason: `[SYNC] Imported from HL: ${coin} ${side} ${leverage}x @ $${entryPrice} | SL -0.5% | TP ${tpLabel} | ${strategy.toUpperCase()}`,
+          reason: `[SYNC] Imported from HL: ${coin} ${side} ${leverage}x @ $${entryPrice} | SL -0.5% | TP ${tpLabel} | OBOS`,
           setupType: strategy, strategy,
           openedAt: new Date().toISOString(),
         });
@@ -357,7 +353,7 @@ export async function registerRoutes(
         await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id} | SL $${sl.toFixed(2)} | TP $${tp.toFixed(2)} | ${strategy.toUpperCase()}`, timestamp: new Date().toISOString() });
       }
       broadcast({ type: "status", data: await tradingEngine.getStatus() });
-      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v14.1: RSI18 + DIVERGENCE)` });
+      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v15.0: B&R + OBOS)` });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -385,7 +381,7 @@ export async function registerRoutes(
     try {
       const config = await storage.getConfig();
       const baselineEquity = config?.pnlBaselineEquity || 658;
-      const baselineTs = config?.pnlBaselineTimestamp || V141_START;
+      const baselineTs = config?.pnlBaselineTimestamp || V15_START;
 
       const allTrades = await storage.getAllTrades(500);
       const closedAfterBaseline = allTrades
@@ -399,7 +395,7 @@ export async function registerRoutes(
       for (const t of closedAfterBaseline) {
         const tradePnl = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
         runningEquity += tradePnl;
-        const stratTag = t.strategy === "new" ? " [NEW]" : t.strategy === "trendline" ? " [TRENDLINE]" : " [RSI16]";
+        const stratTag = (t.strategy === "breakout" || t.strategy === "trendline") ? " [B&R]" : " [OBOS]";
         curve.push({
           timestamp: t.closedAt || t.openedAt,
           equity: parseFloat(runningEquity.toFixed(2)),

@@ -1,29 +1,31 @@
 /**
- * HyperTrader — Trading Engine v14.4
+ * HyperTrader — Trading Engine v15.0
  *
- * TRIPLE STRATEGY: RSI16 + TRENDLINE + NEW
+ * DUAL STRATEGY: Breakout & Retest + Overbought/Oversold
  *
- * STRATEGY A — RSI16:
- *   - BTC, ETH, SOL — LONG only, RSI ≤ 16 on 5m OR 15m
- *   - 50% of (equity - $100), max leverage, max 1 position
+ * STRATEGY A — Breakout & Retest (TV Webhook):
+ *   - BTC only — LONG only
+ *   - 50% of equity, max leverage, max 1 position
+ *   - Signals from TradingView AlgoAlpha Breakout & Retest webhook
  *   - SL -0.35%, TP +0.35%
+ *   - No BE rule
  *
- * STRATEGY B — TRENDLINE (TradingView webhook):
- *   - BTC — LONG only
- *   - 50% of (equity - $100), max leverage, max 1 position
- *   - Signals from TradingView AlgoAlpha Breakout & Retest
- *   - SL -0.35%, TP +0.35%
- *
- * STRATEGY C — NEW (Craig Percoco RCE, TradingView webhook):
- *   - BTC, ETH, SOL, AVAX, XRP — LONG + SHORT
- *   - Fixed $100 allocation, max leverage, max 1 position
- *   - Signals from TradingView webhook with strategy="new"
- *   - SL -0.25%, TP +1.0% (1:4 R:R)
+ * STRATEGY B — Overbought / Oversold (RSI):
+ *   - BTC only — LONG + SHORT
+ *   - 50% of equity, max leverage, max 1 position
+ *   - LONG: 5m RSI ≤ 15 OR 15m RSI ≤ 15
+ *   - SHORT: 5m RSI ≥ 88 OR 15m RSI ≥ 88
+ *   - SL -0.5%, TP +0.45%
+ *   - BE rule: after +0.3% profit → move SL to +0.2% (profit zone)
  *
  * Shared:
+ *   - 50/50 equity split
  *   - Scan every 5 seconds
  *   - Cancel all orders on close (ghost position prevention)
  *   - Orphan detector on startup
+ *   - SL + TP orders placed on HL immediately at fill
+ *   - Intra-candle RSI (append current price to closes)
+ *   - If bot took 1 trade in a setup and failed, ignore that setup
  */
 
 // minifyIdentifiers: false — keep readable names for debugging
@@ -32,8 +34,6 @@ import { storage } from "./storage";
 import { log } from "./index";
 import { createExecutor } from "./hyperliquid-executor";
 import { logDecision, reviewClosedTrades, generateInsights, getLearningStats, run24hReview } from "./learning-engine";
-// AI trendline analyzer removed — using TradingView webhook only
-// import { analyzeTrendlines, type TrendlineSignal } from "./ai-trendline-analyzer";
 
 // ============ ASSET CONFIGURATION ============
 
@@ -50,15 +50,10 @@ interface AssetConfig {
 
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",  displayName: "Bitcoin",     dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
-  { coin: "ETH",  displayName: "Ethereum",    dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
-  { coin: "SOL",  displayName: "Solana",      dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
 ];
 
 // ============ STRATEGY TYPE ============
-type StrategyType = "rsi16" | "trendline" | "new";
-
-// ============ NEW STRATEGY FIXED ALLOCATION ============
-const NEW_STRATEGY_FIXED_USD = 100;
+type StrategyType = "breakout" | "obos";
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -279,46 +274,6 @@ function getSessionInfo(): { session: string; isHighVolume: boolean; description
   return { session: "afterhours", isHighVolume: false, description: "After Hours" };
 }
 
-// ============ HORIZONTAL SUPPORT DETECTION ============
-
-function findHorizontalSupport(candles: OHLCVCandle[], currentPrice: number): { level: number; touches: number } | null {
-  if (candles.length < 20) return null;
-
-  const lows = candles.map(c => c.low);
-  const clusters: { level: number; touches: number }[] = [];
-  const used = new Set<number>();
-
-  for (let i = 0; i < lows.length; i++) {
-    if (used.has(i)) continue;
-    let sumPx = lows[i];
-    let count = 1;
-    const group = [i];
-
-    for (let j = i + 1; j < lows.length; j++) {
-      if (used.has(j)) continue;
-      const avg = sumPx / count;
-      if (Math.abs(lows[j] - avg) / avg <= 0.003) { // within 0.3%
-        sumPx += lows[j];
-        count++;
-        group.push(j);
-      }
-    }
-
-    if (count >= 3) {
-      const avgLevel = sumPx / count;
-      if (avgLevel < currentPrice) {
-        clusters.push({ level: parseFloat(avgLevel.toFixed(6)), touches: count });
-        group.forEach(idx => used.add(idx));
-      }
-    }
-  }
-
-  if (clusters.length === 0) return null;
-
-  clusters.sort((a, b) => Math.abs(currentPrice - a.level) - Math.abs(currentPrice - b.level));
-  return clusters[0];
-}
-
 // ============ TRADING ENGINE ============
 
 class TradingEngine {
@@ -335,19 +290,18 @@ class TradingEngine {
   private pnlResetTimestamp = "";
   private pnlResetEquity = 0;
 
-  // RSI18 cross state — only enter once per RSI extreme event (BTC only)
-  private rsi18CrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
+  // OBOS cross state — only enter once per RSI extreme event
+  private obosCrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
 
-  // Trendline strategy state — TradingView webhook only
-  private trendlineCooldown = 0; // timestamp until which trendline entries are blocked (after failed setup)
+  // Breakout & Retest strategy state — TradingView webhook
+  private breakoutCooldown = 0;
   private pendingWebhookSignal: { signal: "LONG" | "SHORT"; price: number; time: number; source: string; coin: string } | null = null;
-
-  // NEW strategy state — TradingView webhook with strategy="new"
-  private newStrategyCooldown = 0;
-  private pendingNewSignal: { signal: "LONG" | "SHORT"; price: number; time: number; source: string; coin: string } | null = null;
 
   // Robust position sync — track consecutive "no position" readings per tradeId
   private syncMissCount: Map<number, number> = new Map();
+
+  // OBOS BE tracking — track whether BE has been applied per tradeId
+  private beApplied: Set<number> = new Set();
 
   private resetLossTrackers() {
     this.dailyTradeCount = 0;
@@ -369,9 +323,9 @@ class TradingEngine {
       }
     }
 
-    // v14.2: Force fresh P&L baseline on v14.2 deploy
-    const V14_DEPLOY = "2026-04-19T18:00:00.000Z";
-    if (!config.pnlBaselineTimestamp || config.pnlBaselineTimestamp < V14_DEPLOY) {
+    // v15.0: Force fresh P&L baseline on v15 deploy
+    const V15_DEPLOY = "2026-04-20T12:00:00.000Z";
+    if (!config.pnlBaselineTimestamp || config.pnlBaselineTimestamp < V15_DEPLOY) {
       this.pnlResetTimestamp = new Date().toISOString();
       this.pnlResetEquity = this.lastKnownEquity;
       this.startingEquity = this.lastKnownEquity;
@@ -379,9 +333,8 @@ class TradingEngine {
         pnlBaselineEquity: this.lastKnownEquity,
         pnlBaselineTimestamp: this.pnlResetTimestamp,
       });
-      log(`[v14.1] Fresh start — P&L baseline reset to $${this.lastKnownEquity.toFixed(2)}`, "engine");
+      log(`[v15.0] Fresh start — P&L baseline reset to $${this.lastKnownEquity.toFixed(2)}`, "engine");
     } else {
-      // Normal restore: baseline already set to v14.1 or later
       this.pnlResetTimestamp = config.pnlBaselineTimestamp;
       this.pnlResetEquity = config.pnlBaselineEquity;
       this.startingEquity = config.pnlBaselineEquity;
@@ -438,10 +391,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v14.4.1 started | TRIPLE: RSI16 + TRENDLINE + NEW | NEW: $${NEW_STRATEGY_FIXED_USD} fixed, L+S, BTC ETH SOL AVAX XRP, 1:4 R:R | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v15.0 started | DUAL: B&R (TV webhook) + OBOS (RSI ≤15/≥88) | BTC only | 50/50 split | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v14.4 started | TRIPLE: RSI16 + TRENDLINE + NEW | NEW: $${NEW_STRATEGY_FIXED_USD} fixed, SL -0.25% TP +1.0% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.0 started | DUAL: B&R + OBOS | BTC only — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
 
@@ -496,8 +449,8 @@ class TradingEngine {
     side: "long" | "short";
     equityPct: number;
     leverage: number;
-    tpPct: number;        // e.g. 0.005 for +0.5%
-    slPct: number;        // e.g. 0.005 for -0.5%
+    tpPct: number;
+    slPct: number;
     rsi5m: number;
     rsi15m: number;
     triggerRSI: number;
@@ -505,10 +458,9 @@ class TradingEngine {
     equity: number;
     entryReason: string;
     config: any;
-    customSL?: number;    // trendline invalidation price for custom SL
   }): Promise<boolean> {
-    const { asset, strategy, side, equityPct, leverage, tpPct, slPct, rsi5m, rsi15m, triggerRSI, price, equity, entryReason, config, customSL } = params;
-    const stratLabel = strategy === "rsi16" ? "RSI16" : "TRENDLINE";
+    const { asset, strategy, side, equityPct, leverage, tpPct, slPct, rsi5m, rsi15m, triggerRSI, price, equity, entryReason, config } = params;
+    const stratLabel = strategy === "breakout" ? "B&R" : "OBOS";
     const isBuy = side === "long";
 
     // Position sizing — equityPct of equity, at leverage
@@ -522,9 +474,9 @@ class TradingEngine {
     }
 
     const tp = isBuy ? price * (1 + tpPct) : price * (1 - tpPct);
-    const sl = customSL || (isBuy ? price * (1 - slPct) : price * (1 + slPct));
-    const tpPctLabel = `+${(tpPct * 100).toFixed(1)}%`;
-    const slPctLabel = customSL ? `SL @ $${sl.toFixed(1)}` : `SL -${(slPct * 100).toFixed(1)}%`;
+    const sl = isBuy ? price * (1 - slPct) : price * (1 + slPct);
+    const tpPctLabel = `+${(tpPct * 100).toFixed(2)}%`;
+    const slPctLabel = `SL -${(slPct * 100).toFixed(1)}%`;
 
     log(`[${stratLabel}] ${asset.coin} ${side.toUpperCase()} @ $${price} | TP ${tpPctLabel} | ${slPctLabel} | ${leverage}x | ${entryReason}`, "engine");
 
@@ -583,7 +535,7 @@ class TradingEngine {
 
     // Recalculate TP and SL based on actual fill price
     const actualTP = isBuy ? fillPrice * (1 + tpPct) : fillPrice * (1 - tpPct);
-    const actualSL = customSL || (isBuy ? fillPrice * (1 - slPct) : fillPrice * (1 + slPct));
+    const actualSL = isBuy ? fillPrice * (1 - slPct) : fillPrice * (1 + slPct);
     const actualNotional = filledSz * fillPrice;
 
     const trade = await storage.createTrade({
@@ -699,7 +651,7 @@ class TradingEngine {
         });
       }
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v14.4 TRIPLE: RSI16 + TRENDLINE + NEW ($${NEW_STRATEGY_FIXED_USD}) | BTC ETH SOL`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.0 DUAL: B&R + OBOS | BTC only | 50/50`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -714,28 +666,77 @@ class TradingEngine {
 
       // Open positions
       const openTrades = await storage.getOpenTrades();
-      const rsi18Open = openTrades.filter(t => t.strategy === "rsi16" || t.strategy === "rsi18");
-      const trendlineOpen = openTrades.filter(t => t.strategy === "trendline");
-      const newOpen = openTrades.filter(t => t.strategy === "new");
+      const breakoutOpen = openTrades.filter(t => t.strategy === "breakout" || t.strategy === "trendline");
+      const obosOpen = openTrades.filter(t => t.strategy === "obos");
 
-      const RSI18_MAX_POSITIONS = 1;
-      const TRENDLINE_MAX_POSITIONS = 1;
-      const NEW_MAX_POSITIONS = 1;
-
-      // Equity split: reserve $100 for NEW, rest split 50/50 between RSI16 and TRENDLINE
-      const equityForOthers = Math.max(equity - NEW_STRATEGY_FIXED_USD, 0);
+      const BREAKOUT_MAX_POSITIONS = 1;
+      const OBOS_MAX_POSITIONS = 1;
 
       let totalEntries = 0;
 
       // ================================================================
-      // STRATEGY A: RSI16 — BTC, ETH, SOL
-      // Signal: 5m RSI ≤ 16 OR 15m RSI ≤ 16
-      // LONG only, 50% of (equity - $100), max leverage, max 1 position
-      // SL -0.35%, TP +0.35%
+      // STRATEGY A: Breakout & Retest — TradingView Webhook
+      // BTC only, LONG only, 50% equity, SL -0.35%, TP +0.35%
+      // ================================================================
+      if (this.pendingWebhookSignal && breakoutOpen.length < BREAKOUT_MAX_POSITIONS) {
+        const ws = this.pendingWebhookSignal;
+        this.pendingWebhookSignal = null; // consume immediately
+
+        const signalAge = Date.now() - ws.time;
+
+        if (Date.now() < this.breakoutCooldown) {
+          log(`[B&R] Cooldown active — discarding ${ws.signal} signal`, "engine");
+        } else if (signalAge >= 60_000) {
+          log(`[B&R] Stale webhook (${(signalAge/1000).toFixed(0)}s old) — discarding`, "engine");
+        } else if (ws.signal !== "LONG") {
+          log(`[B&R] ${ws.signal} signal — skipping (LONG only)`, "engine");
+        } else if (ws.coin !== "BTC") {
+          log(`[B&R] ${ws.coin} signal — skipping (BTC only)`, "engine");
+        } else {
+          const asset = ALLOWED_ASSETS.find(a => a.coin === "BTC")!;
+          const coinHasPosition = openTrades.some(t => t.coin === ws.coin);
+          if (coinHasPosition) {
+            log(`[B&R] ${ws.coin} already has open position — skipping`, "engine");
+          } else {
+            const price = parseFloat(assetCtxMap[ws.coin]?.midPx || String(ws.price));
+            const entryReason = `TV Webhook: LONG @ $${ws.price.toFixed(1)} (${ws.source})`;
+
+            const entered = await this.executeEntry({
+              asset,
+              strategy: "breakout",
+              side: "long",
+              equityPct: 0.50,
+              leverage: asset.maxLeverage,
+              tpPct: 0.0035,         // +0.35%
+              slPct: 0.0035,         // -0.35%
+              rsi5m: 50, rsi15m: 50, triggerRSI: 0,
+              price, equity,
+              entryReason,
+              config,
+            });
+
+            if (entered) {
+              totalEntries++;
+              this.dailyTradeCount++;
+            } else {
+              this.breakoutCooldown = Date.now() + 5 * 60 * 1000;
+              log(`[B&R] Entry failed — cooldown 5min`, "engine");
+            }
+          }
+        }
+      }
+
+      // ================================================================
+      // STRATEGY B: Overbought / Oversold — RSI-based
+      // BTC only, LONG (RSI ≤ 15 on 5m OR 15m) + SHORT (RSI ≥ 88 on 5m OR 15m)
+      // 50% equity, max leverage, SL -0.5%, TP +0.45%
+      // BE: after +0.3% → move SL to +0.2% (profit zone)
       // ================================================================
       {
-        const RSI_THRESHOLD = 16;
-        const RSI_RESET_THRESHOLD = 25;
+        const RSI_OVERSOLD = 15;
+        const RSI_OVERBOUGHT = 88;
+        const RSI_RESET_OVERSOLD = 25;  // reset long cross state when RSI > 25 on both TFs
+        const RSI_RESET_OVERBOUGHT = 75; // reset short cross state when RSI < 75 on both TFs
 
         for (const asset of ALLOWED_ASSETS) {
           const ctx = assetCtxMap[asset.coin];
@@ -762,19 +763,23 @@ class TradingEngine {
             const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
             const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
 
-            // Signal: 5m OR 15m ≤ 16
-            const rsiSignal = rsi5m <= RSI_THRESHOLD || rsi15m <= RSI_THRESHOLD;
-            const triggerRSI = Math.min(rsi5m, rsi15m);
-            const triggeredTF = rsi5m <= RSI_THRESHOLD ? (rsi15m <= RSI_THRESHOLD ? "5m+15m" : "5m") : "15m";
+            // Signal detection
+            const oversold = rsi5m <= RSI_OVERSOLD || rsi15m <= RSI_OVERSOLD;
+            const overbought = rsi5m >= RSI_OVERBOUGHT || rsi15m >= RSI_OVERBOUGHT;
 
             let scanSignal: string = "neutral";
             let scanDetails = "";
 
-            if (rsiSignal) {
-              scanSignal = "rsi16_oversold";
-              scanDetails = `RSI16: ${triggeredTF} triggered | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
+            if (oversold) {
+              scanSignal = "obos_oversold";
+              const tf = rsi5m <= RSI_OVERSOLD ? (rsi15m <= RSI_OVERSOLD ? "5m+15m" : "5m") : "15m";
+              scanDetails = `OBOS: ${tf} RSI oversold | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Threshold ≤${RSI_OVERSOLD}`;
+            } else if (overbought) {
+              scanSignal = "obos_overbought";
+              const tf = rsi5m >= RSI_OVERBOUGHT ? (rsi15m >= RSI_OVERBOUGHT ? "5m+15m" : "5m") : "15m";
+              scanDetails = `OBOS: ${tf} RSI overbought | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Threshold ≥${RSI_OVERBOUGHT}`;
             } else {
-              scanDetails = `RSI16: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need ≤16 on either TF`;
+              scanDetails = `OBOS: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need ≤${RSI_OVERSOLD} or ≥${RSI_OVERBOUGHT}`;
             }
 
             await storage.upsertMarketScan({
@@ -783,39 +788,38 @@ class TradingEngine {
               volume24h, change24h,
               signal: scanSignal,
               fundingRate: funding, openInterest,
-              confluenceScore: rsiSignal ? 10 : 0,
+              confluenceScore: (oversold || overbought) ? 10 : 0,
               confluenceDetails: scanDetails,
               riskRewardRatio: 0,
               timestamp: new Date().toISOString(),
             });
 
-            const crossKey = `${asset.coin}_rsi16_long`;
-
-            // Reset cross state when RSI recovers above 25 on BOTH timeframes
-            if (!rsiSignal && rsi5m > RSI_RESET_THRESHOLD && rsi15m > RSI_RESET_THRESHOLD) {
-              if (this.rsi18CrossState.has(crossKey)) {
-                this.rsi18CrossState.delete(crossKey);
-                log(`[RSI16] ${asset.coin} cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${RSI_RESET_THRESHOLD}`, "engine");
+            // === LONG entry: RSI oversold ===
+            const longCrossKey = `${asset.coin}_obos_long`;
+            // Reset long cross state when RSI recovers above 25 on BOTH timeframes
+            if (!oversold && rsi5m > RSI_RESET_OVERSOLD && rsi15m > RSI_RESET_OVERSOLD) {
+              if (this.obosCrossState.has(longCrossKey)) {
+                this.obosCrossState.delete(longCrossKey);
+                log(`[OBOS] ${asset.coin} LONG cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${RSI_RESET_OVERSOLD}`, "engine");
               }
             }
 
-            // Entry: RSI signal, no position already open for this strategy, slot available
-            // Also skip if this coin already has a trendline position open
             const coinHasPosition = openTrades.some(t => t.coin === asset.coin);
-            if (rsiSignal && rsi18Open.length < RSI18_MAX_POSITIONS && !coinHasPosition) {
-              if (!this.rsi18CrossState.has(crossKey)) {
-                this.rsi18CrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
+            if (oversold && obosOpen.length < OBOS_MAX_POSITIONS && !coinHasPosition) {
+              if (!this.obosCrossState.has(longCrossKey)) {
+                const triggerRSI = Math.min(rsi5m, rsi15m);
+                const triggeredTF = rsi5m <= RSI_OVERSOLD ? (rsi15m <= RSI_OVERSOLD ? "5m+15m" : "5m") : "15m";
+                this.obosCrossState.set(longCrossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
 
-                const entryReason = `RSI16: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ 16`;
-                const rsiEquityPct = equityForOthers > 0 ? (equityForOthers * 0.50) / equity : 0;
+                const entryReason = `OBOS LONG: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ ${RSI_OVERSOLD}`;
                 const entered = await this.executeEntry({
                   asset,
-                  strategy: "rsi16",
+                  strategy: "obos",
                   side: "long",
-                  equityPct: rsiEquityPct,
+                  equityPct: 0.50,
                   leverage: asset.maxLeverage,
-                  tpPct: 0.0035,         // +0.35%
-                  slPct: 0.0035,         // -0.35%
+                  tpPct: 0.0045,         // +0.45%
+                  slPct: 0.005,          // -0.5%
                   rsi5m, rsi15m, triggerRSI, price, equity,
                   entryReason,
                   config,
@@ -825,126 +829,47 @@ class TradingEngine {
                   totalEntries++;
                   this.dailyTradeCount++;
                 } else {
-                  this.rsi18CrossState.delete(crossKey);
+                  this.obosCrossState.delete(longCrossKey);
                 }
               }
             }
-          }
-        }
-      }
 
-      // ================================================================
-      // STRATEGY B: TRENDLINE — TradingView Webhook Only
-      // Signal: TradingView AlgoAlpha Breakout & Retest indicator
-      // LONG only, 50% of (equity - $100), max leverage, max 1 position
-      // SL -0.35%, TP +0.35%
-      // ================================================================
-      if (this.pendingWebhookSignal && trendlineOpen.length < TRENDLINE_MAX_POSITIONS) {
-        const ws = this.pendingWebhookSignal;
-        this.pendingWebhookSignal = null; // consume immediately
-
-        const signalAge = Date.now() - ws.time;
-
-        // Check cooldown
-        if (Date.now() < this.trendlineCooldown) {
-          log(`[TRENDLINE] Cooldown active — discarding ${ws.signal} signal`, "engine");
-        } else if (signalAge >= 60_000) {
-          log(`[TRENDLINE] Stale webhook (${(signalAge/1000).toFixed(0)}s old) — discarding`, "engine");
-        } else if (ws.signal !== "LONG") {
-          log(`[TRENDLINE] ${ws.signal} signal — skipping (LONG only)`, "engine");
-        } else {
-          // Find asset for this coin
-          const asset = ALLOWED_ASSETS.find(a => a.coin === ws.coin);
-          if (!asset) {
-            log(`[TRENDLINE] Unknown coin ${ws.coin} — skipping`, "engine");
-          } else {
-            // Don't enter if this coin already has a position from either strategy
-            const coinHasPosition = openTrades.some(t => t.coin === ws.coin);
-            if (coinHasPosition) {
-              log(`[TRENDLINE] ${ws.coin} already has open position — skipping`, "engine");
-            } else {
-              const price = parseFloat(assetCtxMap[ws.coin]?.midPx || String(ws.price));
-              const entryReason = `TV Webhook: LONG @ $${ws.price.toFixed(1)} (${ws.source})`;
-
-              const tlEquityPct = equityForOthers > 0 ? (equityForOthers * 0.50) / equity : 0;
-              const entered = await this.executeEntry({
-                asset,
-                strategy: "trendline",
-                side: "long",
-                equityPct: tlEquityPct,
-                leverage: asset.maxLeverage,
-                tpPct: 0.0035,         // +0.35%
-                slPct: 0.0035,         // -0.35%
-                rsi5m: 50, rsi15m: 50, triggerRSI: 0,
-                price, equity,
-                entryReason,
-                config,
-              });
-
-              if (entered) {
-                totalEntries++;
-                this.dailyTradeCount++;
-              } else {
-                this.trendlineCooldown = Date.now() + 5 * 60 * 1000;
-                log(`[TRENDLINE] Entry failed — cooldown 5min`, "engine");
+            // === SHORT entry: RSI overbought ===
+            const shortCrossKey = `${asset.coin}_obos_short`;
+            // Reset short cross state when RSI drops below 75 on BOTH timeframes
+            if (!overbought && rsi5m < RSI_RESET_OVERBOUGHT && rsi15m < RSI_RESET_OVERBOUGHT) {
+              if (this.obosCrossState.has(shortCrossKey)) {
+                this.obosCrossState.delete(shortCrossKey);
+                log(`[OBOS] ${asset.coin} SHORT cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both < ${RSI_RESET_OVERBOUGHT}`, "engine");
               }
             }
-          }
-        }
-      }
 
-      // ================================================================
-      // STRATEGY C: NEW — Craig Percoco RCE Framework
-      // Signal: TradingView webhook with strategy="new"
-      // LONG + SHORT, BTC ETH SOL AVAX XRP, fixed $100, max 1 position
-      // SL -0.25%, TP +1.0% (1:4 R:R)
-      // ================================================================
-      if (this.pendingNewSignal && newOpen.length < NEW_MAX_POSITIONS) {
-        const ns = this.pendingNewSignal;
-        this.pendingNewSignal = null; // consume immediately
+            if (overbought && obosOpen.length < OBOS_MAX_POSITIONS && !coinHasPosition) {
+              if (!this.obosCrossState.has(shortCrossKey)) {
+                const triggerRSI = Math.max(rsi5m, rsi15m);
+                const triggeredTF = rsi5m >= RSI_OVERBOUGHT ? (rsi15m >= RSI_OVERBOUGHT ? "5m+15m" : "5m") : "15m";
+                this.obosCrossState.set(shortCrossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
 
-        const signalAge = Date.now() - ns.time;
+                const entryReason = `OBOS SHORT: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≥ ${RSI_OVERBOUGHT}`;
+                const entered = await this.executeEntry({
+                  asset,
+                  strategy: "obos",
+                  side: "short",
+                  equityPct: 0.50,
+                  leverage: asset.maxLeverage,
+                  tpPct: 0.0045,         // +0.45%
+                  slPct: 0.005,          // -0.5%
+                  rsi5m, rsi15m, triggerRSI, price, equity,
+                  entryReason,
+                  config,
+                });
 
-        if (Date.now() < this.newStrategyCooldown) {
-          log(`[NEW] Cooldown active — discarding ${ns.signal} signal`, "engine");
-        } else if (signalAge >= 60_000) {
-          log(`[NEW] Stale webhook (${(signalAge/1000).toFixed(0)}s old) — discarding`, "engine");
-        } else {
-          const asset = ALLOWED_ASSETS.find(a => a.coin === ns.coin);
-          if (!asset) {
-            log(`[NEW] Unknown coin ${ns.coin} — skipping`, "engine");
-          } else {
-            const coinHasPosition = openTrades.some(t => t.coin === ns.coin);
-            if (coinHasPosition) {
-              log(`[NEW] ${ns.coin} already has open position — skipping`, "engine");
-            } else {
-              const side = ns.signal === "SHORT" ? "short" : "long";
-              const price = parseFloat(assetCtxMap[ns.coin]?.midPx || String(ns.price));
-              const entryReason = `NEW RCE: ${ns.coin} ${side.toUpperCase()} @ $${ns.price.toFixed(1)} (${ns.source})`;
-
-              // Fixed $100 allocation: equityPct = $100 / equity
-              const newEquityPct = Math.min(NEW_STRATEGY_FIXED_USD / equity, 0.95);
-
-              const entered = await this.executeEntry({
-                asset,
-                strategy: "new",
-                side,
-                equityPct: newEquityPct,
-                leverage: asset.maxLeverage,
-                tpPct: 0.01,           // +1.0%
-                slPct: 0.0025,         // -0.25%
-                rsi5m: 50, rsi15m: 50, triggerRSI: 0,
-                price, equity,
-                entryReason,
-                config,
-              });
-
-              if (entered) {
-                totalEntries++;
-                this.dailyTradeCount++;
-              } else {
-                this.newStrategyCooldown = Date.now() + 5 * 60 * 1000;
-                log(`[NEW] Entry failed — cooldown 5min`, "engine");
+                if (entered) {
+                  totalEntries++;
+                  this.dailyTradeCount++;
+                } else {
+                  this.obosCrossState.delete(shortCrossKey);
+                }
               }
             }
           }
@@ -954,7 +879,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v14.4 TRIPLE: RSI16 + TRENDLINE + NEW | BTC ETH SOL`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.0 DUAL: B&R + OBOS | BTC only`,
         timestamp: new Date().toISOString(),
       });
 
@@ -980,8 +905,6 @@ class TradingEngine {
 
     // ============================================================
     // READ ALL P&L DIRECTLY FROM HYPERLIQUID
-    // Open positions: unrealizedPnl from clearinghouseState
-    // Closed positions: closedPnl + fee from userFills
     // ============================================================
 
     const hlPosMap: Map<string, any> = new Map();
@@ -1030,6 +953,7 @@ class TradingEngine {
             } catch (cancelErr) { log(`[SYNC SAFETY] Cancel error: ${cancelErr}`, "engine"); }
 
             this.syncMissCount.delete(trade.id);
+            this.beApplied.delete(trade.id);
             const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
             const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as any, tradeOpenTime);
@@ -1046,8 +970,11 @@ class TradingEngine {
               log(`[SYNC] Trade #${trade.id} ${trade.coin} — HL fills P&L: gross=$${hlPnl.closedPnl.toFixed(4)} fee=$${hlPnl.totalFee.toFixed(4)} net=$${netPnl.toFixed(4)} exitPx=$${exitPrice.toFixed(2)}`, "engine");
             } else {
               exitPrice = parseFloat(mids[trade.coin] || String(trade.entryPrice));
+              const isLong = trade.side === "long";
               const pv = (trade as any).notionalValue || (syncEq * (trade.size / 100) * trade.leverage);
-              const rm = (exitPrice - trade.entryPrice) / trade.entryPrice; // long only
+              const rm = isLong
+                ? (exitPrice - trade.entryPrice) / trade.entryPrice
+                : (trade.entryPrice - exitPrice) / trade.entryPrice;
               netPnl = pv * rm - pv * 0.00045 * 2;
               log(`[SYNC] Trade #${trade.id} ${trade.coin} — no HL fills found, estimated P&L: $${netPnl.toFixed(4)}`, "engine");
             }
@@ -1059,10 +986,11 @@ class TradingEngine {
               status: "closed", closeReason: `Position closed on HL (sync) | P&L: $${netPnl.toFixed(2)} (from HL)`,
               closedAt: new Date().toISOString(),
             });
-            log(`[SYNC] Trade #${trade.id} ${trade.coin} long auto-closed | HL P&L: $${netPnl.toFixed(2)}`, "engine");
+            const stratLabel = trade.strategy === "breakout" || trade.strategy === "trendline" ? "B&R" : "OBOS";
+            log(`[SYNC] Trade #${trade.id} ${trade.coin} ${trade.side} auto-closed [${stratLabel}] | HL P&L: $${netPnl.toFixed(2)}`, "engine");
             await storage.createLog({
               type: "trade_close",
-              message: `[SYNC] Auto-closed ${trade.coin} long #${trade.id} | HL P&L: $${netPnl.toFixed(2)} USDC`,
+              message: `[SYNC] Auto-closed [${stratLabel}] ${trade.coin} ${trade.side} #${trade.id} | HL P&L: $${netPnl.toFixed(2)} USDC`,
               timestamp: new Date().toISOString(),
             });
           }
@@ -1080,8 +1008,7 @@ class TradingEngine {
     }
 
     // ============================================================
-    // OPEN TRADE MONITORING: read unrealizedPnl from HL + check TP/BE
-    // RSI16: LONG only, SL -0.35%, TP +0.35% | TRENDLINE: LONG only, SL -0.35%, TP +0.35%
+    // OPEN TRADE MONITORING: read unrealizedPnl from HL + check TP/SL/BE
     // ============================================================
     for (const trade of openTrades) {
       const currentPrice = parseFloat(mids[trade.coin] || "0");
@@ -1090,9 +1017,8 @@ class TradingEngine {
       const szd = ac?.szDecimals ?? 2;
       const eqForTrade = (trade as any).entryEquity || currentEquity;
 
-      const stratLabel = trade.strategy === "new" ? "NEW" : trade.strategy === "trendline" ? "TRENDLINE" : "RSI16";
-      const tpPctFromEntry = trade.entryPrice > 0 && trade.takeProfit1 ? (Math.abs(trade.takeProfit1 - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
-      const tpPctLabel = `TP +${tpPctFromEntry}%`;
+      const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
+      const stratLabel = isBreakout ? "B&R" : "OBOS";
       const isLong = trade.side === "long";
 
       // Read unrealizedPnl directly from HL position
@@ -1109,32 +1035,102 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // No BE rule — SL stays at original level until TP or SL hit
+      // ============ OBOS BE RULE ============
+      // After price moves +0.3% in profit → move SL to +0.2% (profit zone)
+      if (trade.strategy === "obos" && !this.beApplied.has(trade.id)) {
+        const profitMove = isLong
+          ? (currentPrice - trade.entryPrice) / trade.entryPrice
+          : (trade.entryPrice - currentPrice) / trade.entryPrice;
+
+        if (profitMove >= 0.003) { // +0.3%
+          const newSL = isLong
+            ? trade.entryPrice * 1.002  // +0.2% above entry
+            : trade.entryPrice * 0.998; // -0.2% below entry (profit zone for short)
+
+          log(`[OBOS BE] Trade #${trade.id} ${trade.coin} ${trade.side.toUpperCase()} — price moved +${(profitMove * 100).toFixed(2)}% ≥ 0.3% → moving SL to +0.2% ($${newSL.toFixed(2)})`, "engine");
+
+          // Update SL on HL: cancel old SL, place new one
+          if (config.apiSecret && config.walletAddress) {
+            try {
+              const executor = createExecutor(config.apiSecret, config.walletAddress);
+              // Cancel existing SL trigger orders for this coin
+              const openOrders = await executor.getOpenOrders();
+              const slOrders = openOrders.filter((o: any) => o.coin === trade.coin && o.reduceOnly);
+              // Only cancel trigger orders (SL), not limit orders (TP)
+              for (const order of slOrders) {
+                // Trigger orders have orderType with trigger — but openOrders doesn't always show this clearly
+                // We cancel orders that are on the opposite side of our position
+                const isSLOrder = isLong
+                  ? order.side === "A" && parseFloat(order.limitPx) < trade.entryPrice
+                  : order.side === "B" && parseFloat(order.limitPx) > trade.entryPrice;
+                if (isSLOrder) {
+                  await executor.cancelOrder(order.coin, order.oid);
+                  log(`[OBOS BE] Cancelled old SL order oid=${order.oid}`, "engine");
+                }
+              }
+
+              // Place new SL at +0.2%
+              const hlPos2 = hlPosMap.get(trade.coin);
+              const posSize = hlPos2 ? Math.abs(parseFloat(hlPos2.szi || "0")) : 0;
+              if (posSize > 0) {
+                const slTriggerPx = parseFloat(formatHLPrice(newSL, szd));
+                const slFillPx = parseFloat(formatHLPrice(isLong ? newSL * 0.98 : newSL * 1.02, szd));
+                await executor.placeOrder({
+                  coin: trade.coin, isBuy: !isLong, sz: posSize,
+                  limitPx: slFillPx,
+                  orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+                  reduceOnly: true,
+                });
+                log(`[OBOS BE] New SL placed @ $${slTriggerPx} (+0.2% profit zone)`, "engine");
+              }
+            } catch (beErr) {
+              log(`[OBOS BE] Failed to move SL: ${beErr}`, "engine");
+            }
+          }
+
+          // Update trade record
+          await storage.updateTrade(trade.id, { stopLoss: newSL });
+          this.beApplied.add(trade.id);
+
+          await storage.createLog({
+            type: "system",
+            message: `[OBOS BE] ${trade.coin} ${trade.side.toUpperCase()} — SL moved to +0.2% ($${newSL.toFixed(2)}) after +${(profitMove * 100).toFixed(2)}% profit`,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
 
       // Exit checks
+      const tpPctFromEntry = trade.entryPrice > 0 && trade.takeProfit1 ? (Math.abs(trade.takeProfit1 - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
+      const tpPctLabel = `TP +${tpPctFromEntry}%`;
+
       let shouldClose = false;
       let closeReason = "";
 
-      // TP hit: depends on direction
+      // TP hit
       const tpHit = isLong
         ? currentPrice >= (trade.takeProfit1 || Infinity)
         : currentPrice <= (trade.takeProfit1 || 0);
-      // SL hit: depends on direction
+      // SL hit
       const slActive = trade.stopLoss > 0;
       const slHit = slActive && (isLong ? currentPrice <= trade.stopLoss : currentPrice >= trade.stopLoss);
 
       const slPctFromEntry = trade.entryPrice > 0 ? (Math.abs(trade.stopLoss - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
+      const isBESL = this.beApplied.has(trade.id);
 
       if (tpHit) {
         shouldClose = true;
         closeReason = `[${stratLabel}] ${tpPctLabel} @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
       } else if (slHit) {
         shouldClose = true;
-        closeReason = `[${stratLabel}] SL -${slPctFromEntry}% hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
-        log(`[SL HIT] Trade #${trade.id} ${trade.coin} LONG [${stratLabel}] | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
+        const slLabel = isBESL ? `SL @ BE +0.2%` : `SL -${slPctFromEntry}%`;
+        closeReason = `[${stratLabel}] ${slLabel} hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+        log(`[SL HIT] Trade #${trade.id} ${trade.coin} ${trade.side.toUpperCase()} [${stratLabel}] | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}${isBESL ? " (BE)" : ""}`, "engine");
       }
 
       if (shouldClose) {
+        this.beApplied.delete(trade.id);
+
         // Execute full close on Hyperliquid
         if (config.apiSecret && config.walletAddress) {
           try {
@@ -1154,7 +1150,7 @@ class TradingEngine {
               const sz = Math.abs(parseFloat(pos.szi || "0"));
               const closePx = isLong ? currentPrice * 0.99 : currentPrice * 1.01;
               await executor.placeOrder({
-                coin: trade.coin, isBuy: !isLong, sz, // opposite side to close
+                coin: trade.coin, isBuy: !isLong, sz,
                 limitPx: parseFloat(formatHLPrice(closePx, szd)),
                 orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
               });
@@ -1169,7 +1165,7 @@ class TradingEngine {
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as "long" | "short", tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              const exitLabel = slHit ? `SL -${slPctFromEntry}%` : tpPctLabel;
+              const exitLabel = slHit ? (isBESL ? "SL @ BE +0.2%" : `SL -${slPctFromEntry}%`) : tpPctLabel;
               closeReason = `[${stratLabel}] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
@@ -1177,7 +1173,7 @@ class TradingEngine {
                 hlPnlUsd: hlPnl.netPnl, hlCloseFee: hlPnl.totalFee,
                 peakPnlPct: 0, status: "closed", closeReason, closedAt: new Date().toISOString(),
               });
-              log(`[CLOSE] Trade #${trade.id} ${trade.coin} LONG [${stratLabel}] | HL P&L: $${hlPnl.netPnl.toFixed(2)}`, "engine");
+              log(`[CLOSE] Trade #${trade.id} ${trade.coin} ${trade.side.toUpperCase()} [${stratLabel}] | HL P&L: $${hlPnl.netPnl.toFixed(2)}`, "engine");
             } else {
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
@@ -1206,14 +1202,14 @@ class TradingEngine {
         }
 
         await logDecision({
-          tradeId: trade.id, coin: trade.coin, action: "exit", side: "long", price: currentPrice,
+          tradeId: trade.id, coin: trade.coin, action: "exit", side: trade.side || "long", price: currentPrice,
           reasoning: `EXIT [${stratLabel}]: ${closeReason} | HL P&L: $${pnlUsd.toFixed(2)} | ROI/AUM: ${(eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0).toFixed(3)}%`,
-          equity: currentEquity, leverage: trade.leverage, strategy: (trade.strategy as StrategyType) || "rsi18",
+          equity: currentEquity, leverage: trade.leverage, strategy: (trade.strategy as StrategyType) || "obos",
         });
 
         await storage.createLog({
           type: "trade_close",
-          message: `CLOSED [${stratLabel}] LONG ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
+          message: `CLOSED [${stratLabel}] ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${pnlUsd.toFixed(2)} USDC | ${closeReason}`,
           timestamp: new Date().toISOString(),
         });
       } else {
@@ -1252,8 +1248,9 @@ class TradingEngine {
     const trade = await storage.getTradeById(tradeId);
     if (!trade || trade.status !== "open") return null;
 
-    const stratLabel = trade.strategy === "new" ? "NEW" : trade.strategy === "trendline" ? "TRENDLINE" : "RSI16";
-    const tradeStrategy = (trade.strategy as StrategyType) || "rsi16";
+    const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
+    const stratLabel = isBreakout ? "B&R" : "OBOS";
+    const tradeStrategy = (trade.strategy as StrategyType) || "obos";
     const isLong = trade.side === "long";
 
     const mids: Record<string, string> = (await fetchAllMids()) || {};
@@ -1261,16 +1258,28 @@ class TradingEngine {
     const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin);
     const config = await storage.getConfig();
 
+    this.beApplied.delete(tradeId);
+
     if (config?.apiSecret && config?.walletAddress) {
       try {
         const executor = createExecutor(config.apiSecret, config.walletAddress);
+        // Cancel all orders first
+        try {
+          const openOrders = await executor.getOpenOrders();
+          const coinOrders = openOrders.filter((o: any) => o.coin === trade.coin);
+          for (const order of coinOrders) {
+            await executor.cancelOrder(order.coin, order.oid);
+            log(`[FORCE_CLOSE] Cancelled order ${order.coin} oid=${order.oid}`, "engine");
+          }
+        } catch (cancelErr) { log(`[FORCE_CLOSE] Cancel error: ${cancelErr}`, "engine"); }
+
         const positions = await executor.getPositions();
         const pos = positions.find((p: any) => p.position?.coin === trade.coin);
         if (pos) {
           const sz = Math.abs(parseFloat(pos.position.szi || "0"));
           const closePx = isLong ? currentPrice * 0.99 : currentPrice * 1.01;
           await executor.placeOrder({
-            coin: trade.coin, isBuy: !isLong, sz, // opposite side to close
+            coin: trade.coin, isBuy: !isLong, sz,
             limitPx: parseFloat(formatHLPrice(closePx, ac?.szDecimals ?? 2)),
             orderType: { limit: { tif: "Ioc" } }, reduceOnly: true,
           });
@@ -1281,7 +1290,7 @@ class TradingEngine {
       try {
         const tradeOpenTime = new Date(trade.openedAt || 0).getTime();
         const fills = await fetchUserFills(config.walletAddress, tradeOpenTime);
-        const hlPnl = extractClosePnlFromFills(fills, trade.coin, "long", tradeOpenTime);
+        const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as "long" | "short", tradeOpenTime);
         if (hlPnl) {
           const eq = this.lastKnownEquity || 0;
           const eqForClose = (trade as any).entryEquity || eq;
@@ -1299,7 +1308,7 @@ class TradingEngine {
           });
           await storage.createLog({
             type: "trade_close",
-            message: `Manual close [${stratLabel}] LONG ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
+            message: `Manual close [${stratLabel}] ${trade.side.toUpperCase()} ${trade.coin} | HL P&L: $${hlPnl.netPnl.toFixed(2)} USDC`,
             timestamp: new Date().toISOString(),
           });
           return updated;
@@ -1331,13 +1340,13 @@ class TradingEngine {
     });
     await storage.createLog({
       type: "trade_close",
-      message: `Manual close [${stratLabel}] LONG ${trade.coin} | Est P&L: $${pnlUsd.toFixed(2)} USDC`,
+      message: `Manual close [${stratLabel}] ${trade.side.toUpperCase()} ${trade.coin} | Est P&L: $${pnlUsd.toFixed(2)} USDC`,
       timestamp: new Date().toISOString(),
     });
     return updated;
   }
 
-  // ============ WEBHOOK HANDLER (TRENDLINE + NEW) ============
+  // ============ WEBHOOK HANDLER (Breakout & Retest) ============
 
   async handleWebhookSignal(payload: { signal: string; price: string | number; ticker?: string; source?: string; strategy?: string }): Promise<{ accepted: boolean; reason: string }> {
     const signal = (payload.signal || "").toUpperCase();
@@ -1360,57 +1369,29 @@ class TradingEngine {
       else coin = t.replace(/USDT$/, "").replace(/USD$/, "");
     }
 
-    // Route signal based on strategy field: "new" -> NEW strategy, else -> TRENDLINE
-    const targetStrategy = (payload.strategy || "").toLowerCase() === "new" ? "new" : "trendline";
-
+    // All webhooks go to Breakout & Retest strategy (no more "new" routing)
     const openTrades = await storage.getOpenTrades();
-
-    if (targetStrategy === "new") {
-      const newOpen = openTrades.filter(t => t.strategy === "new");
-      if (newOpen.length >= 1) {
-        return { accepted: false, reason: `NEW already has ${newOpen.length} open position(s)` };
-      }
-
-      this.pendingNewSignal = {
-        signal: signal as "LONG" | "SHORT",
-        price,
-        time: Date.now(),
-        source: String(payload.source || "tradingview"),
-        coin,
-      };
-
-      log(`[WEBHOOK-NEW] Received ${signal} @ $${price.toFixed(1)} from ${payload.source || "tradingview"} — queued for next scan`, "engine");
-      await storage.createLog({
-        type: "system",
-        message: `[WEBHOOK-NEW] ${signal} signal @ $${price.toFixed(1)} from ${payload.source || "tradingview"} | $${NEW_STRATEGY_FIXED_USD} fixed, SL -0.25% TP +1.0%`,
-        timestamp: new Date().toISOString(),
-      });
-
-      return { accepted: true, reason: `NEW ${signal} signal queued — $${NEW_STRATEGY_FIXED_USD} allocation, 1:4 R:R` };
-    } else {
-      // Original TRENDLINE routing
-      const trendlineOpen = openTrades.filter(t => t.strategy === "trendline");
-      if (trendlineOpen.length >= 1) {
-        return { accepted: false, reason: `Trendline already has ${trendlineOpen.length} open position(s)` };
-      }
-
-      this.pendingWebhookSignal = {
-        signal: signal as "LONG" | "SHORT",
-        price,
-        time: Date.now(),
-        source: String(payload.source || "tradingview"),
-        coin,
-      };
-
-      log(`[WEBHOOK] Received ${signal} @ $${price.toFixed(1)} from ${payload.source || "tradingview"} — queued for next scan`, "engine");
-      await storage.createLog({
-        type: "system",
-        message: `[WEBHOOK] ${signal} signal received @ $${price.toFixed(1)} from ${payload.source || "tradingview"}`,
-        timestamp: new Date().toISOString(),
-      });
-
-      return { accepted: true, reason: `${signal} signal queued — will be processed on next scan cycle` };
+    const breakoutOpen = openTrades.filter(t => t.strategy === "breakout" || t.strategy === "trendline");
+    if (breakoutOpen.length >= 1) {
+      return { accepted: false, reason: `B&R already has ${breakoutOpen.length} open position(s)` };
     }
+
+    this.pendingWebhookSignal = {
+      signal: signal as "LONG" | "SHORT",
+      price,
+      time: Date.now(),
+      source: String(payload.source || "tradingview"),
+      coin,
+    };
+
+    log(`[WEBHOOK] Received ${signal} @ $${price.toFixed(1)} from ${payload.source || "tradingview"} — queued for B&R`, "engine");
+    await storage.createLog({
+      type: "system",
+      message: `[WEBHOOK] ${signal} signal received @ $${price.toFixed(1)} from ${payload.source || "tradingview"} — B&R strategy`,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { accepted: true, reason: `${signal} signal queued for Breakout & Retest — will be processed on next scan cycle` };
   }
 
   async forceScan() { await this.runScanCycle(); }
@@ -1479,30 +1460,24 @@ class TradingEngine {
       const eqForT = (t as any).entryEquity || currentEquity;
       const pnlUsd = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
       const pnlOfAum = eqForT > 0 ? (pnlUsd / eqForT) * 100 : 0;
-      const stratBadge = t.strategy === "new" ? "NEW" : t.strategy === "trendline" ? "TRENDLINE" : "RSI16";
+      const isBreakout = t.strategy === "breakout" || t.strategy === "trendline";
+      const stratBadge = isBreakout ? "B&R" : "OBOS";
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)), stratBadge };
     });
 
-    // Strategy A: RSI18 stats
-    const rsi18Trades = activeClosedTrades.filter(t => t.strategy === "rsi16" || t.strategy === "rsi18");
-    const rsi18Wins = rsi18Trades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
-    const rsi18WinRate = rsi18Trades.length > 0 ? (rsi18Wins / rsi18Trades.length) * 100 : 0;
-    const rsi18PnlUsd = rsi18Trades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
-    const rsi18PnlOfAum = startEq > 0 ? (rsi18PnlUsd / startEq) * 100 : 0;
+    // Strategy A: B&R stats
+    const brTrades = activeClosedTrades.filter(t => t.strategy === "breakout" || t.strategy === "trendline");
+    const brWins = brTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
+    const brWinRate = brTrades.length > 0 ? (brWins / brTrades.length) * 100 : 0;
+    const brPnlUsd = brTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
+    const brPnlOfAum = startEq > 0 ? (brPnlUsd / startEq) * 100 : 0;
 
-    // Strategy B: TRENDLINE stats
-    const tlTrades = activeClosedTrades.filter(t => t.strategy === "trendline");
-    const tlWins = tlTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
-    const tlWinRate = tlTrades.length > 0 ? (tlWins / tlTrades.length) * 100 : 0;
-    const tlPnlUsd = tlTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
-    const tlPnlOfAum = startEq > 0 ? (tlPnlUsd / startEq) * 100 : 0;
-
-    // Strategy C: NEW stats
-    const newTrades = activeClosedTrades.filter(t => t.strategy === "new");
-    const newWins = newTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
-    const newWinRate = newTrades.length > 0 ? (newWins / newTrades.length) * 100 : 0;
-    const newPnlUsd = newTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
-    const newPnlOfAum = startEq > 0 ? (newPnlUsd / startEq) * 100 : 0;
+    // Strategy B: OBOS stats
+    const obosTrades = activeClosedTrades.filter(t => t.strategy === "obos");
+    const obosWins = obosTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
+    const obosWinRate = obosTrades.length > 0 ? (obosWins / obosTrades.length) * 100 : 0;
+    const obosPnlUsd = obosTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
+    const obosPnlOfAum = startEq > 0 ? (obosPnlUsd / startEq) * 100 : 0;
 
     return {
       isRunning: config?.isRunning || false,
@@ -1532,35 +1507,24 @@ class TradingEngine {
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
       strategyStats: {
-        rsi18: {
-          trades: rsi18Trades.length,
-          winRate: rsi18WinRate.toFixed(1),
-          openPositions: openTrades.filter(t => t.strategy === "rsi16" || t.strategy === "rsi18").length,
-          pnlUsd: rsi18PnlUsd.toFixed(4),
-          pnlOfAum: rsi18PnlOfAum.toFixed(3),
-          status: "active",
-        },
-        trendline: {
-          trades: tlTrades.length,
-          winRate: tlWinRate.toFixed(1),
-          openPositions: openTrades.filter(t => t.strategy === "trendline").length,
-          pnlUsd: tlPnlUsd.toFixed(4),
-          pnlOfAum: tlPnlOfAum.toFixed(3),
+        breakout: {
+          trades: brTrades.length,
+          winRate: brWinRate.toFixed(1),
+          openPositions: openTrades.filter(t => t.strategy === "breakout" || t.strategy === "trendline").length,
+          pnlUsd: brPnlUsd.toFixed(4),
+          pnlOfAum: brPnlOfAum.toFixed(3),
           status: "active",
           source: "TradingView webhook",
         },
-        new: {
-          trades: newTrades.length,
-          winRate: newWinRate.toFixed(1),
-          openPositions: openTrades.filter(t => t.strategy === "new").length,
-          pnlUsd: newPnlUsd.toFixed(4),
-          pnlOfAum: newPnlOfAum.toFixed(3),
+        obos: {
+          trades: obosTrades.length,
+          winRate: obosWinRate.toFixed(1),
+          openPositions: openTrades.filter(t => t.strategy === "obos").length,
+          pnlUsd: obosPnlUsd.toFixed(4),
+          pnlOfAum: obosPnlOfAum.toFixed(3),
           status: "active",
-          source: "TradingView webhook (strategy=new)",
-          allocation: `$${NEW_STRATEGY_FIXED_USD} fixed`,
           direction: "LONG + SHORT",
-          assets: "BTC ETH SOL AVAX XRP",
-          riskReward: "1:4 (SL -0.25% / TP +1.0%)",
+          riskReward: "SL -0.5% / TP +0.45% / BE @ +0.3%→+0.2%",
         },
       },
     };

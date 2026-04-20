@@ -11,7 +11,6 @@ import {
 import { cn } from "@/lib/utils";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
-
 } from "recharts";
 
 function getSessionInfo(): { session: string; color: string } {
@@ -42,12 +41,6 @@ export default function Dashboard() {
     refetchInterval: 15000,
   });
 
-  const { data: pnlData = [] } = useQuery({
-    queryKey: ["/api/pnl"],
-    queryFn: () => apiRequest("GET", "/api/pnl").then(r => r.json()),
-    refetchInterval: 30000,
-  });
-
   const { data: equityCurve = [] } = useQuery<any[]>({
     queryKey: ["/api/equity-curve"],
     refetchInterval: 15000,
@@ -70,7 +63,8 @@ export default function Dashboard() {
     queryFn: () => apiRequest("GET", "/api/strategies").then(r => r.json()),
     refetchInterval: 15000,
   });
-  const rsi18Strat = strategyData?.strategies?.find((s: any) => s.strategy === "rsi18");
+  const brStrat = strategyData?.strategies?.find((s: any) => s.strategy === "breakout");
+  const obosStrat = strategyData?.strategies?.find((s: any) => s.strategy === "obos");
   const raceHours = strategyData?.raceHours || 0;
 
   const triggerScan = useMutation({
@@ -84,8 +78,6 @@ export default function Dashboard() {
 
   const combinedPnl = parseFloat(status?.combinedPnl || "0");
   const combinedPnlUsd = parseFloat(status?.combinedPnlUsd || "0");
-  const totalPnlUsd = parseFloat(status?.totalPnlUsd || "0");
-  const openPnlUsd = parseFloat(status?.openPnlUsd || "0");
   const accountBalance = account?.marginSummary?.accountValue
     ? parseFloat(account.marginSummary.accountValue)
     : 0;
@@ -109,7 +101,8 @@ export default function Dashboard() {
   const sessionInfo = getSessionInfo();
   const raceDays = raceHours >= 24 ? `${(raceHours / 24).toFixed(1)}d` : `${raceHours.toFixed(1)}h`;
 
-  const rsi18Open = status?.strategyStats?.rsi18?.openPositions || 0;
+  const brOpen = status?.strategyStats?.breakout?.openPositions || 0;
+  const obosOpenCount = status?.strategyStats?.obos?.openPositions || 0;
   const totalOpen = (status?.openPositions || 0);
 
   return (
@@ -119,7 +112,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v14.2 — RSI18 (BTC only)</p>
+            <p className="text-sm text-muted-foreground">v15.0 — B&R + OBOS (BTC)</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -187,10 +180,10 @@ export default function Dashboard() {
               <Activity className="w-4 h-4 text-muted-foreground" />
             </div>
             <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
-              {totalOpen} / 1
+              {totalOpen} / 2
             </div>
             <p className="text-[10px] text-muted-foreground mt-1">
-              RSI18: {rsi18Open} / 1 max
+              B&R: {brOpen}/1 | OBOS: {obosOpenCount}/1
             </p>
           </CardContent>
         </Card>
@@ -211,71 +204,129 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* ========== RSI18 STRATEGY STATS ========== */}
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle className="text-sm font-medium">RSI18 Strategy — v14.2</CardTitle>
-              <p className="text-[10px] text-muted-foreground mt-0.5">
-                BTC only | RSI ≤18 (5m OR 15m) | 90% equity | 40x | SL -0.5% | TP +0.5% | BE @ +0.25% | {raceDays} running
-              </p>
+      {/* ========== DUAL STRATEGY STATS ========== */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* B&R Strategy */}
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <CardTitle className="text-sm font-medium">Breakout & Retest</CardTitle>
+                <p className="text-[10px] text-muted-foreground mt-0.5">
+                  BTC | LONG | TV Webhook | 50% equity | SL -0.35% | TP +0.35%
+                </p>
+              </div>
+              <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-blue-500/10 text-blue-400 border-blue-500/30">
+                B&R
+              </Badge>
             </div>
-            <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
-              RSI18
-            </Badge>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-4 gap-3 mb-4">
-            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
-              <div className="text-sm font-semibold font-mono text-emerald-400">
-                {rsi18Strat?.totalTrades || 0}
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-4 gap-2">
+              <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
+                <div className="text-sm font-semibold font-mono text-blue-400">
+                  {brStrat?.totalTrades || 0}
+                </div>
+                <div className="text-[8px] text-muted-foreground">{brStrat?.wins || 0}W / {brStrat?.losses || 0}L</div>
               </div>
-              <div className="text-[8px] text-muted-foreground">{rsi18Strat?.wins || 0}W / {rsi18Strat?.losses || 0}L</div>
-            </div>
-            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Win Rate</div>
-              <div className="text-sm font-semibold font-mono text-emerald-400">
-                {rsi18Strat?.winRate || 0}%
+              <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Win Rate</div>
+                <div className="text-sm font-semibold font-mono text-blue-400">
+                  {brStrat?.winRate || 0}%
+                </div>
+                <div className="text-[8px] text-muted-foreground">PF: {(brStrat?.profitFactor || 0) >= 999 ? "∞" : (brStrat?.profitFactor || 0).toFixed(2)}</div>
               </div>
-              <div className="text-[8px] text-muted-foreground">{rsi18Strat?.bestWinStreak || 0}W / {rsi18Strat?.worstLossStreak || 0}L streak</div>
-            </div>
-            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Total P&L</div>
-              <div className={cn(
-                "text-sm font-semibold font-mono",
-                (rsi18Strat?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
-              )}>
-                {(rsi18Strat?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(rsi18Strat?.totalPnlUsd || 0).toFixed(2)}
+              <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Total P&L</div>
+                <div className={cn(
+                  "text-sm font-semibold font-mono",
+                  (brStrat?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                )}>
+                  {(brStrat?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(brStrat?.totalPnlUsd || 0).toFixed(2)}
+                </div>
+                <div className="text-[8px] text-muted-foreground">
+                  {(brStrat?.totalPnlPct || 0) >= 0 ? "+" : ""}{(brStrat?.totalPnlPct || 0).toFixed(2)}% AUM
+                </div>
               </div>
-              <div className="text-[8px] text-muted-foreground">
-                {(rsi18Strat?.totalPnlPct || 0) >= 0 ? "+" : ""}{(rsi18Strat?.totalPnlPct || 0).toFixed(2)}% AUM
-              </div>
-            </div>
-            <div className="p-2.5 rounded bg-emerald-500/5 border border-emerald-500/20">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Avg / Trade</div>
-              <div className={cn(
-                "text-sm font-semibold font-mono",
-                (rsi18Strat?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
-              )}>
-                {(rsi18Strat?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(rsi18Strat?.avgPnlPerTrade || 0).toFixed(2)}
-              </div>
-              <div className="text-[8px] text-muted-foreground">
-                PF: {(rsi18Strat?.profitFactor || 0) >= 999 ? "∞" : (rsi18Strat?.profitFactor || 0).toFixed(2)}
+              <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Avg / Trade</div>
+                <div className={cn(
+                  "text-sm font-semibold font-mono",
+                  (brStrat?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                )}>
+                  {(brStrat?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(brStrat?.avgPnlPerTrade || 0).toFixed(2)}
+                </div>
+                <div className="text-[8px] text-muted-foreground">{brStrat?.bestWinStreak || 0}W / {brStrat?.worstLossStreak || 0}L streak</div>
               </div>
             </div>
-          </div>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+
+        {/* OBOS Strategy */}
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <CardTitle className="text-sm font-medium">Overbought / Oversold</CardTitle>
+                <p className="text-[10px] text-muted-foreground mt-0.5">
+                  BTC | L+S | RSI ≤15/≥88 | 50% eq | SL -0.5% | TP +0.45% | BE +0.3%→+0.2%
+                </p>
+              </div>
+              <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-amber-500/10 text-amber-400 border-amber-500/30">
+                OBOS
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-4 gap-2">
+              <div className="p-2 rounded bg-amber-500/5 border border-amber-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
+                <div className="text-sm font-semibold font-mono text-amber-400">
+                  {obosStrat?.totalTrades || 0}
+                </div>
+                <div className="text-[8px] text-muted-foreground">{obosStrat?.wins || 0}W / {obosStrat?.losses || 0}L</div>
+              </div>
+              <div className="p-2 rounded bg-amber-500/5 border border-amber-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Win Rate</div>
+                <div className="text-sm font-semibold font-mono text-amber-400">
+                  {obosStrat?.winRate || 0}%
+                </div>
+                <div className="text-[8px] text-muted-foreground">PF: {(obosStrat?.profitFactor || 0) >= 999 ? "∞" : (obosStrat?.profitFactor || 0).toFixed(2)}</div>
+              </div>
+              <div className="p-2 rounded bg-amber-500/5 border border-amber-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Total P&L</div>
+                <div className={cn(
+                  "text-sm font-semibold font-mono",
+                  (obosStrat?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                )}>
+                  {(obosStrat?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(obosStrat?.totalPnlUsd || 0).toFixed(2)}
+                </div>
+                <div className="text-[8px] text-muted-foreground">
+                  {(obosStrat?.totalPnlPct || 0) >= 0 ? "+" : ""}{(obosStrat?.totalPnlPct || 0).toFixed(2)}% AUM
+                </div>
+              </div>
+              <div className="p-2 rounded bg-amber-500/5 border border-amber-500/20">
+                <div className="text-[9px] text-muted-foreground mb-0.5">Avg / Trade</div>
+                <div className={cn(
+                  "text-sm font-semibold font-mono",
+                  (obosStrat?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
+                )}>
+                  {(obosStrat?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(obosStrat?.avgPnlPerTrade || 0).toFixed(2)}
+                </div>
+                <div className="text-[8px] text-muted-foreground">{obosStrat?.bestWinStreak || 0}W / {obosStrat?.worstLossStreak || 0}L streak</div>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
 
       {/* Charts Row — Equity Curve */}
-      <div className="grid grid-cols-1 lg:grid-cols-1 gap-4">
+      <div className="grid grid-cols-1 gap-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "658").toFixed(2)} USDC baseline (v14.1)</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.0) | {raceDays} running</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
@@ -334,77 +385,84 @@ export default function Dashboard() {
       </div>
 
       {/* Open Positions */}
-      <div className="grid grid-cols-1 gap-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Open Positions</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {openTrades.length > 0 ? (
-              <div className="space-y-2">
-                {openTrades.map((trade: any) => {
-                  const stratLabel = "RSI18";
-                  const badgeBg = "bg-emerald-500/10 text-emerald-400 border-emerald-500/30";
-                  return (
-                    <div
-                      key={trade.id}
-                      className="flex items-center justify-between p-2.5 rounded-md bg-muted/50 border border-border"
-                      data-testid={`card-position-${trade.id}`}
-                    >
-                      <div className="flex items-center gap-2.5">
-                        <Badge
-                          variant="default"
-                          className="text-[10px] px-1.5 py-0 uppercase"
-                        >
-                          LONG
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm font-medium">Open Positions</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {openTrades.length > 0 ? (
+            <div className="space-y-2">
+              {openTrades.map((trade: any) => {
+                const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
+                const stratLabel = isBreakout ? "B&R" : "OBOS";
+                const badgeBg = isBreakout
+                  ? "bg-blue-500/10 text-blue-400 border-blue-500/30"
+                  : "bg-amber-500/10 text-amber-400 border-amber-500/30";
+                const isLong = trade.side === "long";
+                return (
+                  <div
+                    key={trade.id}
+                    className="flex items-center justify-between p-2.5 rounded-md bg-muted/50 border border-border"
+                    data-testid={`card-position-${trade.id}`}
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <Badge
+                        variant="default"
+                        className={cn(
+                          "text-[10px] px-1.5 py-0 uppercase",
+                          isLong ? "bg-emerald-600" : "bg-red-600"
+                        )}
+                      >
+                        {trade.side.toUpperCase()}
+                      </Badge>
+                      <div>
+                        <span className="text-sm font-medium">{trade.coin}</span>
+                        <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
+                        <Badge variant="outline" className={cn("ml-2 text-[9px] px-1 py-0", badgeBg)}>
+                          {stratLabel}
                         </Badge>
-                        <div>
-                          <span className="text-sm font-medium">{trade.coin}</span>
-                          <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
-                          <Badge variant="outline" className={cn("ml-2 text-[9px] px-1 py-0", badgeBg)}>
-                            {stratLabel}
-                          </Badge>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <div className={cn(
-                          "text-sm font-mono font-medium",
-                          (trade.pnlOfAum || 0) >= 0 ? "text-emerald-500" : "text-red-500"
-                        )}>
-                          {(trade.pnlOfAum || 0) >= 0 ? "+" : ""}{(trade.pnlOfAum || 0).toFixed(3)}% AUM
-                        </div>
-                        <div className={cn(
-                          "text-[10px] font-mono",
-                          (trade.pnlUsd || 0) >= 0 ? "text-emerald-400/60" : "text-red-400/60"
-                        )}>
-                          {fmtUsd(trade.pnlUsd || 0)}
-                          {trade.hlPnlUsd !== null && trade.hlPnlUsd !== undefined && (
-                            <span className="text-[8px] text-muted-foreground ml-1">HL</span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-1.5 justify-end">
-                          <span className="text-[10px] text-muted-foreground font-mono">
-                            ${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}
-                          </span>
-                          {trade.stopLoss > 0 && trade.stopLoss >= trade.entryPrice * 0.999 && (
-                            <Badge className="text-[8px] px-1 py-0 bg-amber-500/20 text-amber-400 border-0">
-                              BE SL
-                            </Badge>
-                          )}
-                        </div>
                       </div>
                     </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
-                No open positions
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+                    <div className="text-right">
+                      <div className={cn(
+                        "text-sm font-mono font-medium",
+                        (trade.pnlOfAum || 0) >= 0 ? "text-emerald-500" : "text-red-500"
+                      )}>
+                        {(trade.pnlOfAum || 0) >= 0 ? "+" : ""}{(trade.pnlOfAum || 0).toFixed(3)}% AUM
+                      </div>
+                      <div className={cn(
+                        "text-[10px] font-mono",
+                        (trade.pnlUsd || 0) >= 0 ? "text-emerald-400/60" : "text-red-400/60"
+                      )}>
+                        {fmtUsd(trade.pnlUsd || 0)}
+                        {trade.hlPnlUsd !== null && trade.hlPnlUsd !== undefined && (
+                          <span className="text-[8px] text-muted-foreground ml-1">HL</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 justify-end">
+                        <span className="text-[10px] text-muted-foreground font-mono">
+                          ${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}
+                        </span>
+                        {trade.stopLoss > 0 && trade.entryPrice > 0 && (
+                          isLong ? trade.stopLoss >= trade.entryPrice * 0.999 : trade.stopLoss <= trade.entryPrice * 1.001
+                        ) && (
+                          <Badge className="text-[8px] px-1 py-0 bg-amber-500/20 text-amber-400 border-0">
+                            BE SL
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="h-[80px] flex items-center justify-center text-sm text-muted-foreground">
+              No open positions
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Trade History */}
       <Card>
@@ -412,13 +470,17 @@ export default function Dashboard() {
           <CardTitle className="text-sm font-medium">Trade History</CardTitle>
         </CardHeader>
         <CardContent>
-          {(closedTrades as any[]).length > 0 ? (
+          {(closedTrades as any[]).filter((t: any) => {
+            // Only show trades from v15.0 onwards
+            return t.strategy === "breakout" || t.strategy === "obos" || t.strategy === "trendline";
+          }).length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead>
                   <tr className="border-b border-border text-muted-foreground">
                     <th className="text-left py-1.5 px-1 font-medium">Date/Time</th>
                     <th className="text-left py-1.5 px-1 font-medium">Asset</th>
+                    <th className="text-left py-1.5 px-1 font-medium">Side</th>
                     <th className="text-left py-1.5 px-1 font-medium">Strategy</th>
                     <th className="text-right py-1.5 px-1 font-medium">Entry</th>
                     <th className="text-right py-1.5 px-1 font-medium">Exit</th>
@@ -427,13 +489,18 @@ export default function Dashboard() {
                   </tr>
                 </thead>
                 <tbody>
-                  {(closedTrades as any[]).sort((a: any, b: any) => (b.closedAt || "").localeCompare(a.closedAt || "")).slice(0, 30).map((trade: any) => {
-                    const net = (trade.hlPnlUsd || 0) - (trade.hlCloseFee || 0);
+                  {(closedTrades as any[])
+                    .filter((t: any) => t.strategy === "breakout" || t.strategy === "obos" || t.strategy === "trendline")
+                    .sort((a: any, b: any) => (b.closedAt || "").localeCompare(a.closedAt || ""))
+                    .slice(0, 30)
+                    .map((trade: any) => {
+                    const net = trade.hlPnlUsd ?? 0;
                     const openDate = trade.openedAt ? new Date(trade.openedAt) : null;
                     const closeDate = trade.closedAt ? new Date(trade.closedAt) : null;
-                    const isRsi18 = true;
+                    const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
+                    const isLong = trade.side === "long";
                     const reason = (trade.closeReason || "")
-                      .replace(/\[(RSI18|DIV)\]\s*/g, "")
+                      .replace(/\[(B&R|OBOS)\]\s*/g, "")
                       .replace(/\s*\|\s*HL P&L.*$/g, "")
                       .replace(/Position closed on HL \(sync\)\s*\|?\s*/g, "Sync")
                       .replace(/P&L:.*$/g, "")
@@ -453,10 +520,21 @@ export default function Dashboard() {
                             variant="outline"
                             className={cn(
                               "text-[9px] px-1 py-0",
-                              isRsi18 ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" : "bg-blue-500/10 text-blue-400 border-blue-500/30"
+                              isLong ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" : "bg-red-500/10 text-red-400 border-red-500/30"
                             )}
                           >
-                            {isRsi18 ? "RSI18" : "DIV"}
+                            {trade.side.toUpperCase()}
+                          </Badge>
+                        </td>
+                        <td className="py-1.5 px-1">
+                          <Badge
+                            variant="outline"
+                            className={cn(
+                              "text-[9px] px-1 py-0",
+                              isBreakout ? "bg-blue-500/10 text-blue-400 border-blue-500/30" : "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                            )}
+                          >
+                            {isBreakout ? "B&R" : "OBOS"}
                           </Badge>
                         </td>
                         <td className="py-1.5 px-1 text-right font-mono">${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}</td>
@@ -475,8 +553,8 @@ export default function Dashboard() {
               </table>
             </div>
           ) : (
-            <div className="h-[100px] flex items-center justify-center text-sm text-muted-foreground">
-              No closed trades yet
+            <div className="h-[80px] flex items-center justify-center text-sm text-muted-foreground">
+              No closed trades yet — fresh start
             </div>
           )}
         </CardContent>
