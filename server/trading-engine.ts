@@ -1,18 +1,18 @@
 /**
  * HyperTrader — Trading Engine v14.3
  *
- * DUAL STRATEGY: RSI18 (50%) + TRENDLINE (50%)
+ * DUAL STRATEGY: RSI16 (50%) + TRENDLINE (50%)
  *
- * STRATEGY A — RSI18:
- *   - BTC ONLY, LONG only, RSI ≤ 18 on 5m OR 15m
- *   - 50% equity, 40x leverage, max 1 position
- *   - SL -0.5%, TP +0.5%, BE @ +0.25%
+ * STRATEGY A — RSI16:
+ *   - BTC, ETH, SOL — LONG only, RSI ≤ 16 on 5m OR 15m
+ *   - 50% equity, max leverage, max 1 position
+ *   - SL -0.35%, TP +0.45%, BE @ +0.25%
  *
  * STRATEGY B — TRENDLINE (AI + TradingView webhook):
- *   - BTC ONLY, LONG or SHORT
- *   - 50% equity, 40x leverage, max 1 position
+ *   - BTC, ETH, SOL — LONG only
+ *   - 50% equity, max leverage, max 1 position
  *   - Signals from: (1) Claude AI via Perplexity API (2) TradingView webhook
- *   - SL at trendline invalidation, TP +0.5%, BE @ +0.25%
+ *   - SL -0.25%, TP +0.45%, BE @ +0.25%
  *   - AI scans every 30s (cost control), webhook instant
  *
  * Shared:
@@ -28,7 +28,8 @@ import { storage } from "./storage";
 import { log } from "./index";
 import { createExecutor } from "./hyperliquid-executor";
 import { logDecision, reviewClosedTrades, generateInsights, getLearningStats, run24hReview } from "./learning-engine";
-import { analyzeTrendlines, type TrendlineSignal } from "./ai-trendline-analyzer";
+// AI trendline analyzer removed — using TradingView webhook only
+// import { analyzeTrendlines, type TrendlineSignal } from "./ai-trendline-analyzer";
 
 // ============ ASSET CONFIGURATION ============
 
@@ -45,6 +46,8 @@ interface AssetConfig {
 
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",  displayName: "Bitcoin",     dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
+  { coin: "ETH",  displayName: "Ethereum",    dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
+  { coin: "SOL",  displayName: "Solana",      dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
 ];
 
 // ============ STRATEGY TYPE ============
@@ -328,11 +331,9 @@ class TradingEngine {
   // RSI18 cross state — only enter once per RSI extreme event (BTC only)
   private rsi18CrossState: Map<string, { price: number; timestamp: number; rsi: number }> = new Map();
 
-  // Trendline strategy state
-  private lastAiScanTime = 0;
-  private lastTrendlineSignal: TrendlineSignal | null = null;
+  // Trendline strategy state — TradingView webhook only
   private trendlineCooldown = 0; // timestamp until which trendline entries are blocked (after failed setup)
-  private pendingWebhookSignal: { signal: "LONG" | "SHORT"; price: number; time: number; source: string } | null = null;
+  private pendingWebhookSignal: { signal: "LONG" | "SHORT"; price: number; time: number; source: string; coin: string } | null = null;
 
   // Robust position sync — track consecutive "no position" readings per tradeId
   private syncMissCount: Map<number, number> = new Map();
@@ -426,10 +427,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v14.3 started | DUAL: RSI18 (50%) + TRENDLINE AI+Webhook (50%) | BTC | 40x | SL -0.5% | TP +0.5% | BE @ +0.25% | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v14.3 started | DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL | SL -0.35% | TP +0.45% | BE @ +0.25% | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v14.3 started | DUAL: RSI18 (50%) + TRENDLINE (50%) | BTC | 40x | SL -0.5% | TP +0.5% | BE @ +0.25% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v14.3 started | DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL | SL -0.35% | TP +0.45% | BE @ +0.25% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
 
@@ -675,7 +676,7 @@ class TradingEngine {
         });
       }
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v14.3 DUAL: RSI18 (50%) + TRENDLINE (50%) | BTC | 40x`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v14.3 DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -699,101 +700,103 @@ class TradingEngine {
       let totalEntries = 0;
 
       // ================================================================
-      // STRATEGY A: RSI18 — BTC ONLY
-      // Signal: 5m RSI ≤ 18 OR 15m RSI ≤ 18
-      // 50% equity, 40x, max 1 position, TP +0.5%, SL -0.5%, BE @ +0.25%
+      // STRATEGY A: RSI16 — BTC, ETH, SOL
+      // Signal: 5m RSI ≤ 16 OR 15m RSI ≤ 16
+      // LONG only, 50% equity, max leverage, max 1 position
+      // SL -0.35%, TP +0.45%, BE @ +0.25%
       // ================================================================
       {
-        const RSI18_THRESHOLD = 18;
-        const RSI18_RESET_THRESHOLD = 25;
-        const btcAsset = ALLOWED_ASSETS.find(a => a.coin === "BTC")!;
+        const RSI_THRESHOLD = 16;
+        const RSI_RESET_THRESHOLD = 25;
 
-        const ctx = assetCtxMap["BTC"];
-        if (ctx?.midPx && ctx.midPx !== "None") {
+        for (const asset of ALLOWED_ASSETS) {
+          const ctx = assetCtxMap[asset.coin];
+          if (!ctx?.midPx || ctx.midPx === "None") continue;
           const price = parseFloat(ctx.midPx);
-          if (!isNaN(price) && price > 0) {
-            const volume24h = parseFloat(ctx.dayNtlVlm || "0");
-            const funding = parseFloat(ctx.funding || "0");
-            const openInterest = parseFloat(ctx.openInterest || "0");
-            const prevDayPx = parseFloat(ctx.prevDayPx || String(price));
-            const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : 0;
+          if (isNaN(price) || price <= 0) continue;
 
-            const [ohlcv5m, ohlcv15m] = await Promise.all([
-              fetchCandlesOHLCV("BTC", "5m", 30),
-              fetchCandlesOHLCV("BTC", "15m", 30),
-            ]);
+          const volume24h = parseFloat(ctx.dayNtlVlm || "0");
+          const funding = parseFloat(ctx.funding || "0");
+          const openInterest = parseFloat(ctx.openInterest || "0");
+          const prevDayPx = parseFloat(ctx.prevDayPx || String(price));
+          const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : 0;
 
-            const c5m = ohlcv5m.map(c => c.close);
-            const c15m = ohlcv15m.map(c => c.close);
+          const [ohlcv5m, ohlcv15m] = await Promise.all([
+            fetchCandlesOHLCV(asset.coin, "5m", 30),
+            fetchCandlesOHLCV(asset.coin, "15m", 30),
+          ]);
 
-            if (c5m.length >= 15 || c15m.length >= 15) {
-              // Intra-candle RSI — append current live price
-              const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
-              const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
+          const c5m = ohlcv5m.map(c => c.close);
+          const c15m = ohlcv15m.map(c => c.close);
 
-              // Signal: 5m OR 15m ≤ 18
-              const rsi18Signal = rsi5m <= RSI18_THRESHOLD || rsi15m <= RSI18_THRESHOLD;
-              const triggerRSI = Math.min(rsi5m, rsi15m);
-              const triggeredTF = rsi5m <= RSI18_THRESHOLD ? (rsi15m <= RSI18_THRESHOLD ? "5m+15m" : "5m") : "15m";
+          if (c5m.length >= 15 || c15m.length >= 15) {
+            // Intra-candle RSI — append current live price
+            const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
+            const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
 
-              let scanSignal: string = "neutral";
-              let scanDetails = "";
+            // Signal: 5m OR 15m ≤ 16
+            const rsiSignal = rsi5m <= RSI_THRESHOLD || rsi15m <= RSI_THRESHOLD;
+            const triggerRSI = Math.min(rsi5m, rsi15m);
+            const triggeredTF = rsi5m <= RSI_THRESHOLD ? (rsi15m <= RSI_THRESHOLD ? "5m+15m" : "5m") : "15m";
 
-              if (rsi18Signal) {
-                scanSignal = "rsi18_oversold";
-                scanDetails = `RSI18: ${triggeredTF} triggered | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
-              } else {
-                scanDetails = `RSI18: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need ≤18 on either TF`;
+            let scanSignal: string = "neutral";
+            let scanDetails = "";
+
+            if (rsiSignal) {
+              scanSignal = "rsi16_oversold";
+              scanDetails = `RSI16: ${triggeredTF} triggered | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
+            } else {
+              scanDetails = `RSI16: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need ≤16 on either TF`;
+            }
+
+            await storage.upsertMarketScan({
+              coin: asset.coin, price, rsi5m, rsi15m, rsi: 50, rsi4h: 50, rsi1d: 50,
+              ema10: 0, ema21: 0, ema50: 0,
+              volume24h, change24h,
+              signal: scanSignal,
+              fundingRate: funding, openInterest,
+              confluenceScore: rsiSignal ? 10 : 0,
+              confluenceDetails: scanDetails,
+              riskRewardRatio: 0,
+              timestamp: new Date().toISOString(),
+            });
+
+            const crossKey = `${asset.coin}_rsi16_long`;
+
+            // Reset cross state when RSI recovers above 25 on BOTH timeframes
+            if (!rsiSignal && rsi5m > RSI_RESET_THRESHOLD && rsi15m > RSI_RESET_THRESHOLD) {
+              if (this.rsi18CrossState.has(crossKey)) {
+                this.rsi18CrossState.delete(crossKey);
+                log(`[RSI16] ${asset.coin} cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${RSI_RESET_THRESHOLD}`, "engine");
               }
+            }
 
-              await storage.upsertMarketScan({
-                coin: "BTC", price, rsi5m, rsi15m, rsi: 50, rsi4h: 50, rsi1d: 50,
-                ema10: 0, ema21: 0, ema50: 0,
-                volume24h, change24h,
-                signal: scanSignal,
-                fundingRate: funding, openInterest,
-                confluenceScore: rsi18Signal ? 10 : 0,
-                confluenceDetails: scanDetails,
-                riskRewardRatio: 0,
-                timestamp: new Date().toISOString(),
-              });
+            // Entry: RSI signal, no position already open for this strategy, slot available
+            // Also skip if this coin already has a trendline position open
+            const coinHasPosition = openTrades.some(t => t.coin === asset.coin);
+            if (rsiSignal && rsi18Open.length < RSI18_MAX_POSITIONS && !coinHasPosition) {
+              if (!this.rsi18CrossState.has(crossKey)) {
+                this.rsi18CrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
 
-              const crossKey = `BTC_rsi18_long`;
+                const entryReason = `RSI16: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ 16`;
+                const entered = await this.executeEntry({
+                  asset,
+                  strategy: "rsi18",
+                  side: "long",
+                  equityPct: 0.50,
+                  leverage: asset.maxLeverage,
+                  tpPct: 0.0045,         // +0.45%
+                  slPct: 0.0035,         // -0.35%
+                  rsi5m, rsi15m, triggerRSI, price, equity,
+                  entryReason,
+                  config,
+                });
 
-              // Reset cross state when RSI recovers above 25 on BOTH timeframes
-              if (!rsi18Signal && rsi5m > RSI18_RESET_THRESHOLD && rsi15m > RSI18_RESET_THRESHOLD) {
-                if (this.rsi18CrossState.has(crossKey)) {
+                if (entered) {
+                  totalEntries++;
+                  this.dailyTradeCount++;
+                } else {
                   this.rsi18CrossState.delete(crossKey);
-                  log(`[RSI18] BTC cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${RSI18_RESET_THRESHOLD}`, "engine");
-                }
-              }
-
-              // Entry: RSI18 signal, no position already open for this strategy, slot available
-              if (rsi18Signal && rsi18Open.length < RSI18_MAX_POSITIONS) {
-                if (!this.rsi18CrossState.has(crossKey)) {
-                  this.rsi18CrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
-
-                  const entryReason = `RSI18: ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ 18`;
-                  const entered = await this.executeEntry({
-                    asset: btcAsset,
-                    strategy: "rsi18",
-                    side: "long",
-                    equityPct: 0.50,       // 50% for RSI18 (other 50% for TRENDLINE)
-                    leverage: btcAsset.maxLeverage, // 40x
-                    tpPct: 0.005,          // +0.5%
-                    slPct: 0.005,          // -0.5%
-                    rsi5m, rsi15m, triggerRSI, price, equity,
-                    entryReason,
-                    config,
-                  });
-
-                  if (entered) {
-                    totalEntries++;
-                    this.dailyTradeCount++;
-                  } else {
-                    // Remove cross state if entry failed (didn't fill)
-                    this.rsi18CrossState.delete(crossKey);
-                  }
                 }
               }
             }
@@ -802,97 +805,58 @@ class TradingEngine {
       }
 
       // ================================================================
-      // STRATEGY B: TRENDLINE — AI + TradingView Webhook
-      // Signal: Claude AI analysis OR TradingView webhook
-      // LONG only (for now), 50% equity, 40x, max 1 position
-      // TP +0.5%, SL -0.5% (or at invalidation), BE @ +0.25%
-      // AI scans every 30s, webhook signals processed instantly
+      // STRATEGY B: TRENDLINE — TradingView Webhook Only
+      // Signal: TradingView AlgoAlpha Breakout & Retest indicator
+      // LONG only, 50% equity, max leverage, max 1 position
+      // SL -0.35%, TP +0.45%, BE @ +0.25%
       // ================================================================
-      {
-        const btcAsset = ALLOWED_ASSETS.find(a => a.coin === "BTC")!;
-        const ctx = assetCtxMap["BTC"];
-        const price = ctx?.midPx ? parseFloat(ctx.midPx) : 0;
+      if (this.pendingWebhookSignal && trendlineOpen.length < TRENDLINE_MAX_POSITIONS) {
+        const ws = this.pendingWebhookSignal;
+        this.pendingWebhookSignal = null; // consume immediately
 
-        if (price > 0 && trendlineOpen.length < TRENDLINE_MAX_POSITIONS) {
-          // Check cooldown — skip if we had a failed trendline trade recently (5 minutes)
-          if (Date.now() < this.trendlineCooldown) {
-            log(`[TRENDLINE] Cooldown active — skipping until ${new Date(this.trendlineCooldown).toISOString()}`, "engine");
+        const signalAge = Date.now() - ws.time;
+
+        // Check cooldown
+        if (Date.now() < this.trendlineCooldown) {
+          log(`[TRENDLINE] Cooldown active — discarding ${ws.signal} signal`, "engine");
+        } else if (signalAge >= 60_000) {
+          log(`[TRENDLINE] Stale webhook (${(signalAge/1000).toFixed(0)}s old) — discarding`, "engine");
+        } else if (ws.signal !== "LONG") {
+          log(`[TRENDLINE] ${ws.signal} signal — skipping (LONG only)`, "engine");
+        } else {
+          // Find asset for this coin
+          const asset = ALLOWED_ASSETS.find(a => a.coin === ws.coin);
+          if (!asset) {
+            log(`[TRENDLINE] Unknown coin ${ws.coin} — skipping`, "engine");
           } else {
-            let shouldEnterTL = false;
-            let tlEntryReason = "";
-            let tlSide: "long" | "short" = "long";
-            let tlCustomSL: number | undefined;
+            // Don't enter if this coin already has a position from either strategy
+            const coinHasPosition = openTrades.some(t => t.coin === ws.coin);
+            if (coinHasPosition) {
+              log(`[TRENDLINE] ${ws.coin} already has open position — skipping`, "engine");
+            } else {
+              const price = parseFloat(assetCtxMap[ws.coin]?.midPx || String(ws.price));
+              const entryReason = `TV Webhook: LONG @ $${ws.price.toFixed(1)} (${ws.source})`;
 
-            // Source 1: TradingView Webhook signal (instant, highest priority)
-            if (this.pendingWebhookSignal) {
-              const ws = this.pendingWebhookSignal;
-              const signalAge = Date.now() - ws.time;
-              if (signalAge < 60_000 && ws.signal === "LONG") { // Only LONG for now, signal must be < 60s old
-                shouldEnterTL = true;
-                tlSide = "long";
-                tlEntryReason = `TV Webhook: ${ws.signal} @ $${ws.price.toFixed(1)} (${ws.source})`;
-                log(`[TRENDLINE] Processing TV webhook signal: ${ws.signal} @ $${ws.price}`, "engine");
-              } else if (signalAge >= 60_000) {
-                log(`[TRENDLINE] Stale webhook signal (${(signalAge/1000).toFixed(0)}s old) — discarding`, "engine");
-              } else if (ws.signal === "SHORT") {
-                log(`[TRENDLINE] SHORT webhook signal — skipping (LONG only for now)`, "engine");
-              }
-              this.pendingWebhookSignal = null; // consume signal regardless
-            }
-
-            // Source 2: AI Trendline Analysis (every 30s, lower priority)
-            if (!shouldEnterTL) {
-              const AI_SCAN_INTERVAL = 30_000; // 30 seconds
-              if (Date.now() - this.lastAiScanTime >= AI_SCAN_INTERVAL) {
-                this.lastAiScanTime = Date.now();
-                try {
-                  const candles = await fetchCandlesOHLCV("BTC", "5m", 40);
-                  if (candles.length >= 30) {
-                    const signal = await analyzeTrendlines(candles, price);
-                    this.lastTrendlineSignal = signal;
-
-                    if (signal.signal === "LONG" && signal.confidence >= 6) {
-                      shouldEnterTL = true;
-                      tlSide = "long";
-                      tlEntryReason = `AI TL: conf=${signal.confidence} | ${signal.trendline?.type || "descending"} ${signal.trendline?.touch_count || 0} touches | ${signal.reason}`;
-                      if (signal.invalidation_price > 0) {
-                        tlCustomSL = signal.invalidation_price;
-                      }
-                      log(`[TRENDLINE AI] LONG signal! conf=${signal.confidence} entry=$${signal.entry_price.toFixed(1)} inv=$${signal.invalidation_price.toFixed(1)}`, "engine");
-                    } else {
-                      log(`[TRENDLINE AI] ${signal.signal} conf=${signal.confidence} | ${signal.reason}`, "engine");
-                    }
-                  }
-                } catch (aiErr) {
-                  log(`[TRENDLINE AI] Error: ${aiErr}`, "engine");
-                }
-              }
-            }
-
-            // Execute trendline entry
-            if (shouldEnterTL) {
               const entered = await this.executeEntry({
-                asset: btcAsset,
+                asset,
                 strategy: "trendline",
-                side: tlSide,
+                side: "long",
                 equityPct: 0.50,
-                leverage: btcAsset.maxLeverage, // 40x
-                tpPct: 0.005,          // +0.5%
-                slPct: 0.005,          // -0.5% default (overridden by customSL if present)
+                leverage: asset.maxLeverage,
+                tpPct: 0.0045,         // +0.45%
+                slPct: 0.0035,         // -0.35%
                 rsi5m: 50, rsi15m: 50, triggerRSI: 0,
                 price, equity,
-                entryReason: tlEntryReason,
+                entryReason,
                 config,
-                customSL: tlCustomSL,
               });
 
               if (entered) {
                 totalEntries++;
                 this.dailyTradeCount++;
               } else {
-                // Failed entry — cooldown 5 minutes before trying again
                 this.trendlineCooldown = Date.now() + 5 * 60 * 1000;
-                log(`[TRENDLINE] Entry failed — cooldown until ${new Date(this.trendlineCooldown).toISOString()}`, "engine");
+                log(`[TRENDLINE] Entry failed — cooldown 5min`, "engine");
               }
             }
           }
@@ -902,7 +866,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v14.3 DUAL: RSI18 (50%) + TRENDLINE (50%) | BTC | 40x`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v14.3 DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1334,7 +1298,7 @@ class TradingEngine {
 
   // ============ TRENDLINE WEBHOOK HANDLER ============
 
-  async handleWebhookSignal(payload: { signal: string; price: string | number; source?: string }): Promise<{ accepted: boolean; reason: string }> {
+  async handleWebhookSignal(payload: { signal: string; price: string | number; ticker?: string; source?: string }): Promise<{ accepted: boolean; reason: string }> {
     const signal = (payload.signal || "").toUpperCase();
     if (signal !== "LONG" && signal !== "SHORT") {
       return { accepted: false, reason: `Invalid signal: ${signal}. Expected LONG or SHORT.` };
@@ -1343,6 +1307,16 @@ class TradingEngine {
     const price = typeof payload.price === "string" ? parseFloat(payload.price) : payload.price;
     if (isNaN(price) || price <= 0) {
       return { accepted: false, reason: `Invalid price: ${payload.price}` };
+    }
+
+    // Extract coin from ticker (e.g. "BTCUSDT.P" -> "BTC", "ETHUSDT" -> "ETH")
+    let coin = "BTC"; // default
+    if (payload.ticker) {
+      const t = String(payload.ticker).toUpperCase().replace(".P", "");
+      if (t.startsWith("BTC")) coin = "BTC";
+      else if (t.startsWith("ETH")) coin = "ETH";
+      else if (t.startsWith("SOL")) coin = "SOL";
+      else coin = t.replace(/USDT$/, "").replace(/USD$/, "");
     }
 
     // Check if trendline strategy already has an open position
@@ -1358,6 +1332,7 @@ class TradingEngine {
       price,
       time: Date.now(),
       source: String(payload.source || "tradingview"),
+      coin,
     };
 
     log(`[WEBHOOK] Received ${signal} @ $${price.toFixed(1)} from ${payload.source || "tradingview"} — queued for next scan`, "engine");
@@ -1368,10 +1343,6 @@ class TradingEngine {
     });
 
     return { accepted: true, reason: `${signal} signal queued — will be processed on next scan cycle` };
-  }
-
-  getLastTrendlineSignal(): TrendlineSignal | null {
-    return this.lastTrendlineSignal;
   }
 
   async forceScan() { await this.runScanCycle(); }
@@ -1457,8 +1428,6 @@ class TradingEngine {
     const tlWinRate = tlTrades.length > 0 ? (tlWins / tlTrades.length) * 100 : 0;
     const tlPnlUsd = tlTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
     const tlPnlOfAum = startEq > 0 ? (tlPnlUsd / startEq) * 100 : 0;
-    const lastTlSignal = this.getLastTrendlineSignal();
-
     return {
       isRunning: config?.isRunning || false,
       openPositions: openTrades.length,
@@ -1502,11 +1471,7 @@ class TradingEngine {
           pnlUsd: tlPnlUsd.toFixed(4),
           pnlOfAum: tlPnlOfAum.toFixed(3),
           status: "active",
-          lastSignal: lastTlSignal ? {
-            signal: lastTlSignal.signal,
-            confidence: lastTlSignal.confidence,
-            reason: lastTlSignal.reason,
-          } : null,
+          source: "TradingView webhook",
         },
       },
     };
