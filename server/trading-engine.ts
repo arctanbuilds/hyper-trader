@@ -12,7 +12,7 @@
  *   - BTC, ETH, SOL — LONG only
  *   - 50% equity, max leverage, max 1 position
  *   - Signals from: (1) Claude AI via Perplexity API (2) TradingView webhook
- *   - SL -0.25%, TP +0.45%, BE @ +0.25%
+ *   - SL -0.35%, TP +0.45%, BE @ +0.25%
  *   - AI scans every 30s (cost control), webhook instant
  *
  * Shared:
@@ -1082,6 +1082,8 @@ class TradingEngine {
 
       const isBE = slActive && Math.abs(trade.stopLoss - trade.entryPrice) < trade.entryPrice * 0.001; // SL is at or near entry = BE was activated
 
+      const slPctFromEntry = trade.entryPrice > 0 ? (Math.abs(trade.stopLoss - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
+
       if (tpHit) {
         shouldClose = true;
         closeReason = `[${stratLabel}] ${tpPctLabel} @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
@@ -1089,7 +1091,7 @@ class TradingEngine {
         shouldClose = true;
         closeReason = isBE
           ? `[${stratLabel}] SL @ BE $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`
-          : `[${stratLabel}] SL -0.5% hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
+          : `[${stratLabel}] SL -${slPctFromEntry}% hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
         log(`[SL HIT] Trade #${trade.id} ${trade.coin} LONG [${stratLabel}] | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
       }
 
@@ -1128,7 +1130,7 @@ class TradingEngine {
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as "long" | "short", tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              const exitLabel = slHit ? (isBE ? "SL @ BE" : "SL -0.5%") : tpPctLabel;
+              const exitLabel = slHit ? (isBE ? "SL @ BE" : `SL -${slPctFromEntry}%`) : tpPctLabel;
               closeReason = `[${stratLabel}] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
