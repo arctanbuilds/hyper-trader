@@ -15,7 +15,7 @@
  *   - SL -0.35%, TP +0.35%
  *
  * STRATEGY C — NEW (Craig Percoco RCE, TradingView webhook):
- *   - BTC — LONG only
+ *   - BTC, ETH, SOL, AVAX, XRP — LONG + SHORT
  *   - Fixed $100 allocation, max leverage, max 1 position
  *   - Signals from TradingView webhook with strategy="new"
  *   - SL -0.25%, TP +1.0% (1:4 R:R)
@@ -438,7 +438,7 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v14.4 started | TRIPLE: RSI16 + TRENDLINE + NEW | BTC ETH SOL | NEW: $${NEW_STRATEGY_FIXED_USD} fixed, SL -0.25% TP +1.0% (1:4 R:R) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v14.4.1 started | TRIPLE: RSI16 + TRENDLINE + NEW | NEW: $${NEW_STRATEGY_FIXED_USD} fixed, L+S, BTC ETH SOL AVAX XRP, 1:4 R:R | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
     log(`Engine v14.4 started | TRIPLE: RSI16 + TRENDLINE + NEW | NEW: $${NEW_STRATEGY_FIXED_USD} fixed, SL -0.25% TP +1.0% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
@@ -896,7 +896,7 @@ class TradingEngine {
       // ================================================================
       // STRATEGY C: NEW — Craig Percoco RCE Framework
       // Signal: TradingView webhook with strategy="new"
-      // LONG only, fixed $100, max leverage, max 1 position
+      // LONG + SHORT, BTC ETH SOL AVAX XRP, fixed $100, max 1 position
       // SL -0.25%, TP +1.0% (1:4 R:R)
       // ================================================================
       if (this.pendingNewSignal && newOpen.length < NEW_MAX_POSITIONS) {
@@ -909,8 +909,6 @@ class TradingEngine {
           log(`[NEW] Cooldown active — discarding ${ns.signal} signal`, "engine");
         } else if (signalAge >= 60_000) {
           log(`[NEW] Stale webhook (${(signalAge/1000).toFixed(0)}s old) — discarding`, "engine");
-        } else if (ns.signal !== "LONG") {
-          log(`[NEW] ${ns.signal} signal — skipping (LONG only)`, "engine");
         } else {
           const asset = ALLOWED_ASSETS.find(a => a.coin === ns.coin);
           if (!asset) {
@@ -920,8 +918,9 @@ class TradingEngine {
             if (coinHasPosition) {
               log(`[NEW] ${ns.coin} already has open position — skipping`, "engine");
             } else {
+              const side = ns.signal === "SHORT" ? "short" : "long";
               const price = parseFloat(assetCtxMap[ns.coin]?.midPx || String(ns.price));
-              const entryReason = `NEW RCE: LONG @ $${ns.price.toFixed(1)} (${ns.source})`;
+              const entryReason = `NEW RCE: ${ns.coin} ${side.toUpperCase()} @ $${ns.price.toFixed(1)} (${ns.source})`;
 
               // Fixed $100 allocation: equityPct = $100 / equity
               const newEquityPct = Math.min(NEW_STRATEGY_FIXED_USD / equity, 0.95);
@@ -929,7 +928,7 @@ class TradingEngine {
               const entered = await this.executeEntry({
                 asset,
                 strategy: "new",
-                side: "long",
+                side,
                 equityPct: newEquityPct,
                 leverage: asset.maxLeverage,
                 tpPct: 0.01,           // +1.0%
@@ -1559,6 +1558,8 @@ class TradingEngine {
           status: "active",
           source: "TradingView webhook (strategy=new)",
           allocation: `$${NEW_STRATEGY_FIXED_USD} fixed`,
+          direction: "LONG + SHORT",
+          assets: "BTC ETH SOL AVAX XRP",
           riskReward: "1:4 (SL -0.25% / TP +1.0%)",
         },
       },
