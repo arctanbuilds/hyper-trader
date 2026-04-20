@@ -90,6 +90,25 @@ export async function registerRoutes(
     }
   });
 
+  // ============ TRADINGVIEW WEBHOOK ============
+  app.post("/api/webhook/tradingview", async (req, res) => {
+    try {
+      const payload = req.body;
+      console.log(`[WEBHOOK] Received: ${JSON.stringify(payload).slice(0, 500)}`);
+
+      if (!payload || !payload.signal) {
+        return res.status(400).json({ error: "Missing signal in payload" });
+      }
+
+      const result = await tradingEngine.handleWebhookSignal(payload);
+      broadcast({ type: "webhook", data: { ...result, payload, timestamp: new Date().toISOString() } });
+      res.json(result);
+    } catch (e: any) {
+      console.error(`[WEBHOOK] Error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ============ TRADES ============
   app.get("/api/trades", async (req, res) => {
     const status = req.query.status as string | undefined;
