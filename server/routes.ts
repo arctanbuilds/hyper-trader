@@ -180,6 +180,7 @@ export async function registerRoutes(
 
     const rsi18Bucket = makeBucket();
     const divBucket = makeBucket();
+    const newBucket = makeBucket();
 
     const closedTrades = allTrades
       .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V141_START)
@@ -187,7 +188,7 @@ export async function registerRoutes(
 
     for (const t of closedTrades) {
       const pnl = t.hlPnlUsd ?? 0;
-      const bucket = t.strategy === "divergence" ? divBucket : rsi18Bucket;
+      const bucket = t.strategy === "new" ? newBucket : (t.strategy === "divergence" || t.strategy === "trendline") ? divBucket : rsi18Bucket;
 
       bucket.trades.push(t);
       bucket.totalPnl += pnl;
@@ -232,8 +233,9 @@ export async function registerRoutes(
     }
 
     const openTrades = allTrades.filter((t: any) => t.status === "open");
-    const openRsi18 = openTrades.filter((t: any) => t.strategy === "rsi18").length;
-    const openDiv = openTrades.filter((t: any) => t.strategy === "divergence").length;
+    const openRsi18 = openTrades.filter((t: any) => t.strategy === "rsi16" || t.strategy === "rsi18").length;
+    const openTl = openTrades.filter((t: any) => t.strategy === "trendline" || t.strategy === "divergence").length;
+    const openNew = openTrades.filter((t: any) => t.strategy === "new").length;
 
     const raceStartMs = new Date(V141_START).getTime();
     const raceHours = parseFloat(((Date.now() - raceStartMs) / 3600000).toFixed(1));
@@ -262,8 +264,9 @@ export async function registerRoutes(
     }
 
     const result = [
-      formatBucket(rsi18Bucket, "rsi18", "RSI18 (BTC only)", openRsi18),
-      formatBucket(divBucket, "divergence", "DIVERGENCE (10 assets)", openDiv),
+      formatBucket(rsi18Bucket, "rsi16", "RSI16 (BTC ETH SOL)", openRsi18),
+      formatBucket(divBucket, "trendline", "TRENDLINE (BTC)", openTl),
+      formatBucket(newBucket, "new", "NEW — RCE ($100, 1:4 R:R)", openNew),
     ];
 
     res.json({ raceStartedAt: V141_START, raceHours, strategies: result });
@@ -396,7 +399,7 @@ export async function registerRoutes(
       for (const t of closedAfterBaseline) {
         const tradePnl = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
         runningEquity += tradePnl;
-        const stratTag = " [RSI18]";
+        const stratTag = t.strategy === "new" ? " [NEW]" : t.strategy === "trendline" ? " [TRENDLINE]" : " [RSI16]";
         curve.push({
           timestamp: t.closedAt || t.openedAt,
           equity: parseFloat(runningEquity.toFixed(2)),

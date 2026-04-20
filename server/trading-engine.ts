@@ -1,22 +1,27 @@
 /**
- * HyperTrader — Trading Engine v14.3
+ * HyperTrader — Trading Engine v14.4
  *
- * DUAL STRATEGY: RSI16 (50%) + TRENDLINE (50%)
+ * TRIPLE STRATEGY: RSI16 + TRENDLINE + NEW
  *
  * STRATEGY A — RSI16:
  *   - BTC, ETH, SOL — LONG only, RSI ≤ 16 on 5m OR 15m
- *   - 50% equity, max leverage, max 1 position
+ *   - 50% of (equity - $100), max leverage, max 1 position
  *   - SL -0.35%, TP +0.35%
  *
  * STRATEGY B — TRENDLINE (TradingView webhook):
  *   - BTC — LONG only
- *   - 50% equity, max leverage, max 1 position
+ *   - 50% of (equity - $100), max leverage, max 1 position
  *   - Signals from TradingView AlgoAlpha Breakout & Retest
  *   - SL -0.35%, TP +0.35%
  *
+ * STRATEGY C — NEW (Craig Percoco RCE, TradingView webhook):
+ *   - BTC — LONG only
+ *   - Fixed $100 allocation, max leverage, max 1 position
+ *   - Signals from TradingView webhook with strategy="new"
+ *   - SL -0.25%, TP +1.0% (1:4 R:R)
+ *
  * Shared:
- *   - Scan every 5 seconds (RSI18)
- *   - AI trendline scan every 30 seconds
+ *   - Scan every 5 seconds
  *   - Cancel all orders on close (ghost position prevention)
  *   - Orphan detector on startup
  */
@@ -50,7 +55,10 @@ const ALLOWED_ASSETS: AssetConfig[] = [
 ];
 
 // ============ STRATEGY TYPE ============
-type StrategyType = "rsi16" | "trendline";
+type StrategyType = "rsi16" | "trendline" | "new";
+
+// ============ NEW STRATEGY FIXED ALLOCATION ============
+const NEW_STRATEGY_FIXED_USD = 100;
 
 // ============ HYPERLIQUID PRICE & SIZE FORMATTING ============
 
@@ -334,6 +342,10 @@ class TradingEngine {
   private trendlineCooldown = 0; // timestamp until which trendline entries are blocked (after failed setup)
   private pendingWebhookSignal: { signal: "LONG" | "SHORT"; price: number; time: number; source: string; coin: string } | null = null;
 
+  // NEW strategy state — TradingView webhook with strategy="new"
+  private newStrategyCooldown = 0;
+  private pendingNewSignal: { signal: "LONG" | "SHORT"; price: number; time: number; source: string; coin: string } | null = null;
+
   // Robust position sync — track consecutive "no position" readings per tradeId
   private syncMissCount: Map<number, number> = new Map();
 
@@ -426,10 +438,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v14.3 started | DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL | SL -0.35% | TP +0.35% | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v14.4 started | TRIPLE: RSI16 + TRENDLINE + NEW | BTC ETH SOL | NEW: $${NEW_STRATEGY_FIXED_USD} fixed, SL -0.25% TP +1.0% (1:4 R:R) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v14.3 started | DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL | SL -0.35% | TP +0.35% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v14.4 started | TRIPLE: RSI16 + TRENDLINE + NEW | NEW: $${NEW_STRATEGY_FIXED_USD} fixed, SL -0.25% TP +1.0% — AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
   }
 
@@ -687,7 +699,7 @@ class TradingEngine {
         });
       }
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v14.3 DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v14.4 TRIPLE: RSI16 + TRENDLINE + NEW ($${NEW_STRATEGY_FIXED_USD}) | BTC ETH SOL`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -704,16 +716,21 @@ class TradingEngine {
       const openTrades = await storage.getOpenTrades();
       const rsi18Open = openTrades.filter(t => t.strategy === "rsi16" || t.strategy === "rsi18");
       const trendlineOpen = openTrades.filter(t => t.strategy === "trendline");
+      const newOpen = openTrades.filter(t => t.strategy === "new");
 
       const RSI18_MAX_POSITIONS = 1;
       const TRENDLINE_MAX_POSITIONS = 1;
+      const NEW_MAX_POSITIONS = 1;
+
+      // Equity split: reserve $100 for NEW, rest split 50/50 between RSI16 and TRENDLINE
+      const equityForOthers = Math.max(equity - NEW_STRATEGY_FIXED_USD, 0);
 
       let totalEntries = 0;
 
       // ================================================================
       // STRATEGY A: RSI16 — BTC, ETH, SOL
       // Signal: 5m RSI ≤ 16 OR 15m RSI ≤ 16
-      // LONG only, 50% equity, max leverage, max 1 position
+      // LONG only, 50% of (equity - $100), max leverage, max 1 position
       // SL -0.35%, TP +0.35%
       // ================================================================
       {
@@ -790,11 +807,12 @@ class TradingEngine {
                 this.rsi18CrossState.set(crossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
 
                 const entryReason = `RSI16: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ 16`;
+                const rsiEquityPct = equityForOthers > 0 ? (equityForOthers * 0.50) / equity : 0;
                 const entered = await this.executeEntry({
                   asset,
                   strategy: "rsi16",
                   side: "long",
-                  equityPct: 0.50,
+                  equityPct: rsiEquityPct,
                   leverage: asset.maxLeverage,
                   tpPct: 0.0035,         // +0.35%
                   slPct: 0.0035,         // -0.35%
@@ -818,7 +836,7 @@ class TradingEngine {
       // ================================================================
       // STRATEGY B: TRENDLINE — TradingView Webhook Only
       // Signal: TradingView AlgoAlpha Breakout & Retest indicator
-      // LONG only, 50% equity, max leverage, max 1 position
+      // LONG only, 50% of (equity - $100), max leverage, max 1 position
       // SL -0.35%, TP +0.35%
       // ================================================================
       if (this.pendingWebhookSignal && trendlineOpen.length < TRENDLINE_MAX_POSITIONS) {
@@ -848,11 +866,12 @@ class TradingEngine {
               const price = parseFloat(assetCtxMap[ws.coin]?.midPx || String(ws.price));
               const entryReason = `TV Webhook: LONG @ $${ws.price.toFixed(1)} (${ws.source})`;
 
+              const tlEquityPct = equityForOthers > 0 ? (equityForOthers * 0.50) / equity : 0;
               const entered = await this.executeEntry({
                 asset,
                 strategy: "trendline",
                 side: "long",
-                equityPct: 0.50,
+                equityPct: tlEquityPct,
                 leverage: asset.maxLeverage,
                 tpPct: 0.0035,         // +0.35%
                 slPct: 0.0035,         // -0.35%
@@ -874,10 +893,69 @@ class TradingEngine {
         }
       }
 
+      // ================================================================
+      // STRATEGY C: NEW — Craig Percoco RCE Framework
+      // Signal: TradingView webhook with strategy="new"
+      // LONG only, fixed $100, max leverage, max 1 position
+      // SL -0.25%, TP +1.0% (1:4 R:R)
+      // ================================================================
+      if (this.pendingNewSignal && newOpen.length < NEW_MAX_POSITIONS) {
+        const ns = this.pendingNewSignal;
+        this.pendingNewSignal = null; // consume immediately
+
+        const signalAge = Date.now() - ns.time;
+
+        if (Date.now() < this.newStrategyCooldown) {
+          log(`[NEW] Cooldown active — discarding ${ns.signal} signal`, "engine");
+        } else if (signalAge >= 60_000) {
+          log(`[NEW] Stale webhook (${(signalAge/1000).toFixed(0)}s old) — discarding`, "engine");
+        } else if (ns.signal !== "LONG") {
+          log(`[NEW] ${ns.signal} signal — skipping (LONG only)`, "engine");
+        } else {
+          const asset = ALLOWED_ASSETS.find(a => a.coin === ns.coin);
+          if (!asset) {
+            log(`[NEW] Unknown coin ${ns.coin} — skipping`, "engine");
+          } else {
+            const coinHasPosition = openTrades.some(t => t.coin === ns.coin);
+            if (coinHasPosition) {
+              log(`[NEW] ${ns.coin} already has open position — skipping`, "engine");
+            } else {
+              const price = parseFloat(assetCtxMap[ns.coin]?.midPx || String(ns.price));
+              const entryReason = `NEW RCE: LONG @ $${ns.price.toFixed(1)} (${ns.source})`;
+
+              // Fixed $100 allocation: equityPct = $100 / equity
+              const newEquityPct = Math.min(NEW_STRATEGY_FIXED_USD / equity, 0.95);
+
+              const entered = await this.executeEntry({
+                asset,
+                strategy: "new",
+                side: "long",
+                equityPct: newEquityPct,
+                leverage: asset.maxLeverage,
+                tpPct: 0.01,           // +1.0%
+                slPct: 0.0025,         // -0.25%
+                rsi5m: 50, rsi15m: 50, triggerRSI: 0,
+                price, equity,
+                entryReason,
+                config,
+              });
+
+              if (entered) {
+                totalEntries++;
+                this.dailyTradeCount++;
+              } else {
+                this.newStrategyCooldown = Date.now() + 5 * 60 * 1000;
+                log(`[NEW] Entry failed — cooldown 5min`, "engine");
+              }
+            }
+          }
+        }
+      }
+
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v14.3 DUAL: RSI16 (50%) + TRENDLINE TV (50%) | BTC ETH SOL`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v14.4 TRIPLE: RSI16 + TRENDLINE + NEW | BTC ETH SOL`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1013,7 +1091,7 @@ class TradingEngine {
       const szd = ac?.szDecimals ?? 2;
       const eqForTrade = (trade as any).entryEquity || currentEquity;
 
-      const stratLabel = trade.strategy === "trendline" ? "TRENDLINE" : "RSI16";
+      const stratLabel = trade.strategy === "new" ? "NEW" : trade.strategy === "trendline" ? "TRENDLINE" : "RSI16";
       const tpPctFromEntry = trade.entryPrice > 0 && trade.takeProfit1 ? (Math.abs(trade.takeProfit1 - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
       const tpPctLabel = `TP +${tpPctFromEntry}%`;
       const isLong = trade.side === "long";
@@ -1175,8 +1253,8 @@ class TradingEngine {
     const trade = await storage.getTradeById(tradeId);
     if (!trade || trade.status !== "open") return null;
 
-    const stratLabel = trade.strategy === "trendline" ? "TRENDLINE" : "RSI18";
-    const tradeStrategy = (trade.strategy as StrategyType) || "rsi18";
+    const stratLabel = trade.strategy === "new" ? "NEW" : trade.strategy === "trendline" ? "TRENDLINE" : "RSI16";
+    const tradeStrategy = (trade.strategy as StrategyType) || "rsi16";
     const isLong = trade.side === "long";
 
     const mids: Record<string, string> = (await fetchAllMids()) || {};
@@ -1260,9 +1338,9 @@ class TradingEngine {
     return updated;
   }
 
-  // ============ TRENDLINE WEBHOOK HANDLER ============
+  // ============ WEBHOOK HANDLER (TRENDLINE + NEW) ============
 
-  async handleWebhookSignal(payload: { signal: string; price: string | number; ticker?: string; source?: string }): Promise<{ accepted: boolean; reason: string }> {
+  async handleWebhookSignal(payload: { signal: string; price: string | number; ticker?: string; source?: string; strategy?: string }): Promise<{ accepted: boolean; reason: string }> {
     const signal = (payload.signal || "").toUpperCase();
     if (signal !== "LONG" && signal !== "SHORT") {
       return { accepted: false, reason: `Invalid signal: ${signal}. Expected LONG or SHORT.` };
@@ -1283,30 +1361,57 @@ class TradingEngine {
       else coin = t.replace(/USDT$/, "").replace(/USD$/, "");
     }
 
-    // Check if trendline strategy already has an open position
+    // Route signal based on strategy field: "new" -> NEW strategy, else -> TRENDLINE
+    const targetStrategy = (payload.strategy || "").toLowerCase() === "new" ? "new" : "trendline";
+
     const openTrades = await storage.getOpenTrades();
-    const trendlineOpen = openTrades.filter(t => t.strategy === "trendline");
-    if (trendlineOpen.length >= 1) {
-      return { accepted: false, reason: `Trendline already has ${trendlineOpen.length} open position(s)` };
+
+    if (targetStrategy === "new") {
+      const newOpen = openTrades.filter(t => t.strategy === "new");
+      if (newOpen.length >= 1) {
+        return { accepted: false, reason: `NEW already has ${newOpen.length} open position(s)` };
+      }
+
+      this.pendingNewSignal = {
+        signal: signal as "LONG" | "SHORT",
+        price,
+        time: Date.now(),
+        source: String(payload.source || "tradingview"),
+        coin,
+      };
+
+      log(`[WEBHOOK-NEW] Received ${signal} @ $${price.toFixed(1)} from ${payload.source || "tradingview"} — queued for next scan`, "engine");
+      await storage.createLog({
+        type: "system",
+        message: `[WEBHOOK-NEW] ${signal} signal @ $${price.toFixed(1)} from ${payload.source || "tradingview"} | $${NEW_STRATEGY_FIXED_USD} fixed, SL -0.25% TP +1.0%`,
+        timestamp: new Date().toISOString(),
+      });
+
+      return { accepted: true, reason: `NEW ${signal} signal queued — $${NEW_STRATEGY_FIXED_USD} allocation, 1:4 R:R` };
+    } else {
+      // Original TRENDLINE routing
+      const trendlineOpen = openTrades.filter(t => t.strategy === "trendline");
+      if (trendlineOpen.length >= 1) {
+        return { accepted: false, reason: `Trendline already has ${trendlineOpen.length} open position(s)` };
+      }
+
+      this.pendingWebhookSignal = {
+        signal: signal as "LONG" | "SHORT",
+        price,
+        time: Date.now(),
+        source: String(payload.source || "tradingview"),
+        coin,
+      };
+
+      log(`[WEBHOOK] Received ${signal} @ $${price.toFixed(1)} from ${payload.source || "tradingview"} — queued for next scan`, "engine");
+      await storage.createLog({
+        type: "system",
+        message: `[WEBHOOK] ${signal} signal received @ $${price.toFixed(1)} from ${payload.source || "tradingview"}`,
+        timestamp: new Date().toISOString(),
+      });
+
+      return { accepted: true, reason: `${signal} signal queued — will be processed on next scan cycle` };
     }
-
-    // Store signal for next scan cycle to process
-    this.pendingWebhookSignal = {
-      signal: signal as "LONG" | "SHORT",
-      price,
-      time: Date.now(),
-      source: String(payload.source || "tradingview"),
-      coin,
-    };
-
-    log(`[WEBHOOK] Received ${signal} @ $${price.toFixed(1)} from ${payload.source || "tradingview"} — queued for next scan`, "engine");
-    await storage.createLog({
-      type: "system",
-      message: `[WEBHOOK] ${signal} signal received @ $${price.toFixed(1)} from ${payload.source || "tradingview"}`,
-      timestamp: new Date().toISOString(),
-    });
-
-    return { accepted: true, reason: `${signal} signal queued — will be processed on next scan cycle` };
   }
 
   async forceScan() { await this.runScanCycle(); }
@@ -1375,7 +1480,7 @@ class TradingEngine {
       const eqForT = (t as any).entryEquity || currentEquity;
       const pnlUsd = (t.hlPnlUsd !== null && t.hlPnlUsd !== undefined) ? t.hlPnlUsd : 0;
       const pnlOfAum = eqForT > 0 ? (pnlUsd / eqForT) * 100 : 0;
-      const stratBadge = t.strategy === "trendline" ? "TRENDLINE" : "RSI16";
+      const stratBadge = t.strategy === "new" ? "NEW" : t.strategy === "trendline" ? "TRENDLINE" : "RSI16";
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)), stratBadge };
     });
 
@@ -1392,6 +1497,14 @@ class TradingEngine {
     const tlWinRate = tlTrades.length > 0 ? (tlWins / tlTrades.length) * 100 : 0;
     const tlPnlUsd = tlTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
     const tlPnlOfAum = startEq > 0 ? (tlPnlUsd / startEq) * 100 : 0;
+
+    // Strategy C: NEW stats
+    const newTrades = activeClosedTrades.filter(t => t.strategy === "new");
+    const newWins = newTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
+    const newWinRate = newTrades.length > 0 ? (newWins / newTrades.length) * 100 : 0;
+    const newPnlUsd = newTrades.reduce((s, t) => s + (t.hlPnlUsd ?? (startEq * (t.pnlPct || 0) / 100)), 0);
+    const newPnlOfAum = startEq > 0 ? (newPnlUsd / startEq) * 100 : 0;
+
     return {
       isRunning: config?.isRunning || false,
       openPositions: openTrades.length,
@@ -1436,6 +1549,17 @@ class TradingEngine {
           pnlOfAum: tlPnlOfAum.toFixed(3),
           status: "active",
           source: "TradingView webhook",
+        },
+        new: {
+          trades: newTrades.length,
+          winRate: newWinRate.toFixed(1),
+          openPositions: openTrades.filter(t => t.strategy === "new").length,
+          pnlUsd: newPnlUsd.toFixed(4),
+          pnlOfAum: newPnlOfAum.toFixed(3),
+          status: "active",
+          source: "TradingView webhook (strategy=new)",
+          allocation: `$${NEW_STRATEGY_FIXED_USD} fixed`,
+          riskReward: "1:4 (SL -0.25% / TP +1.0%)",
         },
       },
     };
