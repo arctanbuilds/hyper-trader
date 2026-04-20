@@ -594,21 +594,33 @@ class TradingEngine {
       openedAt: new Date().toISOString(),
     });
 
-    // Place SL order on HL immediately
+    // Place SL + TP orders on HL immediately after fill
     if (config.apiSecret && config.walletAddress) {
       try {
         const executor = createExecutor(config.apiSecret, config.walletAddress);
+
+        // SL: stop-market trigger order
         const slTriggerPx = parseFloat(formatHLPrice(actualSL, asset.szDecimals));
         const slFillPx = parseFloat(formatHLPrice(isBuy ? actualSL * 0.98 : actualSL * 1.02, asset.szDecimals));
         await executor.placeOrder({
-          coin: asset.coin, isBuy: !isBuy, sz: filledSz, // opposite side to close
+          coin: asset.coin, isBuy: !isBuy, sz: filledSz,
           limitPx: slFillPx,
           orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
           reduceOnly: true,
         });
         log(`[SL ORDER] ${asset.coin} SL placed @ $${slTriggerPx} (${slPctLabel})`, "engine");
-      } catch (slErr) {
-        log(`[SL ORDER] FAILED ${asset.coin}: ${slErr} — will monitor in checkExits`, "engine");
+
+        // TP: limit order (resting on the book)
+        const tpLimitPx = parseFloat(formatHLPrice(actualTP, asset.szDecimals));
+        await executor.placeOrder({
+          coin: asset.coin, isBuy: !isBuy, sz: filledSz,
+          limitPx: tpLimitPx,
+          orderType: { limit: { tif: "Gtc" } },
+          reduceOnly: true,
+        });
+        log(`[TP ORDER] ${asset.coin} TP placed @ $${tpLimitPx} (${tpPctLabel})`, "engine");
+      } catch (orderErr) {
+        log(`[SL/TP ORDER] FAILED ${asset.coin}: ${orderErr} — will monitor in checkExits`, "engine");
       }
     }
 
