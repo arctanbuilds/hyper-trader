@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v15.4
+ * HyperTrader — Trading Engine v15.5
  *
  * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
@@ -60,7 +60,7 @@ interface AssetConfig {
   isolatedOnly?: boolean;
 }
 
-// v15.4: Core-4 majors (BTC, ETH, SOL, XRP) — dual-TF RSI confirmation
+// v15.5: Core-4 majors (BTC, ETH, SOL, XRP) — RSI + SMC support/demand confluence
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",      displayName: "Bitcoin",    dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
   { coin: "ETH",      displayName: "Ethereum",   dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
@@ -324,6 +324,122 @@ interface OHLCVCandle {
   volume: number;
 }
 
+// ============ SMC: Support Level & Demand Zone Detection (v15.5) ============
+// Pure price-action algorithm — no AI/LLM. Uses 15m candles for structure.
+
+interface SupportResult {
+  found: boolean;
+  type: "level" | "zone" | null;
+  price: number;       // top of zone or level price
+  low: number;         // zone low (== price for levels)
+  distancePct: number; // (currentPrice - price) / currentPrice * 100
+  touches?: number;    // for levels
+  details: string;
+}
+
+/**
+ * Find a horizontal support level (swing-low cluster) or demand zone within `maxDistPct` below currentPrice.
+ * - Swing lows: 5-candle fractal (low lower than 2 before + 2 after)
+ * - Levels: cluster swing lows within 0.15% of each other, require ≥2 touches
+ * - Demand zones: last base candle before an impulse-up ≥1% within 3 candles, unmitigated
+ * - Returns the CLOSEST qualifying structure within maxDistPct below price.
+ */
+function findNearbySupport(candles: OHLCVCandle[], currentPrice: number, maxDistPct: number = 0.3): SupportResult {
+  const none: SupportResult = { found: false, type: null, price: 0, low: 0, distancePct: 0, details: "no structure" };
+  if (!candles || candles.length < 20) return none;
+
+  // --- Step 1: detect swing-low fractals (skip last 2 candles — can't confirm) ---
+  const swings: { idx: number; price: number }[] = [];
+  for (let i = 2; i < candles.length - 2; i++) {
+    const lo = candles[i].low;
+    if (lo < candles[i-1].low && lo < candles[i-2].low && lo < candles[i+1].low && lo < candles[i+2].low) {
+      swings.push({ idx: i, price: lo });
+    }
+  }
+
+  // --- Step 2: cluster swing lows within 0.15% to build horizontal levels (≥2 touches) ---
+  const CLUSTER_TOL = 0.0015; // 0.15%
+  const levels: { price: number; touches: number }[] = [];
+  const used = new Set<number>();
+  for (let i = 0; i < swings.length; i++) {
+    if (used.has(i)) continue;
+    const cluster = [swings[i].price];
+    used.add(i);
+    for (let j = i + 1; j < swings.length; j++) {
+      if (used.has(j)) continue;
+      if (Math.abs(swings[j].price - swings[i].price) / swings[i].price <= CLUSTER_TOL) {
+        cluster.push(swings[j].price);
+        used.add(j);
+      }
+    }
+    if (cluster.length >= 2) {
+      const avg = cluster.reduce((a, b) => a + b, 0) / cluster.length;
+      levels.push({ price: avg, touches: cluster.length });
+    }
+  }
+
+  // --- Step 3: find unmitigated demand zones ---
+  // Base candle = bearish or small-bodied candle followed by strong impulse-up ≥1% close-to-close within 3 candles.
+  // Zone = [low, max(open, close)]. Unmitigated if no later candle has low <= zone.low.
+  const zones: { low: number; top: number; idx: number }[] = [];
+  for (let i = 0; i < candles.length - 4; i++) {
+    const base = candles[i];
+    // Base candle filter: body must be ≤50% of total range (avoid fat bullish candles)
+    const bodySize = Math.abs(base.close - base.open);
+    const totalRange = base.high - base.low;
+    if (totalRange === 0 || bodySize / totalRange > 0.5) continue;
+    // Impulse: max CLOSE of next 3 candles is ≥1% above base.close (real directional move)
+    const impulseClose = Math.max(candles[i+1].close, candles[i+2].close, candles[i+3].close);
+    if ((impulseClose - base.close) / base.close >= 0.01) {
+      const zoneTop = Math.max(base.open, base.close);
+      const zoneLow = base.low;
+      // Mitigation check: any later candle with low ≤ zoneLow invalidates
+      let mitigated = false;
+      for (let k = i + 4; k < candles.length; k++) {
+        if (candles[k].low <= zoneLow) { mitigated = true; break; }
+      }
+      if (!mitigated) zones.push({ low: zoneLow, top: zoneTop, idx: i });
+    }
+  }
+
+  // --- Step 4: find closest qualifying structure BELOW currentPrice within maxDistPct ---
+  const maxDist = maxDistPct / 100;
+  let best: SupportResult = none;
+
+  for (const lv of levels) {
+    if (lv.price >= currentPrice) continue; // must be below
+    const dist = (currentPrice - lv.price) / currentPrice;
+    if (dist <= maxDist) {
+      const distPct = dist * 100;
+      if (!best.found || distPct < best.distancePct) {
+        best = {
+          found: true, type: "level", price: lv.price, low: lv.price, distancePct: distPct,
+          touches: lv.touches,
+          details: `Level @ $${lv.price.toFixed(4)} (${lv.touches} touches, ${distPct.toFixed(2)}% below)`,
+        };
+      }
+    }
+  }
+
+  for (const z of zones) {
+    // Price must be ABOVE zone top (not inside/below)
+    if (z.top >= currentPrice) continue;
+    const dist = (currentPrice - z.top) / currentPrice;
+    if (dist <= maxDist) {
+      const distPct = dist * 100;
+      if (!best.found || distPct < best.distancePct) {
+        best = {
+          found: true, type: "zone", price: z.top, low: z.low, distancePct: distPct,
+          details: `Demand zone [$${z.low.toFixed(4)} – $${z.top.toFixed(4)}] (${distPct.toFixed(2)}% below top)`,
+        };
+      }
+    }
+  }
+
+  return best;
+}
+
+
 async function fetchCandlesOHLCV(coin: string, interval: string = "1h", limit: number = 100): Promise<OHLCVCandle[]> {
   try {
     const endTime = Date.now();
@@ -557,11 +673,11 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.4 started | DUAL: RSI-26 Core-4 (BTC/ETH/SOL/XRP, 5m+15m AND) + Oil News (xyz:CL) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+      message: `Engine v15.5 started | DUAL: RSI-26 + SMC Core-4 (BTC/ETH/SOL/XRP, 5m+15m AND, support/demand ≤0.3%) + Oil News (xyz:CL) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
 
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.4 started | DUAL: RSI-26 Core-4 (5m+15m AND) + Oil News | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.5 started | DUAL: RSI-26+SMC Core-4 + Oil News | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleOilScan();
   }
@@ -825,7 +941,7 @@ class TradingEngine {
       const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
       const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies / 3) / equity : 0;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.4 DUAL: RSI-26 Core-4 (5m+15m AND) + Oil News | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.5 DUAL: RSI-26+SMC Core-4 + Oil News | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -844,7 +960,7 @@ class TradingEngine {
       const obosOpen = openTrades.filter(t => t.strategy === "obos");
 
       const BREAKOUT_MAX_POSITIONS = 1;
-      const OBOS_MAX_POSITIONS = 3; // v15.4: up to 3 concurrent positions across Core-4 assets
+      const OBOS_MAX_POSITIONS = 3; // v15.5: up to 3 concurrent positions across Core-4 assets
 
       let totalEntries = 0;
 
@@ -863,7 +979,7 @@ class TradingEngine {
       // 50% equity, max leverage, SL -0.5%, TP +0.45%
       // BE: after +0.3% → move SL to +0.2% (profit zone)
       // ================================================================
-      // v15.4: RSI-26 Core-4 — LONG only, BTC/ETH/SOL/XRP, requires 5m AND 15m ≤ 26
+      // v15.5: RSI-26 + SMC Core-4 — LONG only when 5m AND 15m RSI ≤ 26 AND support/demand within 0.3%
       {
         const RSI_OVERSOLD = 26;
         const RSI_RESET = 35;  // reset long cross state when RSI > 35 on both TFs (prevents re-entry same dip)
@@ -882,7 +998,7 @@ class TradingEngine {
 
           const [ohlcv5m, ohlcv15m] = await Promise.all([
             fetchCandlesOHLCV(asset.coin, "5m", 30),
-            fetchCandlesOHLCV(asset.coin, "15m", 30),
+            fetchCandlesOHLCV(asset.coin, "15m", 150), // v15.5: deeper history for SMC structure detection
           ]);
 
           const c5m = ohlcv5m.map(c => c.close);
@@ -893,17 +1009,24 @@ class TradingEngine {
             const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
             const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
 
-            // v15.4: LONG signal — BOTH 5m AND 15m RSI ≤ 26 (dual-TF confirmation)
+            // v15.5: Dual-TF RSI condition
             const oversold = rsi5m <= RSI_OVERSOLD && rsi15m <= RSI_OVERSOLD;
+
+            // v15.5: SMC support/demand zone confluence — only check when RSI is oversold (saves CPU)
+            const support = oversold ? findNearbySupport(ohlcv15m, price, 0.3) : { found: false, type: null, price: 0, low: 0, distancePct: 0, details: "rsi not oversold" } as SupportResult;
+            const confluence = oversold && support.found;
 
             let scanSignal: string = "neutral";
             let scanDetails = "";
 
-            if (oversold) {
-              scanSignal = "obos_oversold";
-              scanDetails = `RSI-26: 5m+15m oversold | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Both ≤${RSI_OVERSOLD}`;
+            if (confluence) {
+              scanSignal = "obos_confluence";
+              scanDetails = `RSI-26+SMC: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | ${support.details}`;
+            } else if (oversold) {
+              scanSignal = "obos_oversold_no_sr";
+              scanDetails = `RSI oversold but no S/R ≤0.3% | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)}`;
             } else {
-              scanDetails = `RSI-26: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need BOTH ≤${RSI_OVERSOLD}`;
+              scanDetails = `RSI-26: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need BOTH ≤${RSI_OVERSOLD} + S/R ≤0.3%`;
             }
 
             await storage.upsertMarketScan({
@@ -918,32 +1041,32 @@ class TradingEngine {
               timestamp: new Date().toISOString(),
             });
 
-            // === LONG entry: BOTH 5m AND 15m RSI ≤ 26 ===
+            // === LONG entry: BOTH 5m AND 15m RSI ≤ 26 AND support/demand within 0.3% ===
             const longCrossKey = `${asset.coin}_obos_long`;
             // Reset cross state when EITHER timeframe recovers above 35 (setup invalidated)
             if (!oversold && (rsi5m > RSI_RESET || rsi15m > RSI_RESET)) {
               if (this.obosCrossState.has(longCrossKey)) {
                 this.obosCrossState.delete(longCrossKey);
-                log(`[RSI-26] ${asset.coin} cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} (either > ${RSI_RESET})`, "engine");
+                log(`[RSI-26+SMC] ${asset.coin} cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} (either > ${RSI_RESET})`, "engine");
               }
             }
 
             const coinHasPosition = openTrades.some(t => t.coin === asset.coin);
-            if (oversold && obosOpen.length < OBOS_MAX_POSITIONS && !coinHasPosition) {
+            if (confluence && obosOpen.length < OBOS_MAX_POSITIONS && !coinHasPosition) {
               if (!this.obosCrossState.has(longCrossKey)) {
                 const triggerRSI = Math.max(rsi5m, rsi15m); // higher of the two (both ≤ 26)
                 const triggeredTF = "5m+15m";
                 this.obosCrossState.set(longCrossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
 
-                const entryReason = `RSI-26 LONG: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ ${RSI_OVERSOLD}`;
+                const entryReason = `RSI-26+SMC LONG: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤${RSI_OVERSOLD} + ${support.details}`;
                 const entered = await this.executeEntry({
                   asset,
                   strategy: "obos",
                   side: "long",
                   equityPct: btcStrategyPct,
                   leverage: asset.maxLeverage,
-                  tpPct: 0.003,          // +0.3%
-                  slPct: 0.0025,         // -0.25%
+                  tpPct: 0.005,          // v15.5: +0.50%
+                  slPct: 0.0045,         // v15.5: -0.45%
                   rsi5m, rsi15m, triggerRSI, price, equity,
                   entryReason,
                   config,
@@ -966,7 +1089,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.4 DUAL: RSI-26 Core-4 (5m+15m AND) + Oil News`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.5 DUAL: RSI-26+SMC Core-4 + Oil News`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1134,7 +1257,48 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // v15.4: BE logic removed — RSI-26 has tight SL (-0.25%) / TP (+0.3%), BE not applicable
+      // v15.5: BE+ for RSI-26+SMC strategy — when price moves +0.30% (LONG only),
+      // cancel existing SL and place new SL at entryPrice * 1.0015 (+0.15% profit lock).
+      const isObos = trade.strategy === "obos";
+      const priceMovePct = trade.entryPrice > 0
+        ? (isLong ? (currentPrice - trade.entryPrice) / trade.entryPrice * 100 : (trade.entryPrice - currentPrice) / trade.entryPrice * 100)
+        : 0;
+      const isBESL = this.beApplied.has(trade.id);
+
+      if (isObos && isLong && !isBESL && priceMovePct >= 0.30 && config.apiSecret && config.walletAddress) {
+        try {
+          const executor = createExecutor(config.apiSecret, config.walletAddress);
+          const newSL = trade.entryPrice * 1.0015; // +0.15% above entry
+          // Cancel existing SL trigger orders for this coin
+          const openOrders = await executor.getOpenOrders();
+          const slOrders = openOrders.filter((o: any) => o.coin === trade.coin && o.triggerCondition !== undefined);
+          for (const o of slOrders) {
+            try { await executor.cancelOrder(o.coin, o.oid); } catch (ce) { log(`[BE] Cancel SL error: ${ce}`, "engine"); }
+          }
+          // Place new SL trigger at +0.15%
+          const slTriggerPx = parseFloat(formatHLPrice(newSL, szd));
+          const slFillPx = parseFloat(formatHLPrice(newSL * 0.98, szd));
+          const pos = hlPos || (await executor.getPositions()).find((p: any) => p.position?.coin === trade.coin)?.position;
+          const sz = pos ? Math.abs(parseFloat(pos.szi || "0")) : 0;
+          if (sz > 0) {
+            await executor.placeOrder({
+              coin: trade.coin, isBuy: !isLong, sz,
+              limitPx: slFillPx,
+              orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+              reduceOnly: true,
+            });
+            await storage.updateTrade(trade.id, { stopLoss: newSL });
+            trade.stopLoss = newSL; // reflect in this iteration
+            this.beApplied.add(trade.id);
+            log(`[BE+] Trade #${trade.id} ${trade.coin} LONG | price moved +${priceMovePct.toFixed(2)}% → SL moved to $${displayPrice(newSL, szd)} (+0.15% profit lock)`, "engine");
+            await storage.createLog({
+              type: "system",
+              message: `[BE+] ${trade.coin} LONG | +${priceMovePct.toFixed(2)}% → SL locked at +0.15% ($${displayPrice(newSL, szd)})`,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } catch (beErr) { log(`[BE+] Error on trade #${trade.id}: ${beErr}`, "engine"); }
+      }
 
       // Exit checks
       const tpPctFromEntry = trade.entryPrice > 0 && trade.takeProfit1 ? (Math.abs(trade.takeProfit1 - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
@@ -1200,7 +1364,7 @@ class TradingEngine {
             const hlPnl = extractClosePnlFromFills(fills, trade.coin, trade.side as "long" | "short", tradeOpenTime);
             if (hlPnl) {
               pnlUsd = hlPnl.netPnl;
-              const exitLabel = slHit ? (isBESL ? "SL @ BE +0.2%" : `SL -${slPctFromEntry}%`) : tpPctLabel;
+              const exitLabel = slHit ? (isBESL ? "SL @ BE+ +0.15%" : `SL -${slPctFromEntry}%`) : tpPctLabel;
               closeReason = `[${stratLabel}] ${exitLabel} | HL P&L: $${hlPnl.netPnl.toFixed(2)} (gross=$${hlPnl.closedPnl.toFixed(2)} fee=$${hlPnl.totalFee.toFixed(2)})`;
               const finalPnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
               await storage.updateTrade(trade.id, {
@@ -1726,8 +1890,9 @@ class TradingEngine {
           pnlOfAum: obosPnlOfAum.toFixed(3),
           status: "active",
           direction: "LONG only",
-          riskReward: "SL -0.25% / TP +0.30%",
-          assets: "Top-10 by volume",
+          riskReward: "SL -0.45% / TP +0.50% | BE+ at +0.30% → SL +0.15%",
+          assets: "Core-4 (BTC/ETH/SOL/XRP)",
+          entryConditions: "5m+15m RSI≤26 AND support/demand ≤0.3%",
           maxPositions: 3,
         },
         oil_news: {

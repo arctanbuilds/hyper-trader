@@ -114,7 +114,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v15.4 — RSI-26 Core-4 (BTC/ETH/SOL/XRP, 5m+15m AND) + Oil News (WTI)</p>
+            <p className="text-sm text-muted-foreground">v15.5 — RSI-26 + SMC Core-4 (BTC/ETH/SOL/XRP, RSI≤26 + S/R confluence) + Oil News (WTI)</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -214,9 +214,9 @@ export default function Dashboard() {
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
               <div>
-                <CardTitle className="text-sm font-medium">RSI-26 Core-4</CardTitle>
+                <CardTitle className="text-sm font-medium">RSI-26 + SMC Core-4</CardTitle>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  Core-4 | LONG | 5m+15m RSI ≤26 | 3 slots | SL -0.25% | TP +0.30%
+                  Core-4 | LONG | 5m+15m RSI≤26 + S/R ≤0.3% | 3 slots | SL -0.45% | TP +0.50% | BE+ @ +0.30%→+0.15%
                 </p>
               </div>
               <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-amber-500/10 text-amber-400 border-amber-500/30">
@@ -350,7 +350,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.4) | {raceDays} running</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.5) | {raceDays} running</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
