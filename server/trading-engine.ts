@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v15.8
+ * HyperTrader — Trading Engine v15.9
  *
  * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
@@ -22,7 +22,7 @@
  *   - WTI Crude Oil (xyz:CL) via XYZ DEX perps — LONG + SHORT
  *   - $100 fixed allocation, 20x leverage, isolated margin
  *   - Every 5 min: Sonar API scans macro/political news → sentiment → direction
- *   - SL -2%, TP +5%, BE+ at +1.5% → SL moves to +1.0% profit lock (v15.6)
+ *   - SL -2%, TP +2%, BE at +0.5% → SL moves to entry (v15.9)
  *   - Max 1 position, 1-hour cooldown after loss
  *   - Confidence threshold: ≥ 7/10 to trade
  *
@@ -85,7 +85,7 @@ type StrategyType = "breakout" | "obos" | "oil_news";
 const OIL_SCAN_INTERVAL_MS = 5 * 60 * 1000; // v15.7: 5 minutes (was 15)
 const OIL_FIXED_CAPITAL = 100; // $100 fixed allocation
 const OIL_LEVERAGE = 20;
-const OIL_TP_PCT = 0.05;  // +5%
+const OIL_TP_PCT = 0.02;  // v15.9: +2% (was +5%)
 const OIL_SL_PCT = 0.02;  // -2%
 const OIL_CONFIDENCE_THRESHOLD = 7;
 const OIL_LOSS_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour after loss
@@ -673,11 +673,11 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.8 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (BE+ @+1.5%→+1.0% L+S) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+      message: `Engine v15.9 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (TP+2%, BE @+0.5% L+S) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
 
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.8 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (BE+ L+S @+1.5%) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.9 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (TP+2%, BE @+0.5%) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleOilScan();
   }
@@ -941,7 +941,7 @@ class TradingEngine {
       const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
       const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies / 3) / equity : 0;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.8 DUAL: RSI-26+SMC Core-4 + Oil News 5-min | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.9 DUAL: RSI-26+SMC Core-4 + Oil News 5-min | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -1089,7 +1089,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.8 DUAL: RSI-26+SMC Core-4 + Oil News 5-min`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.9 DUAL: RSI-26+SMC Core-4 + Oil News 5-min`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1304,15 +1304,13 @@ class TradingEngine {
         } catch (beErr) { log(`[BE+] Error on trade #${trade.id}: ${beErr}`, "engine"); }
       }
 
-      // v15.8: BE+ for Oil News strategy (LONG + SHORT) — when price moves +1.50% in favor,
-      // cancel existing SL and place new SL at +1.00% profit lock.
-      //   LONG: newSL = entry * 1.01 (above entry)
-      //   SHORT: newSL = entry * 0.99 (below entry)
-      // priceMovePct is already direction-aware (positive = in favor) — see line above.
-      if (isOilNews && !isBESL && priceMovePct >= 1.50 && config.apiSecret && config.walletAddress) {
+      // v15.9: BE for Oil News strategy (LONG + SHORT) — when price moves +0.50% in favor,
+      // cancel existing SL and place new SL at entry price (break-even, no profit lock).
+      // priceMovePct is already direction-aware (positive = in favor).
+      if (isOilNews && !isBESL && priceMovePct >= 0.50 && config.apiSecret && config.walletAddress) {
         try {
           const executor = createExecutor(config.apiSecret, config.walletAddress);
-          const newSL = isLong ? trade.entryPrice * 1.01 : trade.entryPrice * 0.99;
+          const newSL = trade.entryPrice; // v15.9: pure BE
           const openOrders = await executor.getOpenOrders();
           const slOrders = openOrders.filter((o: any) => o.coin === trade.coin && o.triggerCondition !== undefined);
           for (const o of slOrders) {
@@ -1334,14 +1332,14 @@ class TradingEngine {
             trade.stopLoss = newSL;
             this.beApplied.add(trade.id);
             const sideLabel = isLong ? "LONG" : "SHORT";
-            log(`[BE+ OIL] Trade #${trade.id} ${trade.coin} ${sideLabel} | price moved +${priceMovePct.toFixed(2)}% in favor → SL moved to $${displayPrice(newSL, szd)} (+1.00% profit lock)`, "engine");
+            log(`[BE OIL] Trade #${trade.id} ${trade.coin} ${sideLabel} | price moved +${priceMovePct.toFixed(2)}% in favor → SL moved to entry $${displayPrice(newSL, szd)} (break-even)`, "engine");
             await storage.createLog({
               type: "system",
-              message: `[BE+ OIL] ${trade.coin} ${sideLabel} | +${priceMovePct.toFixed(2)}% in favor → SL locked at +1.00% ($${displayPrice(newSL, szd)})`,
+              message: `[BE OIL] ${trade.coin} ${sideLabel} | +${priceMovePct.toFixed(2)}% in favor → SL moved to BE ($${displayPrice(newSL, szd)})`,
               timestamp: new Date().toISOString(),
             });
           }
-        } catch (beErr) { log(`[BE+ OIL] Error on trade #${trade.id}: ${beErr}`, "engine"); }
+        } catch (beErr) { log(`[BE OIL] Error on trade #${trade.id}: ${beErr}`, "engine"); }
       }
 
       // Exit checks
@@ -1763,7 +1761,7 @@ class TradingEngine {
         side,
         equityPct: capitalPct,
         leverage: OIL_LEVERAGE,
-        tpPct: OIL_TP_PCT,    // +5%
+        tpPct: OIL_TP_PCT,    // v15.9: +2%
         slPct: OIL_SL_PCT,    // -2%
         rsi5m: 50, rsi15m: 50, triggerRSI: 0,
         price: oilPrice,
@@ -1948,7 +1946,7 @@ class TradingEngine {
           status: "active",
           asset: "xyz:CL (WTI)",
           allocation: `$${OIL_FIXED_CAPITAL} fixed`,
-          riskReward: "SL -2% / TP +5% | BE+ at +1.5% → SL +1.0%",
+          riskReward: "SL -2% / TP +2% | BE at +0.5% → SL = entry",
         },
       },
     };
