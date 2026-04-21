@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v15.5
+ * HyperTrader — Trading Engine v15.6
  *
  * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
@@ -22,7 +22,7 @@
  *   - WTI Crude Oil (xyz:CL) via XYZ DEX perps — LONG + SHORT
  *   - $100 fixed allocation, 20x leverage, isolated margin
  *   - Every 15 min: Sonar API scans macro/political news → sentiment → direction
- *   - SL -2%, TP +5%, no BE
+ *   - SL -2%, TP +5%, BE+ at +1.5% → SL moves to +1.0% profit lock (v15.6)
  *   - Max 1 position, 1-hour cooldown after loss
  *   - Confidence threshold: ≥ 7/10 to trade
  *
@@ -673,11 +673,11 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.5 started | DUAL: RSI-26 + SMC Core-4 (BTC/ETH/SOL/XRP, 5m+15m AND, support/demand ≤0.3%) + Oil News (xyz:CL) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+      message: `Engine v15.6 started | DUAL: RSI-26+SMC Core-4 + Oil News (with BE+ @ +1.5%→+1.0%) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
 
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.5 started | DUAL: RSI-26+SMC Core-4 + Oil News | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.6 started | DUAL: RSI-26+SMC Core-4 + Oil News (BE+ @+1.5%) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleOilScan();
   }
@@ -941,7 +941,7 @@ class TradingEngine {
       const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
       const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies / 3) / equity : 0;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.5 DUAL: RSI-26+SMC Core-4 + Oil News | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.6 DUAL: RSI-26+SMC Core-4 + Oil News | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -1089,7 +1089,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.5 DUAL: RSI-26+SMC Core-4 + Oil News`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.6 DUAL: RSI-26+SMC Core-4 + Oil News`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1232,7 +1232,11 @@ class TradingEngine {
     // OPEN TRADE MONITORING: read unrealizedPnl from HL + check TP/SL/BE
     // ============================================================
     for (const trade of openTrades) {
-      const currentPrice = parseFloat(mids[trade.coin] || "0");
+      // v15.6: xyz DEX coins (oil) not in allMids — fetch separately
+      let currentPrice = parseFloat(mids[trade.coin] || "0");
+      if (currentPrice === 0 && trade.coin.includes(":")) {
+        try { currentPrice = await fetchXyzMidPrice(trade.coin); } catch {}
+      }
       if (currentPrice === 0) continue;
       const ac = ALLOWED_ASSETS.find(a => a.coin === trade.coin) || (trade.coin === OIL_ASSET.coin ? OIL_ASSET : null);
       const szd = ac?.szDecimals ?? 2;
@@ -1298,6 +1302,41 @@ class TradingEngine {
             });
           }
         } catch (beErr) { log(`[BE+] Error on trade #${trade.id}: ${beErr}`, "engine"); }
+      }
+
+      // v15.6: BE+ for Oil News strategy — when price moves +1.50% (LONG only),
+      // cancel existing SL and place new SL at entryPrice * 1.01 (+1.00% profit lock).
+      if (isOilNews && isLong && !isBESL && priceMovePct >= 1.50 && config.apiSecret && config.walletAddress) {
+        try {
+          const executor = createExecutor(config.apiSecret, config.walletAddress);
+          const newSL = trade.entryPrice * 1.01; // +1.00% above entry
+          const openOrders = await executor.getOpenOrders();
+          const slOrders = openOrders.filter((o: any) => o.coin === trade.coin && o.triggerCondition !== undefined);
+          for (const o of slOrders) {
+            try { await executor.cancelOrder(o.coin, o.oid); } catch (ce) { log(`[BE] Cancel oil SL error: ${ce}`, "engine"); }
+          }
+          const slTriggerPx = parseFloat(formatHLPrice(newSL, szd));
+          const slFillPx = parseFloat(formatHLPrice(newSL * 0.98, szd));
+          const pos = hlPos || (await executor.getPositions()).find((p: any) => p.position?.coin === trade.coin)?.position;
+          const sz = pos ? Math.abs(parseFloat(pos.szi || "0")) : 0;
+          if (sz > 0) {
+            await executor.placeOrder({
+              coin: trade.coin, isBuy: !isLong, sz,
+              limitPx: slFillPx,
+              orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+              reduceOnly: true,
+            });
+            await storage.updateTrade(trade.id, { stopLoss: newSL });
+            trade.stopLoss = newSL;
+            this.beApplied.add(trade.id);
+            log(`[BE+ OIL] Trade #${trade.id} ${trade.coin} LONG | price moved +${priceMovePct.toFixed(2)}% → SL moved to $${displayPrice(newSL, szd)} (+1.00% profit lock)`, "engine");
+            await storage.createLog({
+              type: "system",
+              message: `[BE+ OIL] ${trade.coin} LONG | +${priceMovePct.toFixed(2)}% → SL locked at +1.00% ($${displayPrice(newSL, szd)})`,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } catch (beErr) { log(`[BE+ OIL] Error on trade #${trade.id}: ${beErr}`, "engine"); }
       }
 
       // Exit checks
@@ -1904,7 +1943,7 @@ class TradingEngine {
           status: "active",
           asset: "xyz:CL (WTI)",
           allocation: `$${OIL_FIXED_CAPITAL} fixed`,
-          riskReward: "SL -2% / TP +5%",
+          riskReward: "SL -2% / TP +5% | BE+ at +1.5% → SL +1.0%",
         },
       },
     };
