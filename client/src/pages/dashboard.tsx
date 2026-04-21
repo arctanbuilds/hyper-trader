@@ -114,7 +114,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v15.9 — RSI-26 + SMC Core-4 + Oil News 5-min (TP +2% / BE @+0.5%)</p>
+            <p className="text-sm text-muted-foreground">v15.10 — RSI-26 + SMC Core-4 + Oil News 5-min (SL -1% / TP +2% / BE @+0.5%)</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -273,7 +273,7 @@ export default function Dashboard() {
               <div>
                 <CardTitle className="text-sm font-medium">Oil News Sentiment</CardTitle>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  WTI | L+S | Sonar 5m | $100 | SL -2% | TP +2% | BE @ +0.5%→entry
+                  WTI | L+S | Sonar 5m | $100 | SL -1% | TP +2% | BE @ +0.5%→entry
                 </p>
               </div>
               <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
@@ -350,7 +350,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.9) | {raceDays} running</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.10) | {raceDays} running</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
