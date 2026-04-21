@@ -265,7 +265,7 @@ export async function registerRoutes(
 
     const result = [
       formatBucket(brBucket, "breakout", "Breakout & Retest (BTC)", openBr),
-      formatBucket(obosBucket, "obos", "RSI-26 + SMC Core-4", openObos),
+      formatBucket(obosBucket, "obos", "RSI-30 Multi-Asset", openObos),
       formatBucket(oilBucket, "oil_news", "Oil News Sentiment (WTI)", openOil),
     ];
 
@@ -361,7 +361,7 @@ export async function registerRoutes(
         await storage.createLog({ type: "system", message: `[SYNC-IMPORT] Created DB entry for ${coin} ${side} @ $${entryPrice} (${leverage}x) — trade #${trade.id} | SL $${sl.toFixed(2)} | TP $${tp.toFixed(2)} | ${strategy.toUpperCase()}`, timestamp: new Date().toISOString() });
       }
       broadcast({ type: "status", data: await tradingEngine.getStatus() });
-      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v15.6: RSI-26+SMC Core-4 + Oil BE+)` });
+      res.json({ success: true, synced, message: `Imported ${synced.length} position(s) from Hyperliquid (v16.0: RSI-30 Multi-Asset + Oil News)` });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
