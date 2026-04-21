@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v15.3
+ * HyperTrader — Trading Engine v15.4
  *
  * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
@@ -60,18 +60,12 @@ interface AssetConfig {
   isolatedOnly?: boolean;
 }
 
-// v15.3: Top-10 most liquid HL perps by 24h volume (excluding xyz DEX)
+// v15.4: Core-4 majors (BTC, ETH, SOL, XRP) — dual-TF RSI confirmation
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC",      displayName: "Bitcoin",    dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
   { coin: "ETH",      displayName: "Ethereum",   dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
-  { coin: "HYPE",     displayName: "Hyperliquid",dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
   { coin: "SOL",      displayName: "Solana",     dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "ZEC",      displayName: "Zcash",      dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
-  { coin: "AAVE",     displayName: "Aave",       dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
   { coin: "XRP",      displayName: "XRP",        dex: "", maxLeverage: 20, szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "FARTCOIN", displayName: "Fartcoin",   dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
-  { coin: "MON",      displayName: "Monad",      dex: "", maxLeverage: 5,  szDecimals: 0, category: "crypto", minNotional: 10 },
-  { coin: "kPEPE",    displayName: "kPEPE",      dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
 ];
 
 // Oil asset — XYZ DEX perp (separate from ALLOWED_ASSETS to avoid BTC scan logic)
@@ -563,11 +557,11 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.3 started | DUAL: RSI-26 Multi (top-10 assets) + Oil News (xyz:CL) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+      message: `Engine v15.4 started | DUAL: RSI-26 Core-4 (BTC/ETH/SOL/XRP, 5m+15m AND) + Oil News (xyz:CL) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
 
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.3 started | DUAL: RSI-26 Multi + Oil News | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.4 started | DUAL: RSI-26 Core-4 (5m+15m AND) + Oil News | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleOilScan();
   }
@@ -831,7 +825,7 @@ class TradingEngine {
       const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
       const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies / 3) / equity : 0;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.3 DUAL: RSI-26 Multi (top-10) + Oil News | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.4 DUAL: RSI-26 Core-4 (5m+15m AND) + Oil News | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -850,7 +844,7 @@ class TradingEngine {
       const obosOpen = openTrades.filter(t => t.strategy === "obos");
 
       const BREAKOUT_MAX_POSITIONS = 1;
-      const OBOS_MAX_POSITIONS = 3; // v15.3: up to 3 concurrent positions across top-10 assets
+      const OBOS_MAX_POSITIONS = 3; // v15.4: up to 3 concurrent positions across Core-4 assets
 
       let totalEntries = 0;
 
@@ -869,7 +863,7 @@ class TradingEngine {
       // 50% equity, max leverage, SL -0.5%, TP +0.45%
       // BE: after +0.3% → move SL to +0.2% (profit zone)
       // ================================================================
-      // v15.3: RSI-26 Multi-Asset — LONG only, top-10 liquid assets
+      // v15.4: RSI-26 Core-4 — LONG only, BTC/ETH/SOL/XRP, requires 5m AND 15m ≤ 26
       {
         const RSI_OVERSOLD = 26;
         const RSI_RESET = 35;  // reset long cross state when RSI > 35 on both TFs (prevents re-entry same dip)
@@ -899,18 +893,17 @@ class TradingEngine {
             const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
             const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
 
-            // LONG signal: RSI ≤ 26 on either 5m or 15m
-            const oversold = rsi5m <= RSI_OVERSOLD || rsi15m <= RSI_OVERSOLD;
+            // v15.4: LONG signal — BOTH 5m AND 15m RSI ≤ 26 (dual-TF confirmation)
+            const oversold = rsi5m <= RSI_OVERSOLD && rsi15m <= RSI_OVERSOLD;
 
             let scanSignal: string = "neutral";
             let scanDetails = "";
 
             if (oversold) {
               scanSignal = "obos_oversold";
-              const tf = rsi5m <= RSI_OVERSOLD ? (rsi15m <= RSI_OVERSOLD ? "5m+15m" : "5m") : "15m";
-              scanDetails = `RSI-26: ${tf} oversold | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Threshold ≤${RSI_OVERSOLD}`;
+              scanDetails = `RSI-26: 5m+15m oversold | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Both ≤${RSI_OVERSOLD}`;
             } else {
-              scanDetails = `RSI-26: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need ≤${RSI_OVERSOLD}`;
+              scanDetails = `RSI-26: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need BOTH ≤${RSI_OVERSOLD}`;
             }
 
             await storage.upsertMarketScan({
@@ -925,21 +918,21 @@ class TradingEngine {
               timestamp: new Date().toISOString(),
             });
 
-            // === LONG entry: RSI oversold (≤26) ===
+            // === LONG entry: BOTH 5m AND 15m RSI ≤ 26 ===
             const longCrossKey = `${asset.coin}_obos_long`;
-            // Reset cross state when RSI recovers above 35 on BOTH timeframes
-            if (!oversold && rsi5m > RSI_RESET && rsi15m > RSI_RESET) {
+            // Reset cross state when EITHER timeframe recovers above 35 (setup invalidated)
+            if (!oversold && (rsi5m > RSI_RESET || rsi15m > RSI_RESET)) {
               if (this.obosCrossState.has(longCrossKey)) {
                 this.obosCrossState.delete(longCrossKey);
-                log(`[RSI-26] ${asset.coin} cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${RSI_RESET}`, "engine");
+                log(`[RSI-26] ${asset.coin} cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} (either > ${RSI_RESET})`, "engine");
               }
             }
 
             const coinHasPosition = openTrades.some(t => t.coin === asset.coin);
             if (oversold && obosOpen.length < OBOS_MAX_POSITIONS && !coinHasPosition) {
               if (!this.obosCrossState.has(longCrossKey)) {
-                const triggerRSI = Math.min(rsi5m, rsi15m);
-                const triggeredTF = rsi5m <= RSI_OVERSOLD ? (rsi15m <= RSI_OVERSOLD ? "5m+15m" : "5m") : "15m";
+                const triggerRSI = Math.max(rsi5m, rsi15m); // higher of the two (both ≤ 26)
+                const triggeredTF = "5m+15m";
                 this.obosCrossState.set(longCrossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
 
                 const entryReason = `RSI-26 LONG: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ ${RSI_OVERSOLD}`;
@@ -973,7 +966,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.3 DUAL: RSI-26 Multi (top-10) + Oil News`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.4 DUAL: RSI-26 Core-4 (5m+15m AND) + Oil News`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1141,7 +1134,7 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // v15.3: BE logic removed — RSI-26 has tight SL (-0.25%) / TP (+0.3%), BE not applicable
+      // v15.4: BE logic removed — RSI-26 has tight SL (-0.25%) / TP (+0.3%), BE not applicable
 
       // Exit checks
       const tpPctFromEntry = trade.entryPrice > 0 && trade.takeProfit1 ? (Math.abs(trade.takeProfit1 - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
