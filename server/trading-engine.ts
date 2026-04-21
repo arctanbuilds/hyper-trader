@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v15.6
+ * HyperTrader — Trading Engine v15.7
  *
  * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
@@ -21,7 +21,7 @@
  * STRATEGY C — Oil News Sentiment:
  *   - WTI Crude Oil (xyz:CL) via XYZ DEX perps — LONG + SHORT
  *   - $100 fixed allocation, 20x leverage, isolated margin
- *   - Every 15 min: Sonar API scans macro/political news → sentiment → direction
+ *   - Every 5 min: Sonar API scans macro/political news → sentiment → direction
  *   - SL -2%, TP +5%, BE+ at +1.5% → SL moves to +1.0% profit lock (v15.6)
  *   - Max 1 position, 1-hour cooldown after loss
  *   - Confidence threshold: ≥ 7/10 to trade
@@ -32,7 +32,7 @@
  *
  * Shared:
  *   - Scan every 5 seconds (BTC strategies)
- *   - Oil scans every 15 minutes (separate timer)
+ *   - Oil scans every 5 minutes (separate timer)
  *   - Cancel all orders on close (ghost position prevention)
  *   - Orphan detector on startup
  *   - SL + TP orders placed on HL immediately at fill
@@ -82,7 +82,7 @@ type StrategyType = "breakout" | "obos" | "oil_news";
 
 // ============ OIL NEWS SENTIMENT ============
 
-const OIL_SCAN_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const OIL_SCAN_INTERVAL_MS = 5 * 60 * 1000; // v15.7: 5 minutes (was 15)
 const OIL_FIXED_CAPITAL = 100; // $100 fixed allocation
 const OIL_LEVERAGE = 20;
 const OIL_TP_PCT = 0.05;  // +5%
@@ -673,11 +673,11 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.6 started | DUAL: RSI-26+SMC Core-4 + Oil News (with BE+ @ +1.5%→+1.0%) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+      message: `Engine v15.7 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (BE+ @+1.5%→+1.0%) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
 
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.6 started | DUAL: RSI-26+SMC Core-4 + Oil News (BE+ @+1.5%) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.7 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (BE+ @+1.5%) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleOilScan();
   }
@@ -941,7 +941,7 @@ class TradingEngine {
       const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
       const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies / 3) / equity : 0;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.6 DUAL: RSI-26+SMC Core-4 + Oil News | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.7 DUAL: RSI-26+SMC Core-4 + Oil News 5-min | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -1089,7 +1089,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.6 DUAL: RSI-26+SMC Core-4 + Oil News`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.7 DUAL: RSI-26+SMC Core-4 + Oil News 5-min`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1646,7 +1646,7 @@ class TradingEngine {
 
   async forceScan() { await this.runScanCycle(); }
 
-  // ============ OIL NEWS SCAN CYCLE (every 15 min) ============
+  // ============ OIL NEWS SCAN CYCLE (every 5 min — v15.7) ============
 
   private async scheduleOilScan() {
     const config = await storage.getConfig();
