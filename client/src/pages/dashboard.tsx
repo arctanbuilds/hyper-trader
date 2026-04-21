@@ -114,7 +114,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v15.2 — OBOS (BTC) + Oil News (WTI)</p>
+            <p className="text-sm text-muted-foreground">v15.3 — RSI-26 Multi (top-10) + Oil News (WTI)</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -182,10 +182,10 @@ export default function Dashboard() {
               <Activity className="w-4 h-4 text-muted-foreground" />
             </div>
             <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
-              {totalOpen} / 2
+              {totalOpen} / 4
             </div>
             <p className="text-[10px] text-muted-foreground mt-1">
-              OBOS: {obosOpenCount}/1 | Oil: {oilOpenCount}/1
+              RSI-26: {obosOpenCount}/3 | Oil: {oilOpenCount}/1
             </p>
           </CardContent>
         </Card>
@@ -214,13 +214,13 @@ export default function Dashboard() {
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
               <div>
-                <CardTitle className="text-sm font-medium">Overbought / Oversold</CardTitle>
+                <CardTitle className="text-sm font-medium">RSI-26 Multi-Asset</CardTitle>
                 <p className="text-[10px] text-muted-foreground mt-0.5">
-                  BTC | L+S | RSI ≤15/≥88 | 100% remaining eq | SL -0.5% | TP +0.45% | BE
+                  Top-10 | LONG | RSI ≤26 | 3 slots | SL -0.25% | TP +0.30%
                 </p>
               </div>
               <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-amber-500/10 text-amber-400 border-amber-500/30">
-                OBOS
+                RSI-26
               </Badge>
             </div>
           </CardHeader>
@@ -350,7 +350,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.2) | {raceDays} running</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.3) | {raceDays} running</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
@@ -419,7 +419,7 @@ export default function Dashboard() {
               {openTrades.map((trade: any) => {
                 const isBreakout = trade.strategy === "breakout" || trade.strategy === "trendline";
                 const isOilNews = trade.strategy === "oil_news";
-                const stratLabel = isOilNews ? "OIL" : (isBreakout ? "B&R" : "OBOS");
+                const stratLabel = isOilNews ? "OIL" : (isBreakout ? "B&R" : "RSI-26");
                 const badgeBg = isOilNews
                   ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
                   : isBreakout
@@ -564,7 +564,7 @@ export default function Dashboard() {
                                 : "bg-amber-500/10 text-amber-400 border-amber-500/30"
                             )}
                           >
-                            {isOilTrade ? "OIL" : isBreakout ? "B&R" : "OBOS"}
+                            {isOilTrade ? "OIL" : isBreakout ? "B&R" : "RSI-26"}
                           </Badge>
                         </td>
                         <td className="py-1.5 px-1 text-right font-mono">${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}</td>

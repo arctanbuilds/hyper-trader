@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v15.2
+ * HyperTrader — Trading Engine v15.3
  *
  * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
@@ -60,8 +60,18 @@ interface AssetConfig {
   isolatedOnly?: boolean;
 }
 
+// v15.3: Top-10 most liquid HL perps by 24h volume (excluding xyz DEX)
 const ALLOWED_ASSETS: AssetConfig[] = [
-  { coin: "BTC",  displayName: "Bitcoin",     dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
+  { coin: "BTC",      displayName: "Bitcoin",    dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
+  { coin: "ETH",      displayName: "Ethereum",   dex: "", maxLeverage: 25, szDecimals: 4, category: "crypto", minNotional: 10 },
+  { coin: "HYPE",     displayName: "Hyperliquid",dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "SOL",      displayName: "Solana",     dex: "", maxLeverage: 20, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "ZEC",      displayName: "Zcash",      dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "AAVE",     displayName: "Aave",       dex: "", maxLeverage: 10, szDecimals: 2, category: "crypto", minNotional: 10 },
+  { coin: "XRP",      displayName: "XRP",        dex: "", maxLeverage: 20, szDecimals: 0, category: "crypto", minNotional: 10 },
+  { coin: "FARTCOIN", displayName: "Fartcoin",   dex: "", maxLeverage: 10, szDecimals: 1, category: "crypto", minNotional: 10 },
+  { coin: "MON",      displayName: "Monad",      dex: "", maxLeverage: 5,  szDecimals: 0, category: "crypto", minNotional: 10 },
+  { coin: "kPEPE",    displayName: "kPEPE",      dex: "", maxLeverage: 10, szDecimals: 0, category: "crypto", minNotional: 10 },
 ];
 
 // Oil asset — XYZ DEX perp (separate from ALLOWED_ASSETS to avoid BTC scan logic)
@@ -553,11 +563,11 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.2 started | DUAL: OBOS (BTC) + Oil News (xyz:CL) | B&R disabled | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+      message: `Engine v15.3 started | DUAL: RSI-26 Multi (top-10 assets) + Oil News (xyz:CL) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
 
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.2 started | DUAL: OBOS + Oil News | B&R disabled | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.3 started | DUAL: RSI-26 Multi + Oil News | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleOilScan();
   }
@@ -625,7 +635,7 @@ class TradingEngine {
     config: any;
   }): Promise<boolean> {
     const { asset, strategy, side, equityPct, leverage, tpPct, slPct, rsi5m, rsi15m, triggerRSI, price, equity, entryReason, config } = params;
-    const stratLabel = strategy === "breakout" ? "B&R" : "OBOS";
+    const stratLabel = strategy === "breakout" ? "B&R" : strategy === "oil_news" ? "OIL" : "RSI-26";
     const isBuy = side === "long";
 
     // Position sizing — equityPct of equity, at leverage
@@ -816,11 +826,12 @@ class TradingEngine {
         });
       }
 
-      // Equity split: $100 reserved for oil, rest goes 100% to OBOS (B&R disabled)
+      // Equity split: $100 reserved for oil, rest split across up to 3 RSI slots
+      // Each slot gets (equity - $100) / 3 of the equity
       const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
-      const btcStrategyPct = equityForBtcStrategies > 0 ? equityForBtcStrategies / equity : 0;
+      const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies / 3) / equity : 0;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.2 DUAL: OBOS (BTC) + Oil News (WTI) | OBOS eq: $${equityForBtcStrategies.toFixed(0)} (${(btcStrategyPct*100).toFixed(0)}%)`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.3 DUAL: RSI-26 Multi (top-10) + Oil News | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -839,7 +850,7 @@ class TradingEngine {
       const obosOpen = openTrades.filter(t => t.strategy === "obos");
 
       const BREAKOUT_MAX_POSITIONS = 1;
-      const OBOS_MAX_POSITIONS = 1;
+      const OBOS_MAX_POSITIONS = 3; // v15.3: up to 3 concurrent positions across top-10 assets
 
       let totalEntries = 0;
 
@@ -858,11 +869,10 @@ class TradingEngine {
       // 50% equity, max leverage, SL -0.5%, TP +0.45%
       // BE: after +0.3% → move SL to +0.2% (profit zone)
       // ================================================================
+      // v15.3: RSI-26 Multi-Asset — LONG only, top-10 liquid assets
       {
-        const RSI_OVERSOLD = 15;
-        const RSI_OVERBOUGHT = 88;
-        const RSI_RESET_OVERSOLD = 25;  // reset long cross state when RSI > 25 on both TFs
-        const RSI_RESET_OVERBOUGHT = 75; // reset short cross state when RSI < 75 on both TFs
+        const RSI_OVERSOLD = 26;
+        const RSI_RESET = 35;  // reset long cross state when RSI > 35 on both TFs (prevents re-entry same dip)
 
         for (const asset of ALLOWED_ASSETS) {
           const ctx = assetCtxMap[asset.coin];
@@ -889,9 +899,8 @@ class TradingEngine {
             const rsi5m = c5m.length >= 15 ? calculateRSI([...c5m, price]) : 50;
             const rsi15m = c15m.length >= 15 ? calculateRSI([...c15m, price]) : 50;
 
-            // Signal detection
+            // LONG signal: RSI ≤ 26 on either 5m or 15m
             const oversold = rsi5m <= RSI_OVERSOLD || rsi15m <= RSI_OVERSOLD;
-            const overbought = rsi5m >= RSI_OVERBOUGHT || rsi15m >= RSI_OVERBOUGHT;
 
             let scanSignal: string = "neutral";
             let scanDetails = "";
@@ -899,13 +908,9 @@ class TradingEngine {
             if (oversold) {
               scanSignal = "obos_oversold";
               const tf = rsi5m <= RSI_OVERSOLD ? (rsi15m <= RSI_OVERSOLD ? "5m+15m" : "5m") : "15m";
-              scanDetails = `OBOS: ${tf} RSI oversold | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Threshold ≤${RSI_OVERSOLD}`;
-            } else if (overbought) {
-              scanSignal = "obos_overbought";
-              const tf = rsi5m >= RSI_OVERBOUGHT ? (rsi15m >= RSI_OVERBOUGHT ? "5m+15m" : "5m") : "15m";
-              scanDetails = `OBOS: ${tf} RSI overbought | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Threshold ≥${RSI_OVERBOUGHT}`;
+              scanDetails = `RSI-26: ${tf} oversold | 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Threshold ≤${RSI_OVERSOLD}`;
             } else {
-              scanDetails = `OBOS: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need ≤${RSI_OVERSOLD} or ≥${RSI_OVERBOUGHT}`;
+              scanDetails = `RSI-26: 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} | Need ≤${RSI_OVERSOLD}`;
             }
 
             await storage.upsertMarketScan({
@@ -914,19 +919,19 @@ class TradingEngine {
               volume24h, change24h,
               signal: scanSignal,
               fundingRate: funding, openInterest,
-              confluenceScore: (oversold || overbought) ? 10 : 0,
+              confluenceScore: oversold ? 10 : 0,
               confluenceDetails: scanDetails,
               riskRewardRatio: 0,
               timestamp: new Date().toISOString(),
             });
 
-            // === LONG entry: RSI oversold ===
+            // === LONG entry: RSI oversold (≤26) ===
             const longCrossKey = `${asset.coin}_obos_long`;
-            // Reset long cross state when RSI recovers above 25 on BOTH timeframes
-            if (!oversold && rsi5m > RSI_RESET_OVERSOLD && rsi15m > RSI_RESET_OVERSOLD) {
+            // Reset cross state when RSI recovers above 35 on BOTH timeframes
+            if (!oversold && rsi5m > RSI_RESET && rsi15m > RSI_RESET) {
               if (this.obosCrossState.has(longCrossKey)) {
                 this.obosCrossState.delete(longCrossKey);
-                log(`[OBOS] ${asset.coin} LONG cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${RSI_RESET_OVERSOLD}`, "engine");
+                log(`[RSI-26] ${asset.coin} cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both > ${RSI_RESET}`, "engine");
               }
             }
 
@@ -937,15 +942,15 @@ class TradingEngine {
                 const triggeredTF = rsi5m <= RSI_OVERSOLD ? (rsi15m <= RSI_OVERSOLD ? "5m+15m" : "5m") : "15m";
                 this.obosCrossState.set(longCrossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
 
-                const entryReason = `OBOS LONG: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ ${RSI_OVERSOLD}`;
+                const entryReason = `RSI-26 LONG: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≤ ${RSI_OVERSOLD}`;
                 const entered = await this.executeEntry({
                   asset,
                   strategy: "obos",
                   side: "long",
                   equityPct: btcStrategyPct,
                   leverage: asset.maxLeverage,
-                  tpPct: 0.0045,         // +0.45%
-                  slPct: 0.005,          // -0.5%
+                  tpPct: 0.003,          // +0.3%
+                  slPct: 0.0025,         // -0.25%
                   rsi5m, rsi15m, triggerRSI, price, equity,
                   entryReason,
                   config,
@@ -954,47 +959,10 @@ class TradingEngine {
                 if (entered) {
                   totalEntries++;
                   this.dailyTradeCount++;
+                  // Increment in-scan slot counter so next iteration respects MAX_POSITIONS
+                  obosOpen.push({ coin: asset.coin, strategy: "obos", side: "long" } as any);
                 } else {
                   this.obosCrossState.delete(longCrossKey);
-                }
-              }
-            }
-
-            // === SHORT entry: RSI overbought ===
-            const shortCrossKey = `${asset.coin}_obos_short`;
-            // Reset short cross state when RSI drops below 75 on BOTH timeframes
-            if (!overbought && rsi5m < RSI_RESET_OVERBOUGHT && rsi15m < RSI_RESET_OVERBOUGHT) {
-              if (this.obosCrossState.has(shortCrossKey)) {
-                this.obosCrossState.delete(shortCrossKey);
-                log(`[OBOS] ${asset.coin} SHORT cross state reset — 5m=${rsi5m.toFixed(1)} 15m=${rsi15m.toFixed(1)} both < ${RSI_RESET_OVERBOUGHT}`, "engine");
-              }
-            }
-
-            if (overbought && obosOpen.length < OBOS_MAX_POSITIONS && !coinHasPosition) {
-              if (!this.obosCrossState.has(shortCrossKey)) {
-                const triggerRSI = Math.max(rsi5m, rsi15m);
-                const triggeredTF = rsi5m >= RSI_OVERBOUGHT ? (rsi15m >= RSI_OVERBOUGHT ? "5m+15m" : "5m") : "15m";
-                this.obosCrossState.set(shortCrossKey, { price, timestamp: Date.now(), rsi: triggerRSI });
-
-                const entryReason = `OBOS SHORT: ${asset.coin} ${triggeredTF}=${triggerRSI.toFixed(1)} ≥ ${RSI_OVERBOUGHT}`;
-                const entered = await this.executeEntry({
-                  asset,
-                  strategy: "obos",
-                  side: "short",
-                  equityPct: btcStrategyPct,
-                  leverage: asset.maxLeverage,
-                  tpPct: 0.0045,         // +0.45%
-                  slPct: 0.005,          // -0.5%
-                  rsi5m, rsi15m, triggerRSI, price, equity,
-                  entryReason,
-                  config,
-                });
-
-                if (entered) {
-                  totalEntries++;
-                  this.dailyTradeCount++;
-                } else {
-                  this.obosCrossState.delete(shortCrossKey);
                 }
               }
             }
@@ -1005,7 +973,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.1 TRIPLE: B&R + OBOS + Oil`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.3 DUAL: RSI-26 Multi (top-10) + Oil News`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1173,70 +1141,7 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // ============ OBOS BE RULE ============
-      // After price moves +0.3% in profit → move SL to +0.2% (profit zone)
-      if (trade.strategy === "obos" && !this.beApplied.has(trade.id)) {
-        const profitMove = isLong
-          ? (currentPrice - trade.entryPrice) / trade.entryPrice
-          : (trade.entryPrice - currentPrice) / trade.entryPrice;
-
-        if (profitMove >= 0.003) { // +0.3%
-          const newSL = isLong
-            ? trade.entryPrice * 1.002  // +0.2% above entry
-            : trade.entryPrice * 0.998; // -0.2% below entry (profit zone for short)
-
-          log(`[OBOS BE] Trade #${trade.id} ${trade.coin} ${trade.side.toUpperCase()} — price moved +${(profitMove * 100).toFixed(2)}% ≥ 0.3% → moving SL to +0.2% ($${newSL.toFixed(2)})`, "engine");
-
-          // Update SL on HL: cancel old SL, place new one
-          if (config.apiSecret && config.walletAddress) {
-            try {
-              const executor = createExecutor(config.apiSecret, config.walletAddress);
-              // Cancel existing SL trigger orders for this coin
-              const openOrders = await executor.getOpenOrders();
-              const slOrders = openOrders.filter((o: any) => o.coin === trade.coin && o.reduceOnly);
-              // Only cancel trigger orders (SL), not limit orders (TP)
-              for (const order of slOrders) {
-                // Trigger orders have orderType with trigger — but openOrders doesn't always show this clearly
-                // We cancel orders that are on the opposite side of our position
-                const isSLOrder = isLong
-                  ? order.side === "A" && parseFloat(order.limitPx) < trade.entryPrice
-                  : order.side === "B" && parseFloat(order.limitPx) > trade.entryPrice;
-                if (isSLOrder) {
-                  await executor.cancelOrder(order.coin, order.oid);
-                  log(`[OBOS BE] Cancelled old SL order oid=${order.oid}`, "engine");
-                }
-              }
-
-              // Place new SL at +0.2%
-              const hlPos2 = hlPosMap.get(trade.coin);
-              const posSize = hlPos2 ? Math.abs(parseFloat(hlPos2.szi || "0")) : 0;
-              if (posSize > 0) {
-                const slTriggerPx = parseFloat(formatHLPrice(newSL, szd));
-                const slFillPx = parseFloat(formatHLPrice(isLong ? newSL * 0.98 : newSL * 1.02, szd));
-                await executor.placeOrder({
-                  coin: trade.coin, isBuy: !isLong, sz: posSize,
-                  limitPx: slFillPx,
-                  orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
-                  reduceOnly: true,
-                });
-                log(`[OBOS BE] New SL placed @ $${slTriggerPx} (+0.2% profit zone)`, "engine");
-              }
-            } catch (beErr) {
-              log(`[OBOS BE] Failed to move SL: ${beErr}`, "engine");
-            }
-          }
-
-          // Update trade record
-          await storage.updateTrade(trade.id, { stopLoss: newSL });
-          this.beApplied.add(trade.id);
-
-          await storage.createLog({
-            type: "system",
-            message: `[OBOS BE] ${trade.coin} ${trade.side.toUpperCase()} — SL moved to +0.2% ($${newSL.toFixed(2)}) after +${(profitMove * 100).toFixed(2)}% profit`,
-            timestamp: new Date().toISOString(),
-          });
-        }
-      }
+      // v15.3: BE logic removed — RSI-26 has tight SL (-0.25%) / TP (+0.3%), BE not applicable
 
       // Exit checks
       const tpPctFromEntry = trade.entryPrice > 0 && trade.takeProfit1 ? (Math.abs(trade.takeProfit1 - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
@@ -1254,16 +1159,15 @@ class TradingEngine {
       const slHit = slActive && (isLong ? currentPrice <= trade.stopLoss : currentPrice >= trade.stopLoss);
 
       const slPctFromEntry = trade.entryPrice > 0 ? (Math.abs(trade.stopLoss - trade.entryPrice) / trade.entryPrice * 100).toFixed(2) : "?";
-      const isBESL = this.beApplied.has(trade.id);
 
       if (tpHit) {
         shouldClose = true;
         closeReason = `[${stratLabel}] ${tpPctLabel} @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
       } else if (slHit) {
         shouldClose = true;
-        const slLabel = isBESL ? `SL @ BE +0.2%` : `SL -${slPctFromEntry}%`;
+        const slLabel = `SL -${slPctFromEntry}%`;
         closeReason = `[${stratLabel}] ${slLabel} hit @ $${displayPrice(currentPrice, szd)} | $${pnlUsd.toFixed(2)}`;
-        log(`[SL HIT] Trade #${trade.id} ${trade.coin} ${trade.side.toUpperCase()} [${stratLabel}] | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}${isBESL ? " (BE)" : ""}`, "engine");
+        log(`[SL HIT] Trade #${trade.id} ${trade.coin} ${trade.side.toUpperCase()} [${stratLabel}] | Price $${displayPrice(currentPrice, szd)} hit SL $${displayPrice(trade.stopLoss, szd)}`, "engine");
       }
 
       if (shouldClose) {
@@ -1828,8 +1732,10 @@ class TradingEngine {
           pnlUsd: obosPnlUsd.toFixed(4),
           pnlOfAum: obosPnlOfAum.toFixed(3),
           status: "active",
-          direction: "LONG + SHORT",
-          riskReward: "SL -0.5% / TP +0.45% / BE @ +0.3%\u2192+0.2%",
+          direction: "LONG only",
+          riskReward: "SL -0.25% / TP +0.30%",
+          assets: "Top-10 by volume",
+          maxPositions: 3,
         },
         oil_news: {
           trades: oilTrades.length,
