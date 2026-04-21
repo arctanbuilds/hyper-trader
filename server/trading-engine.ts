@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v15.7
+ * HyperTrader — Trading Engine v15.8
  *
  * TRIPLE STRATEGY: Breakout & Retest + Overbought/Oversold + Oil News Sentiment
  *
@@ -673,11 +673,11 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v15.7 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (BE+ @+1.5%→+1.0%) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
+      message: `Engine v15.8 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (BE+ @+1.5%→+1.0% L+S) | AUM: $${this.lastKnownEquity.toLocaleString()} | Oil: $${OIL_FIXED_CAPITAL} fixed`,
 
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v15.7 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (BE+ @+1.5%) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v15.8 started | DUAL: RSI-26+SMC Core-4 + Oil News 5-min (BE+ L+S @+1.5%) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleOilScan();
   }
@@ -941,7 +941,7 @@ class TradingEngine {
       const equityForBtcStrategies = Math.max(0, equity - OIL_FIXED_CAPITAL);
       const btcStrategyPct = equityForBtcStrategies > 0 ? (equityForBtcStrategies / 3) / equity : 0;
 
-      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.7 DUAL: RSI-26+SMC Core-4 + Oil News 5-min | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
+      log(`Scan #${this.scanCount} | AUM: $${equity.toLocaleString()} | v15.8 DUAL: RSI-26+SMC Core-4 + Oil News 5-min | RSI slot eq: $${(equityForBtcStrategies / 3).toFixed(0)} (×3 slots)`, "engine");
 
       // Fetch market data for all assets
       const mainData = await fetchMetaAndAssetCtxs("");
@@ -1089,7 +1089,7 @@ class TradingEngine {
       // Log scan summary
       await storage.createLog({
         type: "scan",
-        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.7 DUAL: RSI-26+SMC Core-4 + Oil News 5-min`,
+        message: `Scan #${this.scanCount}: ${totalEntries} entries | AUM: $${equity.toLocaleString()} | v15.8 DUAL: RSI-26+SMC Core-4 + Oil News 5-min`,
         timestamp: new Date().toISOString(),
       });
 
@@ -1304,19 +1304,23 @@ class TradingEngine {
         } catch (beErr) { log(`[BE+] Error on trade #${trade.id}: ${beErr}`, "engine"); }
       }
 
-      // v15.6: BE+ for Oil News strategy — when price moves +1.50% (LONG only),
-      // cancel existing SL and place new SL at entryPrice * 1.01 (+1.00% profit lock).
-      if (isOilNews && isLong && !isBESL && priceMovePct >= 1.50 && config.apiSecret && config.walletAddress) {
+      // v15.8: BE+ for Oil News strategy (LONG + SHORT) — when price moves +1.50% in favor,
+      // cancel existing SL and place new SL at +1.00% profit lock.
+      //   LONG: newSL = entry * 1.01 (above entry)
+      //   SHORT: newSL = entry * 0.99 (below entry)
+      // priceMovePct is already direction-aware (positive = in favor) — see line above.
+      if (isOilNews && !isBESL && priceMovePct >= 1.50 && config.apiSecret && config.walletAddress) {
         try {
           const executor = createExecutor(config.apiSecret, config.walletAddress);
-          const newSL = trade.entryPrice * 1.01; // +1.00% above entry
+          const newSL = isLong ? trade.entryPrice * 1.01 : trade.entryPrice * 0.99;
           const openOrders = await executor.getOpenOrders();
           const slOrders = openOrders.filter((o: any) => o.coin === trade.coin && o.triggerCondition !== undefined);
           for (const o of slOrders) {
             try { await executor.cancelOrder(o.coin, o.oid); } catch (ce) { log(`[BE] Cancel oil SL error: ${ce}`, "engine"); }
           }
           const slTriggerPx = parseFloat(formatHLPrice(newSL, szd));
-          const slFillPx = parseFloat(formatHLPrice(newSL * 0.98, szd));
+          // Fill slippage: LONG sells so fill below trigger (*0.98); SHORT buys so fill above trigger (*1.02)
+          const slFillPx = parseFloat(formatHLPrice(isLong ? newSL * 0.98 : newSL * 1.02, szd));
           const pos = hlPos || (await executor.getPositions()).find((p: any) => p.position?.coin === trade.coin)?.position;
           const sz = pos ? Math.abs(parseFloat(pos.szi || "0")) : 0;
           if (sz > 0) {
@@ -1329,10 +1333,11 @@ class TradingEngine {
             await storage.updateTrade(trade.id, { stopLoss: newSL });
             trade.stopLoss = newSL;
             this.beApplied.add(trade.id);
-            log(`[BE+ OIL] Trade #${trade.id} ${trade.coin} LONG | price moved +${priceMovePct.toFixed(2)}% → SL moved to $${displayPrice(newSL, szd)} (+1.00% profit lock)`, "engine");
+            const sideLabel = isLong ? "LONG" : "SHORT";
+            log(`[BE+ OIL] Trade #${trade.id} ${trade.coin} ${sideLabel} | price moved +${priceMovePct.toFixed(2)}% in favor → SL moved to $${displayPrice(newSL, szd)} (+1.00% profit lock)`, "engine");
             await storage.createLog({
               type: "system",
-              message: `[BE+ OIL] ${trade.coin} LONG | +${priceMovePct.toFixed(2)}% → SL locked at +1.00% ($${displayPrice(newSL, szd)})`,
+              message: `[BE+ OIL] ${trade.coin} ${sideLabel} | +${priceMovePct.toFixed(2)}% in favor → SL locked at +1.00% ($${displayPrice(newSL, szd)})`,
               timestamp: new Date().toISOString(),
             });
           }

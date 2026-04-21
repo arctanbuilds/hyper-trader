@@ -114,7 +114,7 @@ export default function Dashboard() {
         <div>
           <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
           <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v15.7 — RSI-26 + SMC Core-4 + Oil News 5-min (both with BE+ profit lock)</p>
+            <p className="text-sm text-muted-foreground">v15.8 — RSI-26 + SMC Core-4 + Oil News 5-min (BE+ L+S bug fix)</p>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
               <Clock className="w-3 h-3" />
               <span className={sessionInfo.color}>{sessionInfo.session}</span>
@@ -350,7 +350,7 @@ export default function Dashboard() {
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.7) | {raceDays} running</p>
+            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v15.8) | {raceDays} running</p>
           </CardHeader>
           <CardContent>
             {equityChartData.length > 1 ? (
