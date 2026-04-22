@@ -38,7 +38,7 @@ function getPhase(hour: number, minute: number, weekday: string) {
   if (mins < 8 * 60 + 45) return { key: "news", label: "News fetch", next: "Decision · 08:45 ET", active: 1 };
   if (mins < 9 * 60) return { key: "decision", label: "First decision", next: "Retry window · 09:00 ET", active: 2 };
   if (mins < 9 * 60 + 30) return { key: "retry", label: "Qualification retry", next: "Entry · 09:30 ET", active: 3 };
-  if (mins < 10 * 60 + 45) return { key: "entry", label: "Entry window", next: "Cutoff · 10:45 ET", active: 4 };
+  if (mins < 15 * 60 + 30) return { key: "entry", label: "Entry window", next: "Cutoff · 15:30 ET", active: 4 };
   return { key: "closed", label: "Session closed", next: "Tomorrow 08:30 ET", active: 5 };
 }
 
@@ -207,7 +207,7 @@ export default function Dashboard() {
                 </div>
                 <div className="flex items-center gap-2">
                   {retryCount > 0 && !entryDone && !retriesExhausted && (
-                    <Pill tone="neutral">Retry {retryCount}/8</Pill>
+                    <Pill tone="neutral">Retry {retryCount}/27</Pill>
                   )}
                   <Pill tone={phase.key === "entry" ? "positive" : phase.key === "closed" ? "muted" : "neutral"}>
                     {phase.label}
@@ -233,13 +233,16 @@ export default function Dashboard() {
                   <p className="text-muted-foreground">Claude Opus 4.7 is reading the tape and composing today&apos;s trade thesis.</p>
                 )}
                 {phase.key === "retry" && !decision && (
-                  <p className="text-muted-foreground">Qualification gate didn&apos;t pass. Retrying every 15 minutes with fresh news and a fresh decision until 10:45 ET.</p>
+                  <p className="text-muted-foreground">Qualification gate didn&apos;t pass. Retrying every 15 minutes with fresh news and a fresh decision, all the way through 15:30 ET.</p>
                 )}
                 {phase.key === "retry" && decision && !entryDone && (
                   <p className="text-muted-foreground">Setup qualified. Waiting for the 09:30 ET NY open to enter.</p>
                 )}
-                {phase.key === "entry" && !entryDone && (
-                  <p className="text-muted-foreground">Entry window is live. Limit rests for one minute, then promotes to market if unfilled. Cutoff is 10:45 ET.</p>
+                {phase.key === "entry" && !entryDone && !decision && (
+                  <p className="text-muted-foreground">Still scanning every 15 minutes. Any qualifying setup between now and 15:30 ET enters at market immediately.</p>
+                )}
+                {phase.key === "entry" && !entryDone && decision && (
+                  <p className="text-muted-foreground">Entry window is live. Limit rests for one minute, then promotes to market if unfilled. Cutoff is 15:30 ET.</p>
                 )}
                 {entryDone && sessionResult === "tp" && (
                   <p className="text-[hsl(var(--positive))]">Take-profit captured. Re-entry is permitted within this session window.</p>
@@ -585,7 +588,7 @@ function Timeline({ activeIdx }: { activeIdx: number }) {
     { time: "08:45", label: "Decision" },
     { time: "09:00", label: "Retry" },
     { time: "09:30", label: "Entry" },
-    { time: "10:45", label: "Cutoff" },
+    { time: "15:30", label: "Cutoff" },
   ];
   return (
     <div className="relative flex items-center justify-between pt-2">

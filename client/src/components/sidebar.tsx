@@ -98,7 +98,7 @@ export default function Sidebar() {
       <div className="px-6 pb-6">
         <div className="text-[11px] leading-tight">
           <div className="font-medium text-foreground/80">Operator</div>
-          <div className="text-muted-foreground">v17.2 · BTC Session</div>
+          <div className="text-muted-foreground">v17.3 · BTC Session</div>
         </div>
       </div>
     </aside>

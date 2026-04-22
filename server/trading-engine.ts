@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v17.2
+ * HyperTrader — Trading Engine v17.3
  *
  * SINGLE STRATEGY: BTC NY Open Session Trader (Mon–Fri)
  *
@@ -56,7 +56,7 @@ const ALLOWED_ASSETS: AssetConfig[] = [
 ];
 const BTC_ASSET = ALLOWED_ASSETS[0];
 
-// v17.2 Session constants
+// v17.3 Session constants
 const SESSION_TP_PCT = 0.01;              // +1.0%
 const SESSION_SL_PCT = 0.01;              // -1.0%
 const SESSION_BE_TRIGGER_PCT = 0.5;       // price moves +0.5% in favor → trigger BE+
@@ -70,10 +70,10 @@ const SESSION_ENTRY_LIMIT_MS = 60 * 1000; // 1 min limit window, then market
 const SESSION_NEWS_ET = { hour: 8, minute: 30 };     // Sonar news scan
 const SESSION_DECISION_ET = { hour: 8, minute: 45 }; // Opus first decision
 const SESSION_OPEN_ET = { hour: 9, minute: 30 };     // NY open entry
-const SESSION_CUTOFF_ET = { hour: 10, minute: 45 };  // v17.2 hard cutoff — extended for retry window
-// v17.2 qualification-gate retry loop
+const SESSION_CUTOFF_ET = { hour: 15, minute: 30 };  // v17.3 hard cutoff — 1hr buffer before NY close; positions can run overnight
+// v17.3 qualification-gate retry loop — all day until cutoff
 const SESSION_RETRY_INTERVAL_MIN = 15;  // retry every 15 minutes
-const SESSION_MAX_RETRIES = 8;          // 09:00, 09:15, 09:30, 09:45, 10:00, 10:15, 10:30, 10:45
+const SESSION_MAX_RETRIES = 27;         // 09:00 through 15:30 (every 15 min = 27 retries after 08:45 first call)
 const SESSION_RETRY_START_ET = { hour: 9, minute: 0 };  // first retry slot (after 08:45 first call)
 
 const ALL_TRADEABLE_COINS = [...ALLOWED_ASSETS.map(a => a.coin)];
@@ -725,10 +725,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v17.2 started | BTC NY Open Session Trader (Mon–Fri, 08:30–10:45 ET w/ qualification-gate retry every 15m, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v17.3 started | BTC NY Session Trader (Mon–Fri, 08:30–15:30 ET w/ qualification-gate retry every 15m, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v17.2 started | BTC NY Open Session Trader (retry-loop 08:45–10:45 ET) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v17.3 started | BTC NY Session Trader (retry-loop 08:45–15:30 ET) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleNextSessionTick();
   }
@@ -1152,9 +1152,9 @@ class TradingEngine {
         }
       }
 
-      // 4) 10:45 ET — hard cutoff. If still no entry and decision was valid, take market. Otherwise end session.
+      // 4) 15:30 ET — hard cutoff. If still no entry and decision was valid, take market. Otherwise end session.
       if (this.sessionState.decisionDone && !this.sessionState.entryDone && minutes >= cutoffMin) {
-        log(`[SESSION] ${dateKey} 10:45 ET cutoff — forcing market entry if decision valid`, "engine");
+        log(`[SESSION] ${dateKey} 15:30 ET cutoff — forcing market entry if decision valid`, "engine");
         await this.cancelRestingSessionOrders(config);
         await this.tryEnterSession(config, true);
         // Mark session done regardless — no more entries this day
@@ -1835,7 +1835,7 @@ class TradingEngine {
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
       sessionState: this.sessionState,
-      version: "v17.2",
+      version: "v17.3",
       strategyStats: {
         btc_session: {
           trades: sessionTrades.length,
