@@ -77,14 +77,9 @@ export async function registerRoutes(
       // Sort by timestamp ascending
       const sorted = [...history].sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
 
-      // Decide which decision (if any) produced the trade: the first PASS chronologically before trade open
-      let tradeDecisionIdx = -1;
-      if (todaySessionTrade && ss?.decision && ss?.decisionDone) {
-        // The qualifying decision is the LAST one in history — because after PASS we stop appending.
-        // Actually: runQualificationPass only pushes to retryHistory on FAIL. PASS sets decisionDone and does not push.
-        // So the qualifying decision is stored as ss.decision (current), not in retryHistory.
-        tradeDecisionIdx = sorted.length; // "virtual" last entry representing the PASS
-      }
+      // Note: runQualificationPass only pushes to retryHistory on FAIL.
+      // On PASS it sets decisionDone and stores the qualifying decision in ss.decision
+      // (not retryHistory). We append a synthetic PASS row below when decisionDone=true.
 
       // Compose response
       const decisions = sorted.map((h, i) => ({
@@ -96,11 +91,18 @@ export async function registerRoutes(
         passed: false,
         tradeOpened: false,
       }));
-      // If the current ss.decision PASSED and bot entered, append a synthetic PASS row
+      // If the current ss.decision PASSED, append a synthetic PASS row.
+      // Use the trade openedAt if available, otherwise the last retryHistory timestamp,
+      // otherwise the sessionState decision time (stable — does not flicker on re-fetch).
       if (ss?.decisionDone && ss?.decision) {
+        const passAt =
+          todaySessionTrade?.openedAt ||
+          ss?.decisionAt ||
+          (sorted.length > 0 ? sorted[sorted.length - 1].at : null) ||
+          new Date().toISOString();
         decisions.push({
           idx: decisions.length + 1,
-          at: todaySessionTrade?.openedAt || new Date().toISOString(),
+          at: passAt,
           minuteEt: -1, // not tracked for PASS (it's one-shot)
           direction: (ss.decision.direction || "").toLowerCase(),
           confidence: ss.decision.confidence || 0,

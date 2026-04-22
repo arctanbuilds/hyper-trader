@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v17.4
+ * HyperTrader — Trading Engine v17.4.1
  *
  * SINGLE STRATEGY: BTC NY Open Session Trader (Mon–Fri)
  *
@@ -595,6 +595,7 @@ function emptySessionState(dateKey: string): SessionState {
     decision: null,
     firstDecisionAttempted: false,
     retryCount: 0,
+    retriesExhausted: false,
     retryHistory: [],
   };
 }
@@ -727,10 +728,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v17.4 started | BTC NY Session Trader (Mon–Fri, 08:30–15:30 ET w/ qualification-gate retry every 15m, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v17.4.1 started | BTC NY Session Trader (Mon–Fri, 08:30–15:30 ET w/ qualification-gate retry every 15m, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v17.4 started | BTC NY Session Trader (retry-loop 08:45–15:30 ET) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v17.4.1 started | BTC NY Session Trader (retry-loop 08:45–15:30 ET) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleNextSessionTick();
   }
@@ -1083,7 +1084,17 @@ class TradingEngine {
           await this.saveSessionState();
           const ok = await this.runQualificationPass(pplxKey, minutes, /*attemptLabel=*/"first");
           if (!ok) {
-            log(`[SESSION] First pass failed qualification — entering retry loop (up to ${SESSION_MAX_RETRIES} retries every ${SESSION_RETRY_INTERVAL_MIN} min)`, "engine");
+            // v17.4-fix (ISSUE-002): seed lastRetryMinute to the CURRENT slot so retry #1
+            // has to wait a full 15-min interval before firing. Without this, if the first
+            // decision runs past 09:00, retry #1 fires on the very next tick (observed:
+            // 16 seconds gap) because slot 0's guard is open.
+            const currentSlotIdx = Math.max(0, Math.floor((minutes - retryStartMin) / SESSION_RETRY_INTERVAL_MIN));
+            const currentSlotMin = retryStartMin + currentSlotIdx * SESSION_RETRY_INTERVAL_MIN;
+            if (minutes >= retryStartMin) {
+              this.sessionState.lastRetryMinute = currentSlotMin;
+              await this.saveSessionState();
+            }
+            log(`[SESSION] First pass failed qualification — entering retry loop (up to ${SESSION_MAX_RETRIES} retries every ${SESSION_RETRY_INTERVAL_MIN} min); next retry at ET minute ${currentSlotMin + SESSION_RETRY_INTERVAL_MIN}`, "engine");
           }
         }
       }
@@ -1839,7 +1850,7 @@ class TradingEngine {
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
       sessionState: this.sessionState,
-      version: "v17.4",
+      version: "v17.4.1",
       strategyStats: {
         btc_session: {
           trades: sessionTrades.length,

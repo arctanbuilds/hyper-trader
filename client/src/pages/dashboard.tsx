@@ -216,7 +216,14 @@ export default function Dashboard() {
               </div>
 
               {/* Timeline */}
-              <Timeline activeIdx={phase.active} />
+              <Timeline
+                activeIdx={phase.active}
+                newsDone={!!sessionState?.newsDone}
+                decisionAttempted={!!sessionState?.firstDecisionAttempted}
+                decisionDone={!!sessionState?.decisionDone}
+                entryDone={!!entryDone}
+                retriesExhausted={!!sessionState?.retriesExhausted}
+              />
 
               {/* Result / state */}
               <div className="pt-2 border-t border-dashed border-border text-[13px] leading-relaxed">
@@ -232,16 +239,16 @@ export default function Dashboard() {
                 {phase.key === "decision" && !decision && (
                   <p className="text-muted-foreground">Claude Opus 4.7 is reading the tape and composing today&apos;s trade thesis.</p>
                 )}
-                {phase.key === "retry" && !decision && (
+                {phase.key === "retry" && !sessionState?.decisionDone && (
                   <p className="text-muted-foreground">Qualification gate didn&apos;t pass. Retrying every 15 minutes with fresh news and a fresh decision, all the way through 15:30 ET.</p>
                 )}
-                {phase.key === "retry" && decision && !entryDone && (
+                {phase.key === "retry" && sessionState?.decisionDone && !entryDone && (
                   <p className="text-muted-foreground">Setup qualified. Waiting for the 09:30 ET NY open to enter.</p>
                 )}
-                {phase.key === "entry" && !entryDone && !decision && (
+                {phase.key === "entry" && !entryDone && !sessionState?.decisionDone && (
                   <p className="text-muted-foreground">Still scanning every 15 minutes. Any qualifying setup between now and 15:30 ET enters at market immediately.</p>
                 )}
-                {phase.key === "entry" && !entryDone && decision && (
+                {phase.key === "entry" && !entryDone && sessionState?.decisionDone && (
                   <p className="text-muted-foreground">Entry window is live. Limit rests for one minute, then promotes to market if unfilled. Cutoff is 15:30 ET.</p>
                 )}
                 {entryDone && sessionResult === "tp" && (
@@ -263,32 +270,28 @@ export default function Dashboard() {
                   <p className="label-mono mb-2">The thesis</p>
                   <h3 className="font-serif text-[18px] tracking-tight">Claude Opus 4.7</h3>
                 </div>
-                {decision?.direction && (
-                  <Pill tone={decision.direction === "LONG" ? "positive" : decision.direction === "SHORT" ? "negative" : "muted"}>
-                    {decision.direction}
-                  </Pill>
-                )}
+                {decision?.direction && (() => {
+                  const dir = String(decision.direction).toLowerCase();
+                  return (
+                    <Pill tone={dir === "long" ? "positive" : dir === "short" ? "negative" : "muted"}>
+                      {dir.toUpperCase()}
+                    </Pill>
+                  );
+                })()}
               </div>
 
               {decision ? (
                 <div className="space-y-4">
                   <div className="grid grid-cols-3 gap-4 pb-4 border-b border-dashed border-border">
-                    <MiniStat label="Entry" value={decision.entryPrice ? `$${Number(decision.entryPrice).toLocaleString()}` : "—"} />
+                    <MiniStat label="Entry" value={decision.entry ? `$${Number(decision.entry).toLocaleString()}` : "Market"} />
                     <MiniStat label="Confidence" value={`${decision.confidence || 0}/10`} tone={(decision.confidence || 0) >= 7 ? "positive" : "muted"} />
                     <MiniStat label="Timing" value="NY Open" />
                   </div>
 
-                  {decision.thesis && (
-                    <div className="space-y-1.5">
-                      <p className="label-mono">Read</p>
-                      <p className="text-[13px] leading-relaxed text-foreground/85">{decision.thesis}</p>
-                    </div>
-                  )}
-
                   {decision.reasoning && (
                     <div className="space-y-1.5">
                       <p className="label-mono">Rationale</p>
-                      <p className="text-[13px] leading-relaxed text-muted-foreground">{decision.reasoning}</p>
+                      <p className="text-[13px] leading-relaxed text-foreground/85">{decision.reasoning}</p>
                     </div>
                   )}
 
@@ -678,7 +681,16 @@ function Pill({
   );
 }
 
-function Timeline({ activeIdx }: { activeIdx: number }) {
+function Timeline({
+  activeIdx, newsDone, decisionAttempted, decisionDone, entryDone, retriesExhausted,
+}: {
+  activeIdx: number;
+  newsDone?: boolean;
+  decisionAttempted?: boolean;
+  decisionDone?: boolean;
+  entryDone?: boolean;
+  retriesExhausted?: boolean;
+}) {
   const steps = [
     { time: "08:30", label: "News" },
     { time: "08:45", label: "Decision" },
@@ -686,12 +698,23 @@ function Timeline({ activeIdx }: { activeIdx: number }) {
     { time: "09:30", label: "Entry" },
     { time: "15:30", label: "Cutoff" },
   ];
+  // State-aware "done" flags (fall back to time-based when state unknown).
+  // Decision step is done only when decision actually qualified.
+  // Retry step is done when decision qualified OR retries exhausted.
+  // Entry step is done when entry has fired.
+  const stepDone = [
+    activeIdx > 0 || !!newsDone,                                           // News
+    activeIdx > 1 && !!decisionDone,                                       // Decision (qualified)
+    activeIdx > 2 && (!!decisionDone || !!retriesExhausted),               // Retry (resolved)
+    activeIdx > 3 && !!entryDone,                                          // Entry
+    activeIdx > 4,                                                         // Cutoff
+  ];
   return (
     <div className="relative flex items-center justify-between pt-2">
       {/* Line */}
       <div className="absolute left-[6px] right-[6px] top-[14px] h-px bg-border" aria-hidden />
       {steps.map((s, i) => {
-        const done = activeIdx > i;
+        const done = stepDone[i];
         const current = activeIdx === i;
         return (
           <div key={s.label} className="relative flex flex-col items-center gap-1.5 z-10 bg-card px-2">
