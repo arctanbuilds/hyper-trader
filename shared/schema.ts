@@ -42,6 +42,8 @@ export const botConfig = pgTable("bot_config", {
   // Max daily/weekly loss
   maxDailyLossPct: doublePrecision("max_daily_loss_pct").default(0.75),
   maxWeeklyLossPct: doublePrecision("max_weekly_loss_pct").default(1.5),
+  // v17.4.1: persist session state across restarts (JSON-serialised SessionState)
+  sessionState: text("session_state").default(""),
   updatedAt: text("updated_at").default(""),
 });
 
