@@ -36,6 +36,104 @@ export async function registerRoutes(
     res.json(status);
   });
 
+  // v17.4: session decisions timeline — all decisions (first + retries) with PASS/FAIL and trade linkage
+  app.get("/api/session/decisions", async (_req, res) => {
+    try {
+      const status: any = await tradingEngine.getStatus();
+      const ss = status?.sessionState || {};
+      const dateKey = ss?.date || "";
+
+      // Find any session trade opened today (for linkage)
+      // Compute ET-midnight ISO to bound getClosedTradesSince
+      const etMidnightIso = (() => {
+        try {
+          const now = new Date();
+          const et = new Intl.DateTimeFormat("en-CA", {
+            timeZone: "America/New_York",
+            year: "numeric", month: "2-digit", day: "2-digit",
+          }).format(now);
+          // Treat as UTC start of that ET date minus 5hr offset is fragile; simpler: go back 24h from now
+          return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        } catch { return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); }
+      })();
+      const openTrades = await storage.getOpenTrades();
+      const closedTrades = await storage.getClosedTradesSince(etMidnightIso);
+      const allTrades = [...openTrades, ...closedTrades];
+      const todaySessionTrade = allTrades.find((t: any) => {
+        if (t.strategy !== "btc_session") return false;
+        if (!t.openedAt) return false;
+        // Match ET date key against trade openedAt
+        try {
+          const openedEt = new Intl.DateTimeFormat("en-CA", {
+            timeZone: "America/New_York",
+            year: "numeric", month: "2-digit", day: "2-digit",
+          }).format(new Date(t.openedAt));
+          return openedEt === dateKey;
+        } catch { return false; }
+      });
+
+      // Build a flat, ordered list of decisions from retryHistory
+      const history: Array<{ at: string; minute: number; direction: string; confidence: number }> = Array.isArray(ss.retryHistory) ? ss.retryHistory : [];
+      // Sort by timestamp ascending
+      const sorted = [...history].sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+
+      // Decide which decision (if any) produced the trade: the first PASS chronologically before trade open
+      let tradeDecisionIdx = -1;
+      if (todaySessionTrade && ss?.decision && ss?.decisionDone) {
+        // The qualifying decision is the LAST one in history — because after PASS we stop appending.
+        // Actually: runQualificationPass only pushes to retryHistory on FAIL. PASS sets decisionDone and does not push.
+        // So the qualifying decision is stored as ss.decision (current), not in retryHistory.
+        tradeDecisionIdx = sorted.length; // "virtual" last entry representing the PASS
+      }
+
+      // Compose response
+      const decisions = sorted.map((h, i) => ({
+        idx: i + 1,
+        at: h.at,
+        minuteEt: h.minute,
+        direction: (h.direction || "").toLowerCase(),
+        confidence: h.confidence || 0,
+        passed: false,
+        tradeOpened: false,
+      }));
+      // If the current ss.decision PASSED and bot entered, append a synthetic PASS row
+      if (ss?.decisionDone && ss?.decision) {
+        decisions.push({
+          idx: decisions.length + 1,
+          at: todaySessionTrade?.openedAt || new Date().toISOString(),
+          minuteEt: -1, // not tracked for PASS (it's one-shot)
+          direction: (ss.decision.direction || "").toLowerCase(),
+          confidence: ss.decision.confidence || 0,
+          passed: true,
+          tradeOpened: !!todaySessionTrade,
+        });
+      }
+
+      res.json({
+        date: dateKey,
+        firstDecisionAttempted: !!ss.firstDecisionAttempted,
+        decisionDone: !!ss.decisionDone,
+        entryDone: !!ss.entryDone,
+        retryCount: ss.retryCount || 0,
+        retriesExhausted: !!ss.retriesExhausted,
+        maxRetries: 27,
+        trade: todaySessionTrade ? {
+          id: todaySessionTrade.id,
+          coin: todaySessionTrade.coin,
+          side: todaySessionTrade.side,
+          entryPrice: todaySessionTrade.entryPrice,
+          openedAt: todaySessionTrade.openedAt,
+          closedAt: todaySessionTrade.closedAt,
+          pnlUsd: todaySessionTrade.hlPnlUsd ?? null,
+          status: todaySessionTrade.status,
+        } : null,
+        decisions,
+      });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ============ BOT CONFIG ============
   app.get("/api/config", async (_req, res) => {
     const config = await storage.getConfig();

@@ -404,14 +404,22 @@ export default function Dashboard() {
         </section>
 
         {/* ──────── Open position ──────── */}
-        {openTrades.length > 0 && (
-          <section className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] p-6">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <p className="label-mono mb-1">Open position</p>
-                <h3 className="font-serif text-[18px] tracking-tight">Live on Hyperliquid</h3>
-              </div>
+        <section className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] p-6">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <p className="label-mono mb-1">Open position</p>
+              <h3 className="font-serif text-[18px] tracking-tight">Live on Hyperliquid</h3>
             </div>
+            <Pill tone={openTrades.length > 0 ? "positive" : "muted"}>
+              {openTrades.length > 0 ? `${openTrades.length} live` : "No position"}
+            </Pill>
+          </div>
+          {openTrades.length === 0 ? (
+            <div className="py-6 flex flex-col items-center justify-center text-center gap-1 border border-dashed border-border rounded-[10px] bg-panel-soft/30">
+              <p className="font-serif italic text-[14px] text-muted-foreground">The desk is flat.</p>
+              <p className="text-[11px] text-muted-foreground font-mono">Position will appear here on fill.</p>
+            </div>
+          ) : (
             <div className="space-y-2">
               {openTrades.map((t: any) => {
                 const isLong = t.side === "long";
@@ -456,8 +464,11 @@ export default function Dashboard() {
                 );
               })}
             </div>
-          </section>
-        )}
+          )}
+        </section>
+
+        {/* ──────── Decisions timeline (v17.4) ──────── */}
+        <DecisionsLog />
 
         {/* ──────── Recent activity ──────── */}
         <section className="pb-12">
@@ -521,6 +532,91 @@ export default function Dashboard() {
 }
 
 /* ───────────── sub-components ───────────── */
+
+// v17.4 — Decisions log card: shows every Opus decision (first + retries) with PASS/FAIL + trade linkage
+function DecisionsLog() {
+  const { data } = useQuery<any>({
+    queryKey: ["/api/session/decisions"],
+    refetchInterval: 15000,
+  });
+  const decisions: any[] = data?.decisions || [];
+  const trade = data?.trade;
+  const retryCount: number = data?.retryCount || 0;
+  const maxRetries: number = data?.maxRetries || 27;
+
+  // Show newest first
+  const ordered = [...decisions].reverse();
+
+  return (
+    <section className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] p-6">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <p className="label-mono mb-1">Decisions log</p>
+          <h3 className="font-serif text-[18px] tracking-tight">Opus check-ins · every 15 min</h3>
+        </div>
+        <div className="flex items-center gap-2">
+          {trade && (
+            <Pill tone={trade.side === "long" ? "positive" : "negative"}>
+              Trade · {trade.side?.toUpperCase()}
+            </Pill>
+          )}
+          <Pill tone="neutral">{retryCount}/{maxRetries} checks</Pill>
+        </div>
+      </div>
+
+      {ordered.length === 0 ? (
+        <div className="py-6 flex flex-col items-center justify-center text-center gap-1 border border-dashed border-border rounded-[10px] bg-panel-soft/30">
+          <p className="font-serif italic text-[14px] text-muted-foreground">Awaiting the first read.</p>
+          <p className="text-[11px] text-muted-foreground font-mono">Opus runs at 08:45 ET, then every 15 minutes until 15:30.</p>
+        </div>
+      ) : (
+        <div className="max-h-[340px] overflow-y-auto divide-y divide-dashed divide-border">
+          {ordered.map((d, i) => {
+            const timeStr = (() => {
+              try {
+                return new Intl.DateTimeFormat("en-US", {
+                  timeZone: "America/New_York",
+                  hour: "2-digit", minute: "2-digit", hour12: false,
+                }).format(new Date(d.at));
+              } catch { return "--:--"; }
+            })();
+            const dir = (d.direction || "").toLowerCase();
+            const dirTone =
+              dir === "long" ? "text-[hsl(var(--positive))]"
+              : dir === "short" ? "text-[hsl(var(--negative))]"
+              : "text-muted-foreground";
+            return (
+              <div key={i} className="grid grid-cols-[auto_auto_1fr_auto_auto] items-center gap-4 py-2.5">
+                <span className="font-mono text-[11px] text-muted-foreground w-12">{timeStr}</span>
+                <span className={cn("font-mono text-[11px] uppercase tracking-wider font-medium w-14", dirTone)}>
+                  {dir === "skip" ? "skip" : dir || "—"}
+                </span>
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  conf {d.confidence}/10
+                </span>
+                <span className={cn(
+                  "font-mono text-[10px] uppercase tracking-wider px-2 py-0.5 rounded",
+                  d.passed
+                    ? "bg-positive-soft text-[hsl(var(--positive))]"
+                    : "bg-[hsl(var(--muted))] text-muted-foreground"
+                )}>
+                  {d.passed ? "PASS" : "FAIL"}
+                </span>
+                {d.tradeOpened ? (
+                  <span className="font-mono text-[10px] uppercase tracking-wider px-2 py-0.5 rounded bg-[hsl(var(--gold)/0.15)] text-[hsl(var(--gold))] border border-[hsl(var(--gold)/0.3)]">
+                    trade
+                  </span>
+                ) : (
+                  <span className="w-[52px]" />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
 
 function StatCard({
   label, value, subline, valueClass, sublineClass,
