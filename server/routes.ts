@@ -3,7 +3,8 @@ import { type Server } from "http";
 import { storage } from "./storage";
 import { tradingEngine } from "./trading-engine";
 import { getLearningStats, reviewClosedTrades, generateInsights, run24hReview } from "./learning-engine";
-import { insertBotConfigSchema } from "@shared/schema";
+import { insertBotConfigSchema, trades, activityLog, marketScans, pnlSnapshots, tradeDecisions, learningInsights, learningReviews } from "@shared/schema";
+import { db } from "./db";
 import { WebSocketServer, WebSocket } from "ws";
 
 export async function registerRoutes(
@@ -85,6 +86,36 @@ export async function registerRoutes(
       if (!wasRunning) await storage.updateConfig({ isRunning: false });
       
       res.json({ success: true, message: "Scan completed" });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ============ ADMIN: FULL RESET (wipe trades/logs/scans/snapshots/learning) ============
+  // v17.1 fresh start — clears all history but keeps bot_config
+  app.post("/api/admin/reset", async (req, res) => {
+    try {
+      const token = req.headers["x-reset-token"] || req.query.token;
+      if (token !== "v17-fresh-start") {
+        return res.status(403).json({ error: "forbidden" });
+      }
+      const out: Record<string, number> = {};
+      const r1 = await db.delete(trades); out.trades = (r1 as any).rowCount ?? 0;
+      const r2 = await db.delete(activityLog); out.activityLog = (r2 as any).rowCount ?? 0;
+      const r3 = await db.delete(marketScans); out.marketScans = (r3 as any).rowCount ?? 0;
+      const r4 = await db.delete(pnlSnapshots); out.pnlSnapshots = (r4 as any).rowCount ?? 0;
+      const r5 = await db.delete(tradeDecisions); out.tradeDecisions = (r5 as any).rowCount ?? 0;
+      const r6 = await db.delete(learningInsights); out.learningInsights = (r6 as any).rowCount ?? 0;
+      const r7 = await db.delete(learningReviews); out.learningReviews = (r7 as any).rowCount ?? 0;
+      // reset baseline-related config
+      await storage.updateConfig({ sessionState: null } as any);
+      await storage.createLog({
+        type: "system",
+        message: "v17.1 fresh reset — all history cleared",
+        data: JSON.stringify(out),
+        timestamp: new Date().toISOString(),
+      });
+      res.json({ success: true, cleared: out });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }

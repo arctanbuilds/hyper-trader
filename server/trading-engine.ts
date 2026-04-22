@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v17.0
+ * HyperTrader — Trading Engine v17.1
  *
  * SINGLE STRATEGY: BTC NY Open Session Trader (Mon–Fri)
  *
@@ -24,7 +24,7 @@
  *   - Orphan detector on startup
  *   - SL + TP orders placed on HL immediately at fill
  *
- * Removed in v17.0:
+ * Removed in v17.1:
  *   - Breakout & Retest (TradingView webhook) strategy
  *   - RSI-30 Multi-Asset OBOS strategy
  *   - Oil News Sentiment strategy (xyz:CL)
@@ -50,13 +50,13 @@ interface AssetConfig {
   isolatedOnly?: boolean;
 }
 
-// v17.0 BTC Session Trader — single asset
+// v17.1 BTC Session Trader — single asset
 const ALLOWED_ASSETS: AssetConfig[] = [
   { coin: "BTC", displayName: "Bitcoin", dex: "", maxLeverage: 40, szDecimals: 5, category: "crypto", minNotional: 10 },
 ];
 const BTC_ASSET = ALLOWED_ASSETS[0];
 
-// v17.0 Session constants
+// v17.1 Session constants
 const SESSION_TP_PCT = 0.01;              // +1.0%
 const SESSION_SL_PCT = 0.01;              // -1.0%
 const SESSION_BE_TRIGGER_PCT = 0.5;       // price moves +0.5% in favor → trigger BE+
@@ -609,7 +609,7 @@ class TradingEngine {
   // BE tracking — track whether BE+ has been applied per tradeId
   private beApplied: Set<number> = new Set();
 
-  // v17.0 session state (in-memory cache; persisted to storage.config.sessionState)
+  // v17.1 session state (in-memory cache; persisted to storage.config.sessionState)
   private sessionState: SessionState = emptySessionState("");
 
   private resetLossTrackers() {
@@ -714,10 +714,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v17.0 started | BTC NY Open Session Trader (Mon–Fri, 08:30–10:00 ET, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v17.1 started | BTC NY Open Session Trader (Mon–Fri, 08:30–10:00 ET, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v17.0 started | BTC NY Open Session Trader | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v17.1 started | BTC NY Open Session Trader | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleNextSessionTick();
   }
@@ -991,7 +991,7 @@ class TradingEngine {
         });
       }
 
-      // v17.0: no intra-cycle entries. Session scheduler handles entries on its own timer.
+      // v17.1: no intra-cycle entries. Session scheduler handles entries on its own timer.
       // This cycle: monitor open trades (TP/SL/BE+) and snapshot P&L.
       await this.checkExits(equity);
       await this.takePnlSnapshot(equity);
@@ -1005,7 +1005,7 @@ class TradingEngine {
     this.scheduleNextScan();
   }
 
-  // ============ SESSION TICK (every 30s) — handles v17.0 NY Open pipeline ============
+  // ============ SESSION TICK (every 30s) — handles v17.1 NY Open pipeline ============
 
   private async runSessionTick() {
     if (this.isSessionRunning) return;
@@ -1354,7 +1354,7 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // v17.0 BE+: when price moves +0.5% in favor → SL moves to +0.25% profit lock
+      // v17.1 BE+: when price moves +0.5% in favor → SL moves to +0.25% profit lock
       const priceMovePct = trade.entryPrice > 0
         ? (isLong ? (currentPrice - trade.entryPrice) / trade.entryPrice * 100 : (trade.entryPrice - currentPrice) / trade.entryPrice * 100)
         : 0;
@@ -1636,9 +1636,9 @@ class TradingEngine {
     return updated;
   }
 
-  // v17.0: Webhook handler disabled — no breakout/trendline strategy. Preserved for API compat.
+  // v17.1: Webhook handler disabled — no breakout/trendline strategy. Preserved for API compat.
   async handleWebhookSignal(_payload: any): Promise<{ accepted: boolean; reason: string }> {
-    return { accepted: false, reason: "Webhook strategies disabled in v17.0 (BTC Session Trader only)" };
+    return { accepted: false, reason: "Webhook strategies disabled in v17.1 (BTC Session Trader only)" };
   }
 
   async forceScan() { await this.runScanCycle(); }
@@ -1711,7 +1711,7 @@ class TradingEngine {
       return { ...t, pnlUsd: parseFloat(pnlUsd.toFixed(4)), pnlOfAum: parseFloat(pnlOfAum.toFixed(4)), stratBadge };
     });
 
-    // Session strategy stats (v17.0)
+    // Session strategy stats (v17.1)
     const sessionTrades = activeClosedTrades.filter(t => t.strategy === "btc_session");
     const sessionWins = sessionTrades.filter(t => (t.hlPnlUsd ?? (t.pnlPct || 0)) > 0).length;
     const sessionWinRate = sessionTrades.length > 0 ? (sessionWins / sessionTrades.length) * 100 : 0;
@@ -1746,7 +1746,7 @@ class TradingEngine {
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
       sessionState: this.sessionState,
-      version: "v17.0",
+      version: "v17.1",
       strategyStats: {
         btc_session: {
           trades: sessionTrades.length,

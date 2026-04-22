@@ -1,26 +1,20 @@
-import { useQuery, useMutation } from "@tanstack/react-query";
-import { apiRequest, queryClient } from "@/lib/queryClient";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { useQuery } from "@tanstack/react-query";
+import { apiRequest } from "@/lib/queryClient";
 import {
-  TrendingUp, TrendingDown, Target,
-  Activity, RefreshCw, Wallet,
-  Clock, Brain, Calendar,
-} from "lucide-react";
-import { cn } from "@/lib/utils";
-import {
-  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
+  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from "recharts";
+import { cn } from "@/lib/utils";
 
-function getNyNowParts(): { hour: number; minute: number; weekday: string; dateStr: string; timeStr: string } {
+/* ───────────── helpers ───────────── */
+
+function getNyParts(): { hour: number; minute: number; weekday: string; dateStr: string; timeStr: string } {
   const now = new Date();
   const fmt = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     hour: "2-digit",
     minute: "2-digit",
     weekday: "short",
-    month: "short",
+    month: "long",
     day: "numeric",
     hour12: false,
   });
@@ -29,28 +23,37 @@ function getNyNowParts(): { hour: number; minute: number; weekday: string; dateS
   const hour = parseInt(get("hour"), 10);
   const minute = parseInt(get("minute"), 10);
   return {
-    hour,
-    minute,
+    hour, minute,
     weekday: get("weekday"),
     dateStr: `${get("month")} ${get("day")}`,
     timeStr: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
   };
 }
 
-function getSessionPhase(hour: number, minute: number, weekday: string): { phase: string; color: string; next: string } {
+function getPhase(hour: number, minute: number, weekday: string) {
   const isWeekday = ["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday);
-  if (!isWeekday) return { phase: "Weekend — Bot Idle", color: "text-muted-foreground", next: "Mon 08:30 ET" };
+  if (!isWeekday) return { key: "weekend", label: "Weekend", next: "Monday 08:30 ET", active: -1 };
   const mins = hour * 60 + minute;
-  const NEWS = 8 * 60 + 30;
-  const DECISION = 8 * 60 + 45;
-  const ENTRY = 9 * 60 + 30;
-  const CUTOFF = 10 * 60;
-  if (mins < NEWS) return { phase: "Pre-Session", color: "text-muted-foreground", next: "News fetch @ 08:30 ET" };
-  if (mins < DECISION) return { phase: "News Fetch Window", color: "text-blue-400", next: "Decision @ 08:45 ET" };
-  if (mins < ENTRY) return { phase: "Decision Window", color: "text-purple-400", next: "Entry @ 09:30 ET" };
-  if (mins < CUTOFF) return { phase: "Entry Window", color: "text-emerald-400", next: "Cutoff @ 10:00 ET" };
-  return { phase: "Session Closed", color: "text-muted-foreground", next: "Next: Tomorrow 08:30 ET" };
+  if (mins < 8 * 60 + 30) return { key: "pre", label: "Pre-session", next: "News · 08:30 ET", active: 0 };
+  if (mins < 8 * 60 + 45) return { key: "news", label: "News fetch", next: "Decision · 08:45 ET", active: 1 };
+  if (mins < 9 * 60 + 30) return { key: "decision", label: "Decision", next: "Entry · 09:30 ET", active: 2 };
+  if (mins < 10 * 60) return { key: "entry", label: "Entry window", next: "Cutoff · 10:00 ET", active: 3 };
+  return { key: "closed", label: "Session closed", next: "Tomorrow 08:30 ET", active: 4 };
 }
+
+function fmtUsd0(v: number) {
+  return v.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtSignedUsd(v: number) {
+  const sign = v >= 0 ? "+" : "−";
+  return `${sign}$${Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+function fmtPct(v: number, digits = 2) {
+  const sign = v >= 0 ? "+" : "−";
+  return `${sign}${Math.abs(v).toFixed(digits)}%`;
+}
+
+/* ───────────── component ───────────── */
 
 export default function Dashboard() {
   const { data: status } = useQuery<any>({
@@ -81,639 +84,528 @@ export default function Dashboard() {
     refetchInterval: 30000,
   });
 
-  const { data: logs = [] } = useQuery<any[]>({
-    queryKey: ["/api/logs"],
-    queryFn: () => apiRequest("GET", "/api/logs?limit=10").then(r => r.json()),
-    refetchInterval: 10000,
-  });
-
-  const { data: strategyData } = useQuery<{ raceStartedAt: string; raceHours: number; strategies: any[] }>({
+  const { data: strategyData } = useQuery<any>({
     queryKey: ["/api/strategies"],
     queryFn: () => apiRequest("GET", "/api/strategies").then(r => r.json()),
     refetchInterval: 15000,
   });
-  const btcStrat = strategyData?.strategies?.find((s: any) => s.strategy === "btc_session");
-  const raceHours = strategyData?.raceHours || 0;
 
-  const triggerScan = useMutation({
-    mutationFn: () => apiRequest("POST", "/api/bot/scan"),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/scans"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/trades"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/status"] });
-    },
-  });
+  const btcStrat = strategyData?.strategies?.find((s: any) => s.strategy === "btc_session");
+
+  const ny = getNyParts();
+  const phase = getPhase(ny.hour, ny.minute, ny.weekday);
+
+  const accountBalance = account?.marginSummary?.accountValue
+    ? parseFloat(account.marginSummary.accountValue)
+    : parseFloat(status?.equity || "0");
 
   const combinedPnl = parseFloat(status?.combinedPnl || "0");
   const combinedPnlUsd = parseFloat(status?.combinedPnlUsd || "0");
-  const accountBalance = account?.marginSummary?.accountValue
-    ? parseFloat(account.marginSummary.accountValue)
-    : 0;
 
-  const fmtUsd = (v: number) => {
-    const sign = v >= 0 ? "+" : "";
-    return `${sign}${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDC`;
-  };
+  const sessionState: any = status?.sessionState || {};
+  const decision = sessionState?.decision;
+  const entryDone = sessionState?.entryDone;
+  const sessionResult = sessionState?.sessionResult;
+  const newsSummary = sessionState?.newsSummary;
+
+  const todayClosedTrades = (closedTrades || []).filter((t: any) => {
+    if (!t.closedAt || t.strategy !== "btc_session") return false;
+    const d = new Date(t.closedAt);
+    const todayEt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "numeric" }).format(new Date());
+    const tradeEt = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "numeric" }).format(d);
+    return todayEt === tradeEt;
+  });
+
+  const recentTrades = (closedTrades || [])
+    .filter((t: any) => t.strategy === "btc_session")
+    .sort((a: any, b: any) => (b.closedAt || "").localeCompare(a.closedAt || ""))
+    .slice(0, 8);
 
   const equityChartData = (equityCurve || []).map((p: any) => {
     const d = new Date(p.timestamp);
     return {
-      time: `${d.getMonth()+1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+      time: `${d.getMonth() + 1}/${d.getDate()}`,
       equity: p.equity,
       trade: p.trade,
       pnl: p.pnl,
     };
   });
 
-  const ny = getNyNowParts();
-  const phase = getSessionPhase(ny.hour, ny.minute, ny.weekday);
-  const raceDays = raceHours >= 24 ? `${(raceHours / 24).toFixed(1)}d` : `${raceHours.toFixed(1)}h`;
-
-  // Session state from backend (JSON string in config.sessionState)
-  const sessionState: any = status?.sessionState || {};
-  const decision = sessionState?.decision;
-  const sessionResult = sessionState?.sessionResult;
-  const entryDone = sessionState?.entryDone;
-  const newsSummary = sessionState?.newsSummary;
-
-  const totalOpen = status?.openPositions || 0;
+  const greeting = ny.hour < 12 ? "Good morning" : ny.hour < 18 ? "Good afternoon" : "Good evening";
 
   return (
-    <div className="p-6 space-y-6 max-w-[1400px]">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
-          <div className="flex items-center gap-3 mt-0.5">
-            <p className="text-sm text-muted-foreground">v17.0 — BTC NY Open Session Trader (Opus 4.7 + Sonar)</p>
-            <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1">
-              <Clock className="w-3 h-3" />
-              <span className={phase.color}>{phase.phase}</span>
-            </Badge>
-          </div>
-        </div>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => triggerScan.mutate()}
-          disabled={triggerScan.isPending}
-          data-testid="button-trigger-scan"
-        >
-          <RefreshCw className={cn("w-3.5 h-3.5 mr-1.5", triggerScan.isPending && "animate-spin")} />
-          {triggerScan.isPending ? "Scanning..." : "Force Scan"}
-        </Button>
-      </div>
+    <div className="min-h-screen bg-background">
+      <div className="max-w-[1180px] mx-auto px-10 py-10 space-y-10">
 
-      {/* KPI Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-muted-foreground font-medium">Account Balance</span>
-              <Wallet className="w-4 h-4 text-muted-foreground" />
-            </div>
-            <div className="text-lg font-semibold font-mono" data-testid="text-balance">
-              ${accountBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </div>
-            <p className="text-[10px] text-muted-foreground mt-1">
-              {account?.connected ? "Connected" : "Not connected"}
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-muted-foreground font-medium">Total ROI / AUM</span>
-              {combinedPnl >= 0 ? (
-                <TrendingUp className="w-4 h-4 text-emerald-500" />
-              ) : (
-                <TrendingDown className="w-4 h-4 text-red-500" />
-              )}
-            </div>
-            <div className={cn(
-              "text-lg font-semibold font-mono",
-              combinedPnl >= 0 ? "text-emerald-500" : "text-red-500"
-            )} data-testid="text-total-pnl">
-              {combinedPnl >= 0 ? "+" : ""}{combinedPnl.toFixed(2)}%
-            </div>
-            <p className={cn(
-              "text-[11px] font-mono mt-0.5",
-              combinedPnlUsd >= 0 ? "text-emerald-400/70" : "text-red-400/70"
-            )}>
-              {fmtUsd(combinedPnlUsd)}
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-muted-foreground font-medium">Open Positions</span>
-              <Activity className="w-4 h-4 text-muted-foreground" />
-            </div>
-            <div className="text-lg font-semibold font-mono" data-testid="text-open-positions">
-              {totalOpen} / 1
-            </div>
-            <p className="text-[10px] text-muted-foreground mt-1">
-              BTC | 80% AUM | 20x lev
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs text-muted-foreground font-medium">Win Rate / Trades</span>
-              <Target className="w-4 h-4 text-muted-foreground" />
-            </div>
-            <div className="text-lg font-semibold font-mono" data-testid="text-win-rate">
-              {status?.winRate || "0.0"}%
-            </div>
-            <p className="text-[10px] text-muted-foreground mt-1">
-              {status?.closedTrades || 0} closed | Today: {status?.dailyTradeCount || 0}
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* ========== SESSION BRIEFING ========== */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Today's Session */}
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="text-sm font-medium flex items-center gap-1.5">
-                  <Calendar className="w-4 h-4" />
-                  Today's Session — {ny.weekday} {ny.dateStr}
-                </CardTitle>
-                <p className="text-[10px] text-muted-foreground mt-0.5">
-                  ET {ny.timeStr} | {phase.next}
-                </p>
-              </div>
-              <Badge variant="outline" className={cn(
-                "text-[10px] px-2 py-0.5 border-border",
-                phase.color.replace("text-", "bg-").replace("400", "500/10") + " " + phase.color + " border-current"
-              )}>
-                {phase.phase.split(" ")[0]}
-              </Badge>
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {/* Timeline */}
-            <div className="grid grid-cols-4 gap-1 text-[9px]">
-              <div className={cn("p-1.5 rounded border text-center",
-                ny.hour * 60 + ny.minute >= 8 * 60 + 30 ? "bg-blue-500/10 border-blue-500/30 text-blue-400" : "bg-muted/30 border-border text-muted-foreground"
-              )}>
-                <div className="font-medium">08:30</div>
-                <div>News</div>
-              </div>
-              <div className={cn("p-1.5 rounded border text-center",
-                ny.hour * 60 + ny.minute >= 8 * 60 + 45 ? "bg-purple-500/10 border-purple-500/30 text-purple-400" : "bg-muted/30 border-border text-muted-foreground"
-              )}>
-                <div className="font-medium">08:45</div>
-                <div>Decision</div>
-              </div>
-              <div className={cn("p-1.5 rounded border text-center",
-                ny.hour * 60 + ny.minute >= 9 * 60 + 30 ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400" : "bg-muted/30 border-border text-muted-foreground"
-              )}>
-                <div className="font-medium">09:30</div>
-                <div>Entry</div>
-              </div>
-              <div className={cn("p-1.5 rounded border text-center",
-                ny.hour * 60 + ny.minute >= 10 * 60 ? "bg-muted/50 border-border text-muted-foreground" : "bg-muted/30 border-border text-muted-foreground"
-              )}>
-                <div className="font-medium">10:00</div>
-                <div>Cutoff</div>
-              </div>
-            </div>
-
-            {/* Session result badges */}
-            <div className="flex items-center gap-2 text-[10px]">
-              {entryDone && sessionResult === "tp" && (
-                <Badge className="bg-emerald-500/20 text-emerald-400 border-0">TP Hit — Re-entry Allowed</Badge>
-              )}
-              {entryDone && sessionResult === "sl" && (
-                <Badge className="bg-red-500/20 text-red-400 border-0">SL Hit — Session Blocked</Badge>
-              )}
-              {!entryDone && decision && (
-                <Badge className="bg-amber-500/20 text-amber-400 border-0">Decision Ready</Badge>
-              )}
-              {!decision && phase.phase.includes("Decision") && (
-                <Badge className="bg-muted text-muted-foreground border-0">Awaiting Decision</Badge>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Opus 4.7 Thesis */}
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="text-sm font-medium flex items-center gap-1.5">
-                  <Brain className="w-4 h-4" />
-                  Opus 4.7 Decision
-                </CardTitle>
-                <p className="text-[10px] text-muted-foreground mt-0.5">
-                  Claude Opus 4.7 via Perplexity | Confidence ≥7/10 to trade
-                </p>
-              </div>
-              {decision?.direction && (
-                <Badge variant="outline" className={cn(
-                  "text-[10px] px-2 py-0.5",
-                  decision.direction === "LONG" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" :
-                  decision.direction === "SHORT" ? "bg-red-500/10 text-red-400 border-red-500/30" :
-                  "bg-muted text-muted-foreground border-border"
-                )}>
-                  {decision.direction}
-                </Badge>
-              )}
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {decision ? (
-              <>
-                <div className="grid grid-cols-3 gap-2">
-                  <div className="p-2 rounded bg-muted/30 border border-border">
-                    <div className="text-[9px] text-muted-foreground">Direction</div>
-                    <div className={cn(
-                      "text-sm font-mono font-semibold",
-                      decision.direction === "LONG" ? "text-emerald-400" :
-                      decision.direction === "SHORT" ? "text-red-400" : "text-muted-foreground"
-                    )}>
-                      {decision.direction || "—"}
-                    </div>
-                  </div>
-                  <div className="p-2 rounded bg-muted/30 border border-border">
-                    <div className="text-[9px] text-muted-foreground">Entry Zone</div>
-                    <div className="text-sm font-mono font-semibold">
-                      {decision.entryPrice ? `$${Number(decision.entryPrice).toLocaleString()}` : "—"}
-                    </div>
-                  </div>
-                  <div className="p-2 rounded bg-muted/30 border border-border">
-                    <div className="text-[9px] text-muted-foreground">Confidence</div>
-                    <div className={cn(
-                      "text-sm font-mono font-semibold",
-                      (decision.confidence || 0) >= 7 ? "text-emerald-400" : "text-amber-400"
-                    )}>
-                      {decision.confidence || 0}/10
-                    </div>
-                  </div>
-                </div>
-                {decision.thesis && (
-                  <div className="p-2 rounded bg-muted/30 border border-border">
-                    <div className="text-[9px] text-muted-foreground mb-0.5">Thesis</div>
-                    <p className="text-[10px] leading-relaxed">{decision.thesis}</p>
-                  </div>
+        {/* ──────── Hero headline ──────── */}
+        <header className="space-y-3">
+          <div className="flex items-start justify-between gap-8">
+            <div className="space-y-2 flex-1">
+              <p className="text-xs text-muted-foreground">{greeting}, Operator</p>
+              <h1 className="display-serif text-[42px] md:text-[48px] leading-[1.05] max-w-[780px]">
+                {phase.key === "weekend" ? (
+                  <>Markets are closed. <span className="italic text-muted-foreground">The board rests.</span></>
+                ) : !decision && phase.key === "pre" ? (
+                  <>Today&apos;s session opens at <span className="italic">09:30 ET</span>.</>
+                ) : !decision && (phase.key === "news" || phase.key === "decision") ? (
+                  <>The committee is <span className="italic">deliberating</span>…</>
+                ) : decision && !entryDone ? (
+                  <>Today we&apos;re <span className="italic">{decision.direction?.toLowerCase()}</span> on Bitcoin.</>
+                ) : entryDone && sessionResult === "tp" ? (
+                  <>Target hit. <span className="italic text-[hsl(var(--positive))]">Re-entry open.</span></>
+                ) : entryDone && sessionResult === "sl" ? (
+                  <>Stop taken. <span className="italic text-muted-foreground">Session closed.</span></>
+                ) : (
+                  <>Your portfolio is <span className="italic">{combinedPnl >= 0 ? "up" : "down"} {Math.abs(combinedPnl).toFixed(2)}%</span> today.</>
                 )}
-                {decision.reasoning && (
-                  <div className="p-2 rounded bg-muted/30 border border-border">
-                    <div className="text-[9px] text-muted-foreground mb-0.5">Reasoning</div>
-                    <p className="text-[10px] leading-relaxed text-muted-foreground">{decision.reasoning}</p>
-                  </div>
-                )}
-                {newsSummary && (
-                  <div className="p-2 rounded bg-blue-500/5 border border-blue-500/20">
-                    <div className="text-[9px] text-blue-400 mb-0.5">Sonar News Brief</div>
-                    <p className="text-[10px] leading-relaxed text-muted-foreground line-clamp-3">{newsSummary}</p>
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="h-[140px] flex flex-col items-center justify-center text-sm text-muted-foreground gap-1">
-                <Brain className="w-6 h-6 opacity-30" />
-                <span className="text-xs">Waiting for today's decision…</span>
-                <span className="text-[10px]">Runs at 08:45 ET every weekday</span>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* ========== STRATEGY STATS ========== */}
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle className="text-sm font-medium">BTC Session Strategy</CardTitle>
-              <p className="text-[10px] text-muted-foreground mt-0.5">
-                BTC | L+S | 80% AUM | 20x | Max 1 | TP +1% | SL -1% | BE+ @ +0.5% → SL +0.25% | 1 session/day Mon-Fri
+              </h1>
+              <p className="text-sm text-muted-foreground">
+                {ny.weekday}, {ny.dateStr} · {ny.timeStr} ET · {phase.next}
               </p>
             </div>
-            <Badge variant="outline" className="text-[10px] px-2 py-0.5 bg-purple-500/10 text-purple-400 border-purple-500/30">
-              BTC SESSION
-            </Badge>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
-            <div className="p-2 rounded bg-purple-500/5 border border-purple-500/20">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Trades</div>
-              <div className="text-sm font-semibold font-mono text-purple-400">
-                {btcStrat?.totalTrades || 0}
-              </div>
-              <div className="text-[8px] text-muted-foreground">{btcStrat?.wins || 0}W / {btcStrat?.losses || 0}L</div>
-            </div>
-            <div className="p-2 rounded bg-purple-500/5 border border-purple-500/20">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Win Rate</div>
-              <div className="text-sm font-semibold font-mono text-purple-400">
-                {btcStrat?.winRate || 0}%
-              </div>
-              <div className="text-[8px] text-muted-foreground">PF: {(btcStrat?.profitFactor || 0) >= 999 ? "∞" : (btcStrat?.profitFactor || 0).toFixed(2)}</div>
-            </div>
-            <div className="p-2 rounded bg-purple-500/5 border border-purple-500/20">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Total P&L</div>
-              <div className={cn(
-                "text-sm font-semibold font-mono",
-                (btcStrat?.totalPnlUsd || 0) >= 0 ? "text-emerald-400" : "text-red-400"
-              )}>
-                {(btcStrat?.totalPnlUsd || 0) >= 0 ? "+" : ""}${(btcStrat?.totalPnlUsd || 0).toFixed(2)}
-              </div>
-              <div className="text-[8px] text-muted-foreground">
-                {(btcStrat?.totalPnlPct || 0) >= 0 ? "+" : ""}{(btcStrat?.totalPnlPct || 0).toFixed(2)}% AUM
-              </div>
-            </div>
-            <div className="p-2 rounded bg-purple-500/5 border border-purple-500/20">
-              <div className="text-[9px] text-muted-foreground mb-0.5">Avg / Trade</div>
-              <div className={cn(
-                "text-sm font-semibold font-mono",
-                (btcStrat?.avgPnlPerTrade || 0) >= 0 ? "text-emerald-400" : "text-red-400"
-              )}>
-                {(btcStrat?.avgPnlPerTrade || 0) >= 0 ? "+" : ""}${(btcStrat?.avgPnlPerTrade || 0).toFixed(2)}
-              </div>
-              <div className="text-[8px] text-muted-foreground">{btcStrat?.bestWinStreak || 0}W / {btcStrat?.worstLossStreak || 0}L streak</div>
+            <div className="flex items-center gap-2 shrink-0 pt-1">
+              <Pill active={status?.isRunning}>{status?.isRunning ? "Live" : "Paused"}</Pill>
             </div>
           </div>
-        </CardContent>
-      </Card>
+        </header>
 
-      {/* Equity Curve */}
-      <div className="grid grid-cols-1 gap-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Equity Curve</CardTitle>
-            <p className="text-[10px] text-muted-foreground">Starting from ${parseFloat(status?.startingEquity || "329").toFixed(2)} USDC baseline (v17.0) | {raceDays} running</p>
-          </CardHeader>
-          <CardContent>
-            {equityChartData.length > 1 ? (
-              <ResponsiveContainer width="100%" height={200}>
-                <AreaChart data={equityChartData}>
-                  <defs>
-                    <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="hsl(142, 70%, 45%)" stopOpacity={0.3} />
-                      <stop offset="95%" stopColor="hsl(142, 70%, 45%)" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(220, 15%, 15%)" />
-                  <XAxis dataKey="time" tick={{ fontSize: 9 }} stroke="hsl(220, 10%, 40%)" />
-                  <YAxis
-                    tick={{ fontSize: 10 }} stroke="hsl(220, 10%, 40%)"
-                    domain={['dataMin', 'dataMax']}
-                    tickFormatter={(v: number) => `$${v.toFixed(0)}`}
-                    padding={{ top: 10, bottom: 10 }}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      background: "hsl(225, 18%, 10%)",
-                      border: "1px solid hsl(220, 15%, 15%)",
-                      borderRadius: "6px",
-                      fontSize: "12px",
-                    }}
-                    formatter={(value: number, name: string) => [
-                      `$${value.toFixed(2)}`, name === "equity" ? "Equity" : name
-                    ]}
-                    labelFormatter={(label: string, payload: any[]) => {
-                      const item = payload?.[0]?.payload;
-                      if (item?.trade && item.trade !== "Baseline" && item.trade !== "Now") {
-                        const sign = item.pnl >= 0 ? "+" : "";
-                        return `${label} | ${item.trade} (${sign}$${item.pnl.toFixed(2)})`;
-                      }
-                      return label;
-                    }}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="equity"
-                    stroke="hsl(142, 70%, 45%)"
-                    fill="url(#eqGrad)"
-                    strokeWidth={2}
-                    dot={{ r: 3, fill: "hsl(142, 70%, 45%)", stroke: "hsl(225, 18%, 10%)", strokeWidth: 1 }}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
-                No trades yet — equity curve builds as trades close
+        {/* ──────── KPI row ──────── */}
+        <section className="grid grid-cols-1 md:grid-cols-3 gap-5">
+          <StatCard
+            label="Account value"
+            value={fmtUsd0(accountBalance)}
+            subline={status?.openPositions > 0 ? `${status.openPositions} position open` : "No open position"}
+          />
+          <StatCard
+            label="Total ROI · AUM"
+            value={fmtPct(combinedPnl)}
+            valueClass={combinedPnl >= 0 ? "text-[hsl(var(--positive))]" : "text-[hsl(var(--negative))]"}
+            subline={fmtSignedUsd(combinedPnlUsd)}
+            sublineClass={combinedPnlUsd >= 0 ? "text-[hsl(var(--positive))]" : "text-[hsl(var(--negative))]"}
+          />
+          <StatCard
+            label="Win rate · 30 days"
+            value={`${status?.winRate || "0.0"}%`}
+            subline={`${status?.closedTrades || 0} closed · today ${todayClosedTrades.length}`}
+          />
+        </section>
+
+        {/* ──────── Session briefing (hero card) ──────── */}
+        <section className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] overflow-hidden">
+          <div className="grid grid-cols-1 lg:grid-cols-[1.15fr_1fr]">
+            {/* Left: Today's session */}
+            <div className="p-8 space-y-6 border-b lg:border-b-0 lg:border-r border-card-border">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="label-mono mb-2">Today&apos;s session</p>
+                  <h2 className="font-serif text-[22px] tracking-tight leading-tight">
+                    {ny.weekday}, {ny.dateStr}
+                  </h2>
+                </div>
+                <Pill tone={phase.key === "entry" ? "positive" : phase.key === "closed" ? "muted" : "neutral"}>
+                  {phase.label}
+                </Pill>
               </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
 
-      {/* Open Positions */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium">Open Positions</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {openTrades.length > 0 ? (
+              {/* Timeline */}
+              <Timeline activeIdx={phase.active} />
+
+              {/* Result / state */}
+              <div className="pt-2 border-t border-dashed border-border text-[13px] leading-relaxed">
+                {phase.key === "weekend" && (
+                  <p className="text-muted-foreground">The bot idles through the weekend. The next news fetch runs Monday at 08:30 ET.</p>
+                )}
+                {phase.key === "pre" && (
+                  <p className="text-muted-foreground">Standing by for the 08:30 ET news sweep. Sonar will pull overnight macro and crypto headlines first.</p>
+                )}
+                {phase.key === "news" && (
+                  <p className="text-muted-foreground">Fetching overnight news via Perplexity Sonar. The decision engine fires at 08:45 ET.</p>
+                )}
+                {phase.key === "decision" && !decision && (
+                  <p className="text-muted-foreground">Claude Opus 4.7 is reading the tape and composing today&apos;s trade thesis.</p>
+                )}
+                {phase.key === "entry" && !entryDone && (
+                  <p className="text-muted-foreground">Entry window is live. Limit rests for one minute, then promotes to market if unfilled.</p>
+                )}
+                {entryDone && sessionResult === "tp" && (
+                  <p className="text-[hsl(var(--positive))]">Take-profit captured. Re-entry is permitted within this session window.</p>
+                )}
+                {entryDone && sessionResult === "sl" && (
+                  <p className="text-muted-foreground">Stop triggered. This setup is retired for the day — no retries.</p>
+                )}
+                {phase.key === "closed" && !entryDone && (
+                  <p className="text-muted-foreground">Session closed without a qualifying setup. We pass on the day.</p>
+                )}
+              </div>
+            </div>
+
+            {/* Right: Opus 4.7 thesis */}
+            <div className="p-8 bg-panel-soft/40 space-y-5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="label-mono mb-2">The thesis</p>
+                  <h3 className="font-serif text-[18px] tracking-tight">Claude Opus 4.7</h3>
+                </div>
+                {decision?.direction && (
+                  <Pill tone={decision.direction === "LONG" ? "positive" : decision.direction === "SHORT" ? "negative" : "muted"}>
+                    {decision.direction}
+                  </Pill>
+                )}
+              </div>
+
+              {decision ? (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-3 gap-4 pb-4 border-b border-dashed border-border">
+                    <MiniStat label="Entry" value={decision.entryPrice ? `$${Number(decision.entryPrice).toLocaleString()}` : "—"} />
+                    <MiniStat label="Confidence" value={`${decision.confidence || 0}/10`} tone={(decision.confidence || 0) >= 7 ? "positive" : "muted"} />
+                    <MiniStat label="Timing" value="NY Open" />
+                  </div>
+
+                  {decision.thesis && (
+                    <div className="space-y-1.5">
+                      <p className="label-mono">Read</p>
+                      <p className="text-[13px] leading-relaxed text-foreground/85">{decision.thesis}</p>
+                    </div>
+                  )}
+
+                  {decision.reasoning && (
+                    <div className="space-y-1.5">
+                      <p className="label-mono">Rationale</p>
+                      <p className="text-[13px] leading-relaxed text-muted-foreground">{decision.reasoning}</p>
+                    </div>
+                  )}
+
+                  {newsSummary && (
+                    <div className="space-y-1.5 pt-3 border-t border-dashed border-border">
+                      <p className="label-mono">Overnight brief · Sonar</p>
+                      <p className="text-[12px] leading-relaxed text-muted-foreground line-clamp-3">{newsSummary}</p>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="py-8 flex flex-col items-center justify-center text-center gap-2">
+                  <div className="w-10 h-10 rounded-full border border-dashed border-border flex items-center justify-center">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" className="text-muted-foreground">
+                      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.2" />
+                      <path d="M12 7v5l3 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+                    </svg>
+                  </div>
+                  <p className="text-[13px] text-muted-foreground">No thesis yet — runs at 08:45 ET.</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* ──────── Equity curve + Strategy snapshot ──────── */}
+        <section className="grid grid-cols-1 lg:grid-cols-[1.6fr_1fr] gap-5">
+          {/* Equity */}
+          <div className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] p-6">
+            <div className="flex items-start justify-between mb-5">
+              <div>
+                <p className="label-mono mb-1">Equity</p>
+                <h3 className="numeric-display text-[32px]">{fmtUsd0(accountBalance)}</h3>
+                <p className={cn(
+                  "text-[12px] mt-1 font-mono",
+                  combinedPnlUsd >= 0 ? "text-[hsl(var(--positive))]" : "text-[hsl(var(--negative))]"
+                )}>
+                  {fmtSignedUsd(combinedPnlUsd)} · {fmtPct(combinedPnl)} since inception
+                </p>
+              </div>
+            </div>
+            <div className="h-[220px]">
+              {equityChartData.length > 1 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={equityChartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="hsl(142 30% 38%)" stopOpacity={0.22} />
+                        <stop offset="100%" stopColor="hsl(142 30% 38%)" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <XAxis
+                      dataKey="time"
+                      tick={{ fontSize: 10, fill: "hsl(var(--muted-foreground))", fontFamily: "var(--font-mono)" }}
+                      axisLine={false}
+                      tickLine={false}
+                    />
+                    <YAxis
+                      hide
+                      domain={["dataMin - 10", "dataMax + 10"]}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        background: "hsl(var(--card))",
+                        border: "1px solid hsl(var(--border))",
+                        borderRadius: "8px",
+                        fontSize: 12,
+                        fontFamily: "var(--font-mono)",
+                        boxShadow: "0 4px 10px -2px hsl(30 15% 12% / 0.1)",
+                      }}
+                      formatter={(v: number) => [fmtUsd0(v), "Equity"]}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="equity"
+                      stroke="hsl(142 30% 38%)"
+                      strokeWidth={1.75}
+                      fill="url(#eqGrad)"
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="h-full flex flex-col items-center justify-center text-center gap-1">
+                  <p className="font-serif italic text-[15px] text-muted-foreground">A fresh page.</p>
+                  <p className="text-[12px] text-muted-foreground">Equity curve builds trade by trade.</p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Strategy snapshot */}
+          <div className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] p-6 space-y-5">
+            <div>
+              <p className="label-mono mb-1">Strategy</p>
+              <h3 className="font-serif text-[18px] tracking-tight">BTC · NY Open Session</h3>
+              <p className="text-[12px] text-muted-foreground mt-1 leading-relaxed">
+                One disciplined session per weekday. Sonar reads the tape. Opus decides.
+                80% AUM, 20× leverage, ±1% bracket, break-even lock at +0.5%.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 pt-4 border-t border-dashed border-border">
+              <MiniStat label="Trades" value={`${btcStrat?.totalTrades || 0}`} />
+              <MiniStat label="Win rate" value={`${btcStrat?.winRate || 0}%`} />
+              <MiniStat
+                label="Realized P&L"
+                value={(btcStrat?.totalPnlUsd || 0) >= 0 ? `+$${(btcStrat?.totalPnlUsd || 0).toFixed(2)}` : `−$${Math.abs(btcStrat?.totalPnlUsd || 0).toFixed(2)}`}
+                tone={(btcStrat?.totalPnlUsd || 0) >= 0 ? "positive" : (btcStrat?.totalPnlUsd || 0) < 0 ? "negative" : "muted"}
+              />
+              <MiniStat label="Avg · trade" value={(btcStrat?.avgPnlPerTrade || 0) >= 0 ? `+$${(btcStrat?.avgPnlPerTrade || 0).toFixed(2)}` : `−$${Math.abs(btcStrat?.avgPnlPerTrade || 0).toFixed(2)}`} />
+            </div>
+          </div>
+        </section>
+
+        {/* ──────── Open position ──────── */}
+        {openTrades.length > 0 && (
+          <section className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <p className="label-mono mb-1">Open position</p>
+                <h3 className="font-serif text-[18px] tracking-tight">Live on Hyperliquid</h3>
+              </div>
+            </div>
             <div className="space-y-2">
-              {openTrades.map((trade: any) => {
-                const isLong = trade.side === "long";
+              {openTrades.map((t: any) => {
+                const isLong = t.side === "long";
                 return (
-                  <div
-                    key={trade.id}
-                    className="flex items-center justify-between p-2.5 rounded-md bg-muted/50 border border-border"
-                    data-testid={`card-position-${trade.id}`}
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <Badge
-                        variant="default"
-                        className={cn(
-                          "text-[10px] px-1.5 py-0 uppercase",
-                          isLong ? "bg-emerald-600" : "bg-red-600"
-                        )}
-                      >
-                        {trade.side.toUpperCase()}
-                      </Badge>
-                      <div>
-                        <span className="text-sm font-medium">{trade.coin}</span>
-                        <span className="text-xs text-muted-foreground ml-2">{trade.leverage}x</span>
-                        <Badge variant="outline" className="ml-2 text-[9px] px-1 py-0 bg-purple-500/10 text-purple-400 border-purple-500/30">
-                          SESSION
-                        </Badge>
+                  <div key={t.id} className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-4 py-3 border-b border-dashed border-border last:border-b-0">
+                    <span className={cn(
+                      "font-mono text-[10px] uppercase tracking-wider px-2 py-1 rounded",
+                      isLong ? "bg-positive-soft text-[hsl(var(--positive))]" : "bg-negative-soft text-[hsl(var(--negative))]"
+                    )}>
+                      {isLong ? "Long" : "Short"}
+                    </span>
+                    <div>
+                      <div className="font-serif text-[15px]">{t.coin}</div>
+                      <div className="text-[11px] text-muted-foreground font-mono">
+                        {t.leverage}× · entry ${t.entryPrice?.toFixed(t.entryPrice < 10 ? 4 : 2)}
                       </div>
                     </div>
                     <div className="text-right">
                       <div className={cn(
-                        "text-sm font-mono font-medium",
-                        (trade.pnlOfAum || 0) >= 0 ? "text-emerald-500" : "text-red-500"
+                        "numeric-mono text-[14px] font-medium",
+                        (t.pnlUsd || 0) >= 0 ? "text-[hsl(var(--positive))]" : "text-[hsl(var(--negative))]"
                       )}>
-                        {(trade.pnlOfAum || 0) >= 0 ? "+" : ""}{(trade.pnlOfAum || 0).toFixed(3)}% AUM
+                        {fmtSignedUsd(t.pnlUsd || 0)}
                       </div>
                       <div className={cn(
-                        "text-[10px] font-mono",
-                        (trade.pnlUsd || 0) >= 0 ? "text-emerald-400/60" : "text-red-400/60"
+                        "text-[11px] font-mono",
+                        (t.pnlOfAum || 0) >= 0 ? "text-[hsl(var(--positive))]" : "text-[hsl(var(--negative))]"
                       )}>
-                        {fmtUsd(trade.pnlUsd || 0)}
-                        {trade.hlPnlUsd !== null && trade.hlPnlUsd !== undefined && (
-                          <span className="text-[8px] text-muted-foreground ml-1">HL</span>
-                        )}
+                        {fmtPct(t.pnlOfAum || 0, 3)} AUM
                       </div>
-                      <div className="flex items-center gap-1.5 justify-end">
-                        <span className="text-[10px] text-muted-foreground font-mono">
-                          ${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}
-                        </span>
-                        {trade.stopLoss > 0 && trade.entryPrice > 0 && (
-                          isLong ? trade.stopLoss >= trade.entryPrice * 1.001 : trade.stopLoss <= trade.entryPrice * 0.999
-                        ) && (
-                          <Badge className="text-[8px] px-1 py-0 bg-emerald-500/20 text-emerald-400 border-0">
-                            BE+ SL
-                          </Badge>
-                        )}
-                        {trade.stopLoss > 0 && trade.entryPrice > 0 && (
-                          isLong ? (trade.stopLoss >= trade.entryPrice * 0.999 && trade.stopLoss < trade.entryPrice * 1.001)
-                                 : (trade.stopLoss <= trade.entryPrice * 1.001 && trade.stopLoss > trade.entryPrice * 0.999)
-                        ) && (
-                          <Badge className="text-[8px] px-1 py-0 bg-amber-500/20 text-amber-400 border-0">
-                            BE SL
-                          </Badge>
-                        )}
-                      </div>
+                    </div>
+                    <div className="text-right text-[11px] text-muted-foreground font-mono min-w-[80px]">
+                      {t.stopLoss > 0 && t.entryPrice > 0 && (
+                        isLong ? t.stopLoss >= t.entryPrice * 1.001 : t.stopLoss <= t.entryPrice * 0.999
+                      ) ? (
+                        <span className="text-[hsl(var(--positive))]">BE+ locked</span>
+                      ) : (
+                        <span>SL ${t.stopLoss?.toFixed(t.stopLoss < 10 ? 4 : 2)}</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* ──────── Recent activity ──────── */}
+        <section className="pb-12">
+          <div className="flex items-center justify-between mb-5">
+            <div>
+              <p className="label-mono mb-1">Activity</p>
+              <h3 className="font-serif text-[18px] tracking-tight">Recent sessions</h3>
+            </div>
+            <span className="text-[11px] text-muted-foreground font-mono">
+              {recentTrades.length} of {closedTrades.length}
+            </span>
+          </div>
+
+          {recentTrades.length > 0 ? (
+            <div className="space-y-0">
+              {recentTrades.map((t: any) => {
+                const net = t.hlPnlUsd ?? 0;
+                const d = t.closedAt ? new Date(t.closedAt) : null;
+                const dateStr = d ? new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", month: "short", day: "2-digit" }).format(d) : "—";
+                const timeStr = d ? new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false }).format(d) : "";
+                const isLong = t.side === "long";
+                const reason = (t.closeReason || "")
+                  .replace(/\[(SESSION|BTC)\]\s*/g, "")
+                  .replace(/\s*\|\s*HL P&L.*$/g, "")
+                  .replace(/Position closed on HL \(sync\)\s*\|?\s*/g, "Sync")
+                  .replace(/P&L:.*$/g, "")
+                  .trim() || "—";
+                return (
+                  <div key={t.id} className="grid grid-cols-[70px_auto_1fr_auto] items-center gap-4 py-3 border-b border-dashed border-border hover:bg-panel-soft/30 -mx-2 px-2 rounded-md transition-colors">
+                    <span className="font-mono text-[11px] text-muted-foreground tracking-wide">{timeStr || dateStr}</span>
+                    <span className={cn(
+                      "font-mono text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded",
+                      isLong ? "bg-positive-soft text-[hsl(var(--positive))]" : "bg-negative-soft text-[hsl(var(--negative))]"
+                    )}>
+                      {isLong ? "Long" : "Short"}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="font-serif text-[14px]">{t.coin}</div>
+                      <div className="text-[11px] text-muted-foreground truncate">{reason}</div>
+                    </div>
+                    <div className={cn(
+                      "numeric-mono text-[13px] text-right",
+                      net >= 0 ? "text-[hsl(var(--positive))]" : "text-[hsl(var(--negative))]"
+                    )}>
+                      {fmtSignedUsd(net)}
                     </div>
                   </div>
                 );
               })}
             </div>
           ) : (
-            <div className="h-[80px] flex items-center justify-center text-sm text-muted-foreground">
-              No open positions
+            <div className="py-10 text-center">
+              <p className="font-serif italic text-[15px] text-muted-foreground">No sessions recorded yet.</p>
+              <p className="text-[12px] text-muted-foreground mt-1">Your first trade will appear here once it closes.</p>
             </div>
           )}
-        </CardContent>
-      </Card>
+        </section>
+      </div>
+    </div>
+  );
+}
 
-      {/* Trade History */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium">Trade History</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {(closedTrades as any[]).filter((t: any) => t.strategy === "btc_session").length > 0 ? (
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b border-border text-muted-foreground">
-                    <th className="text-left py-1.5 px-1 font-medium">Date/Time</th>
-                    <th className="text-left py-1.5 px-1 font-medium">Asset</th>
-                    <th className="text-left py-1.5 px-1 font-medium">Side</th>
-                    <th className="text-right py-1.5 px-1 font-medium">Entry</th>
-                    <th className="text-right py-1.5 px-1 font-medium">Exit</th>
-                    <th className="text-right py-1.5 px-1 font-medium">P&L (USDC)</th>
-                    <th className="text-left py-1.5 px-1 font-medium">Reason</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(closedTrades as any[])
-                    .filter((t: any) => t.strategy === "btc_session")
-                    .sort((a: any, b: any) => (b.closedAt || "").localeCompare(a.closedAt || ""))
-                    .slice(0, 30)
-                    .map((trade: any) => {
-                    const net = trade.hlPnlUsd ?? 0;
-                    const openDate = trade.openedAt ? new Date(trade.openedAt) : null;
-                    const closeDate = trade.closedAt ? new Date(trade.closedAt) : null;
-                    const isLong = trade.side === "long";
-                    const reason = (trade.closeReason || "")
-                      .replace(/\[(SESSION|BTC)\]\s*/g, "")
-                      .replace(/\s*\|\s*HL P&L.*$/g, "")
-                      .replace(/Position closed on HL \(sync\)\s*\|?\s*/g, "Sync")
-                      .replace(/P&L:.*$/g, "")
-                      .trim();
-                    return (
-                      <tr key={trade.id} className="border-b border-border/30 hover:bg-muted/30">
-                        <td className="py-1.5 px-1 font-mono text-muted-foreground whitespace-nowrap">
-                          <div>{openDate ? openDate.toLocaleDateString([], { month: "short", day: "numeric" }) : "-"}</div>
-                          <div className="text-[10px]">
-                            {openDate ? openDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}
-                            {closeDate ? " → " + closeDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}
-                          </div>
-                        </td>
-                        <td className="py-1.5 px-1 font-medium">{trade.coin}</td>
-                        <td className="py-1.5 px-1">
-                          <Badge
-                            variant="outline"
-                            className={cn(
-                              "text-[9px] px-1 py-0",
-                              isLong ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" : "bg-red-500/10 text-red-400 border-red-500/30"
-                            )}
-                          >
-                            {trade.side.toUpperCase()}
-                          </Badge>
-                        </td>
-                        <td className="py-1.5 px-1 text-right font-mono">${trade.entryPrice?.toFixed(trade.entryPrice < 10 ? 4 : 2)}</td>
-                        <td className="py-1.5 px-1 text-right font-mono">${trade.exitPrice?.toFixed(trade.exitPrice < 10 ? 4 : 2)}</td>
-                        <td className={cn(
-                          "py-1.5 px-1 text-right font-mono font-medium",
-                          net >= 0 ? "text-emerald-400" : "text-red-400"
-                        )}>
-                          {net >= 0 ? "+" : ""}{net.toFixed(2)}
-                        </td>
-                        <td className="py-1.5 px-1 text-muted-foreground truncate max-w-[140px]">{reason || "-"}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div className="h-[80px] flex items-center justify-center text-sm text-muted-foreground">
-              No closed trades yet — fresh start
-            </div>
-          )}
-        </CardContent>
-      </Card>
+/* ───────────── sub-components ───────────── */
 
-      {/* Recent Activity */}
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium">Recent Activity</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-1.5">
-            {(logs as any[]).slice(0, 8).map((log: any) => (
-              <div
-                key={log.id}
-                className="flex items-start gap-2.5 py-1.5 border-b border-border/50 last:border-0"
-              >
-                <div className={cn(
-                  "w-1.5 h-1.5 rounded-full mt-1.5 shrink-0",
-                  log.type === "trade_open" && "bg-emerald-500",
-                  log.type === "trade_close" && "bg-blue-500",
-                  log.type === "error" && "bg-red-500",
-                  log.type === "scan" && "bg-yellow-500",
-                  log.type === "system" && "bg-muted-foreground",
-                  log.type === "config_change" && "bg-purple-500",
-                  log.type === "learning" && "bg-cyan-500",
-                  log.type === "learning_24h" && "bg-cyan-400",
-                  log.type === "order_error" && "bg-red-400",
-                  log.type === "order_unfilled" && "bg-orange-400",
-                )} />
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs truncate">{log.message}</p>
-                  <p className="text-[10px] text-muted-foreground">
-                    {new Date(log.timestamp).toLocaleString()}
-                  </p>
-                </div>
-              </div>
-            ))}
-            {logs.length === 0 && (
-              <p className="text-sm text-muted-foreground text-center py-4">No activity yet</p>
-            )}
+function StatCard({
+  label, value, subline, valueClass, sublineClass,
+}: {
+  label: string; value: string; subline?: string;
+  valueClass?: string; sublineClass?: string;
+}) {
+  return (
+    <div className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] px-6 py-5">
+      <p className="label-mono mb-2">{label}</p>
+      <div className={cn("numeric-display text-[26px] leading-none", valueClass)}>{value}</div>
+      {subline && (
+        <p className={cn("text-[11px] mt-2 font-mono text-muted-foreground", sublineClass)}>{subline}</p>
+      )}
+    </div>
+  );
+}
+
+function MiniStat({
+  label, value, tone,
+}: {
+  label: string; value: string; tone?: "positive" | "negative" | "muted";
+}) {
+  const cls = tone === "positive" ? "text-[hsl(var(--positive))]"
+            : tone === "negative" ? "text-[hsl(var(--negative))]"
+            : "";
+  return (
+    <div>
+      <p className="label-mono mb-1">{label}</p>
+      <p className={cn("numeric-mono text-[14px] font-medium", cls)}>{value}</p>
+    </div>
+  );
+}
+
+function Pill({
+  children, tone, active,
+}: {
+  children: React.ReactNode;
+  tone?: "positive" | "negative" | "muted" | "neutral";
+  active?: boolean;
+}) {
+  const cls =
+    tone === "positive" ? "bg-positive-soft text-[hsl(var(--positive))] border-[hsl(var(--positive)/0.25)]"
+    : tone === "negative" ? "bg-negative-soft text-[hsl(var(--negative))] border-[hsl(var(--negative)/0.25)]"
+    : tone === "muted" ? "bg-muted text-muted-foreground border-border"
+    : active !== undefined
+      ? (active ? "bg-positive-soft text-[hsl(var(--positive))] border-[hsl(var(--positive)/0.25)]" : "bg-muted text-muted-foreground border-border")
+      : "bg-panel-soft text-foreground/80 border-border";
+  return (
+    <span className={cn(
+      "inline-flex items-center gap-1.5 text-[10px] font-mono tracking-wider uppercase px-2.5 py-1 rounded-full border",
+      cls,
+    )}>
+      {active !== undefined && (
+        <span className={cn("w-1 h-1 rounded-full", active ? "bg-[hsl(var(--positive))] animate-pulse" : "bg-muted-foreground/50")} />
+      )}
+      {children}
+    </span>
+  );
+}
+
+function Timeline({ activeIdx }: { activeIdx: number }) {
+  const steps = [
+    { time: "08:30", label: "News" },
+    { time: "08:45", label: "Decision" },
+    { time: "09:30", label: "Entry" },
+    { time: "10:00", label: "Cutoff" },
+  ];
+  return (
+    <div className="relative flex items-center justify-between pt-2">
+      {/* Line */}
+      <div className="absolute left-[6px] right-[6px] top-[14px] h-px bg-border" aria-hidden />
+      {steps.map((s, i) => {
+        const done = activeIdx > i;
+        const current = activeIdx === i;
+        return (
+          <div key={s.label} className="relative flex flex-col items-center gap-1.5 z-10 bg-card px-2">
+            <div className={cn(
+              "w-3 h-3 rounded-full border-2 transition-colors",
+              done ? "bg-[hsl(var(--positive))] border-[hsl(var(--positive))]"
+                : current ? "bg-background border-[hsl(var(--positive))]"
+                : "bg-background border-border"
+            )}>
+              {done && (
+                <svg viewBox="0 0 12 12" className="w-full h-full text-primary-foreground">
+                  <path d="M3 6l2 2 4-4" stroke="currentColor" strokeWidth="1.8" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              )}
+            </div>
+            <div className="text-center">
+              <div className={cn(
+                "font-mono text-[10px] tracking-wider",
+                current ? "text-foreground font-medium" : done ? "text-[hsl(var(--positive))]" : "text-muted-foreground"
+              )}>{s.time}</div>
+              <div className={cn(
+                "text-[10px] mt-0.5",
+                current ? "text-foreground font-medium" : "text-muted-foreground"
+              )}>{s.label}</div>
+            </div>
           </div>
-        </CardContent>
-      </Card>
+        );
+      })}
     </div>
   );
 }

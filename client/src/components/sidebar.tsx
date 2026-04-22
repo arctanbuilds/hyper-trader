@@ -2,34 +2,23 @@ import { Link, useLocation } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import {
-  LayoutDashboard,
-  ArrowLeftRight,
-  ScanSearch,
-  Settings,
-  ScrollText,
-  Play,
-  Square,
-  Zap,
-  TrendingUp,
-  Brain,
+  Circle, Diamond, Gem, Minus, FileText, Settings2,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
 const navItems = [
-  { path: "/", label: "Dashboard", icon: LayoutDashboard },
-  { path: "/trades", label: "Trades", icon: ArrowLeftRight },
-  { path: "/scanner", label: "Scanner", icon: ScanSearch },
-  { path: "/learning", label: "Learning", icon: Brain },
-  { path: "/settings", label: "Settings", icon: Settings },
-  { path: "/logs", label: "Logs", icon: ScrollText },
+  { path: "/", label: "Dashboard", icon: Circle },
+  { path: "/trades", label: "Trades", icon: Diamond },
+  { path: "/scanner", label: "Scanner", icon: Gem },
+  { path: "/logs", label: "Activity", icon: Minus },
+  { path: "/learning", label: "Learning", icon: FileText },
+  { path: "/settings", label: "Settings", icon: Settings2 },
 ];
 
 export default function Sidebar() {
   const [location] = useLocation();
 
-  const { data: status } = useQuery({
+  const { data: status } = useQuery<any>({
     queryKey: ["/api/status"],
     refetchInterval: 5000,
   });
@@ -47,101 +36,69 @@ export default function Sidebar() {
   const isRunning = status?.isRunning;
 
   return (
-    <aside className="w-64 h-screen flex flex-col bg-sidebar text-sidebar-foreground border-r border-sidebar-border shrink-0">
-      {/* Logo */}
-      <div className="p-4 border-b border-sidebar-border">
+    <aside className="w-60 min-h-screen flex flex-col bg-sidebar text-sidebar-foreground border-r border-sidebar-border shrink-0">
+      {/* Brand */}
+      <div className="px-6 pt-8 pb-6">
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
-            <Zap className="w-4 h-4 text-primary-foreground" />
-          </div>
-          <div>
-            <h1 className="text-sm font-semibold tracking-tight">HyperTrader</h1>
-            <p className="text-xs text-muted-foreground">Hyperliquid Bot</p>
-          </div>
-        </div>
-      </div>
-
-      {/* Bot Status & Control */}
-      <div className="p-3 border-b border-sidebar-border">
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-2">
-            <div className={cn(
-              "w-2 h-2 rounded-full",
-              isRunning ? "bg-emerald-500 animate-pulse" : "bg-muted-foreground"
-            )} />
-            <span className="text-xs font-medium">
-              {isRunning ? "Running" : "Stopped"}
-            </span>
-          </div>
-          <Badge variant={isRunning ? "default" : "secondary"} className="text-[10px] px-1.5 py-0">
-            {status?.openPositions || 0} open
-          </Badge>
-        </div>
-        <Button
-          size="sm"
-          className="w-full text-xs"
-          variant={isRunning ? "destructive" : "default"}
-          onClick={() => isRunning ? stopBot.mutate() : startBot.mutate()}
-          disabled={startBot.isPending || stopBot.isPending}
-          data-testid={isRunning ? "button-stop-bot" : "button-start-bot"}
-        >
-          {isRunning ? (
-            <><Square className="w-3 h-3 mr-1.5" /> Stop Bot</>
-          ) : (
-            <><Play className="w-3 h-3 mr-1.5" /> Start Bot</>
-          )}
-        </Button>
-      </div>
-
-      {/* Quick Stats */}
-      <div className="p-3 border-b border-sidebar-border space-y-1">
-        <div className="flex justify-between text-xs">
-          <span className="text-muted-foreground">ROI / AUM</span>
-          <span className={cn(
-            "font-mono font-medium",
-            parseFloat(status?.combinedPnl || "0") >= 0 ? "text-emerald-500" : "text-red-500"
-          )}>
-            {parseFloat(status?.combinedPnl || "0") >= 0 ? "+" : ""}{status?.combinedPnl || "0.00"}%
-          </span>
-        </div>
-        <div className="flex justify-between text-xs">
-          <span className="text-muted-foreground">Win Rate</span>
-          <span className="font-mono font-medium">{status?.winRate || "0.0"}%</span>
-        </div>
-        <div className="flex justify-between text-xs">
-          <span className="text-muted-foreground">Trades</span>
-          <span className="font-mono font-medium">{status?.totalTrades || 0}</span>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" className="text-sidebar-foreground">
+            <path d="M12 3L22 20H2L12 3Z" stroke="currentColor" strokeWidth="1.5" fill="none" />
+          </svg>
+          <span className="font-serif text-[17px] tracking-tight">HyperTrader</span>
         </div>
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 p-2 space-y-0.5">
+      <nav className="flex-1 px-3 space-y-0.5">
         {navItems.map((item) => {
           const isActive = location === item.path;
+          const Icon = item.icon;
           return (
             <Link key={item.path} href={item.path}>
               <div
                 className={cn(
-                  "flex items-center gap-2.5 px-3 py-2 rounded-md text-sm cursor-pointer transition-colors",
+                  "flex items-center gap-3 px-3 py-2 rounded-md text-[13px] cursor-pointer transition-colors",
                   isActive
-                    ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
-                    : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent/50"
+                    ? "bg-sidebar-primary text-sidebar-primary-foreground font-medium"
+                    : "text-sidebar-foreground/70 hover:text-sidebar-foreground hover:bg-sidebar-accent/60"
                 )}
                 data-testid={`nav-${item.label.toLowerCase()}`}
               >
-                <item.icon className="w-4 h-4" />
-                {item.label}
+                <Icon className="w-3 h-3" strokeWidth={1.5} />
+                <span>{item.label}</span>
               </div>
             </Link>
           );
         })}
       </nav>
 
+      {/* Bot control — minimal inline */}
+      <div className="px-6 py-4 space-y-3 border-t border-sidebar-border">
+        <button
+          onClick={() => (isRunning ? stopBot.mutate() : startBot.mutate())}
+          disabled={startBot.isPending || stopBot.isPending}
+          className="w-full text-left text-[11px] tracking-wide flex items-center justify-between group"
+          data-testid={isRunning ? "button-stop-bot" : "button-start-bot"}
+        >
+          <span className="flex items-center gap-2">
+            <span
+              className={cn(
+                "w-1.5 h-1.5 rounded-full",
+                isRunning ? "bg-[hsl(var(--positive))] animate-pulse" : "bg-muted-foreground/40"
+              )}
+            />
+            <span className="text-foreground/80">{isRunning ? "Bot running" : "Bot stopped"}</span>
+          </span>
+          <span className="text-muted-foreground group-hover:text-foreground transition-colors">
+            {isRunning ? "stop" : "start"} →
+          </span>
+        </button>
+      </div>
+
       {/* Footer */}
-      <div className="p-3 border-t border-sidebar-border">
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-          <TrendingUp className="w-3 h-3" />
-          <span>v4.0 — Self-Learning Engine</span>
+      <div className="px-6 pb-6">
+        <div className="text-[11px] leading-tight">
+          <div className="font-medium text-foreground/80">Operator</div>
+          <div className="text-muted-foreground">v17.1 · BTC Session</div>
         </div>
       </div>
     </aside>
