@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v17.1
+ * HyperTrader — Trading Engine v17.2
  *
  * SINGLE STRATEGY: BTC NY Open Session Trader (Mon–Fri)
  *
@@ -56,7 +56,7 @@ const ALLOWED_ASSETS: AssetConfig[] = [
 ];
 const BTC_ASSET = ALLOWED_ASSETS[0];
 
-// v17.1 Session constants
+// v17.2 Session constants
 const SESSION_TP_PCT = 0.01;              // +1.0%
 const SESSION_SL_PCT = 0.01;              // -1.0%
 const SESSION_BE_TRIGGER_PCT = 0.5;       // price moves +0.5% in favor → trigger BE+
@@ -67,10 +67,14 @@ const SESSION_CONFIDENCE_THRESHOLD = 7;   // min confidence to trade
 const SESSION_ENTRY_LIMIT_MS = 60 * 1000; // 1 min limit window, then market
 
 // NY schedule (ET). We compute UTC hour at runtime using America/New_York TZ.
-const SESSION_NEWS_ET = { hour: 8, minute: 30 };   // Sonar news scan
-const SESSION_DECISION_ET = { hour: 8, minute: 45 }; // Opus analysis
-const SESSION_OPEN_ET = { hour: 9, minute: 30 };   // NY open entry
-const SESSION_CUTOFF_ET = { hour: 10, minute: 0 }; // Hard cutoff — no more entries
+const SESSION_NEWS_ET = { hour: 8, minute: 30 };     // Sonar news scan
+const SESSION_DECISION_ET = { hour: 8, minute: 45 }; // Opus first decision
+const SESSION_OPEN_ET = { hour: 9, minute: 30 };     // NY open entry
+const SESSION_CUTOFF_ET = { hour: 10, minute: 45 };  // v17.2 hard cutoff — extended for retry window
+// v17.2 qualification-gate retry loop
+const SESSION_RETRY_INTERVAL_MIN = 15;  // retry every 15 minutes
+const SESSION_MAX_RETRIES = 8;          // 09:00, 09:15, 09:30, 09:45, 10:00, 10:15, 10:30, 10:45
+const SESSION_RETRY_START_ET = { hour: 9, minute: 0 };  // first retry slot (after 08:45 first call)
 
 const ALL_TRADEABLE_COINS = [...ALLOWED_ASSETS.map(a => a.coin)];
 
@@ -571,6 +575,11 @@ interface SessionState {
   entryOrderPlacedAt?: number;   // ms timestamp of limit placement (for 1-min timeout)
   entryOrderCoin?: string;
   notes?: string;
+  // v17.2 retry loop
+  retryCount: number;                    // 0..SESSION_MAX_RETRIES — increments on each failed qualification
+  lastRetryMinute?: number;              // ET minute-of-day of last retry fire (prevents duplicate fires in same 15-min window)
+  retriesExhausted?: boolean;            // true when retry loop gave up (all retries failed)
+  retryHistory?: Array<{ at: string; minute: number; confidence: number; direction: string }>;
 }
 
 function emptySessionState(dateKey: string): SessionState {
@@ -583,6 +592,8 @@ function emptySessionState(dateKey: string): SessionState {
     sessionResult: "",
     news: null,
     decision: null,
+    retryCount: 0,
+    retryHistory: [],
   };
 }
 
@@ -714,10 +725,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v17.1 started | BTC NY Open Session Trader (Mon–Fri, 08:30–10:00 ET, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v17.2 started | BTC NY Open Session Trader (Mon–Fri, 08:30–10:45 ET w/ qualification-gate retry every 15m, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v17.1 started | BTC NY Open Session Trader | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v17.2 started | BTC NY Open Session Trader (retry-loop 08:45–10:45 ET) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleNextSessionTick();
   }
@@ -1032,15 +1043,16 @@ class TradingEngine {
       const decisionMin = SESSION_DECISION_ET.hour * 60 + SESSION_DECISION_ET.minute;
       const openMin = SESSION_OPEN_ET.hour * 60 + SESSION_OPEN_ET.minute;
       const cutoffMin = SESSION_CUTOFF_ET.hour * 60 + SESSION_CUTOFF_ET.minute;
+      const retryStartMin = SESSION_RETRY_START_ET.hour * 60 + SESSION_RETRY_START_ET.minute;
 
-      // Window guard: only operate within 08:30–10:00 ET; outside this we do nothing
+      // Window guard: only operate within 08:30–10:45 ET (+5 min buffer); outside this we do nothing
       if (minutes < newsMin - 5 || minutes > cutoffMin + 5) {
         this.isSessionRunning = false;
         this.scheduleNextSessionTick();
         return;
       }
 
-      // 1) 08:30 ET — fetch news (once)
+      // 1) 08:30 ET — fetch news (first pass)
       if (!this.sessionState.newsDone && minutes >= newsMin) {
         const pplxKey = process.env.PERPLEXITY_API_KEY || "";
         if (!pplxKey) {
@@ -1059,33 +1071,71 @@ class TradingEngine {
         }
       }
 
-      // 2) 08:45 ET — run Opus 4.7 decision (once)
-      if (this.sessionState.newsDone && !this.sessionState.decisionDone && minutes >= decisionMin) {
+      // 2) 08:45 ET — Opus 4.7 first decision
+      if (this.sessionState.newsDone && !this.sessionState.decisionDone && !this.sessionState.retriesExhausted && minutes >= decisionMin) {
         const pplxKey = process.env.PERPLEXITY_API_KEY || "";
         if (pplxKey && this.sessionState.news) {
-          log(`[SESSION] ${dateKey} 08:45 ET — Opus 4.7 decision`, "engine");
-          const mids = await fetchAllMids();
-          const currentPrice = parseFloat(mids["BTC"] || "0");
-          if (currentPrice > 0) {
-            const tech = await computeBtcTechnicals(currentPrice);
-            const decision = await fetchBtcDecision(pplxKey, this.sessionState.news, tech, currentPrice);
-            this.sessionState.decision = decision;
-            this.sessionState.decisionDone = true;
-            await this.saveSessionState();
-            await storage.createLog({
-              type: "system",
-              message: `[SESSION] DECISION: ${decision.direction.toUpperCase()} conf=${decision.confidence}/10 entry=${decision.entry ?? "MARKET"} | ${decision.reasoning.slice(0, 200)}`,
-              timestamp: new Date().toISOString(),
-            });
-          } else {
-            log(`[SESSION] Cannot fetch BTC mid price — delaying decision`, "engine");
+          log(`[SESSION] ${dateKey} 08:45 ET — Opus 4.7 first decision (attempt 1/${SESSION_MAX_RETRIES + 1})`, "engine");
+          const ok = await this.runQualificationPass(pplxKey, minutes, /*attemptLabel=*/"first");
+          if (!ok) {
+            // First pass failed qualification — schedule retries (do not mark decisionDone)
+            log(`[SESSION] First pass failed qualification — entering retry loop (up to ${SESSION_MAX_RETRIES} retries every ${SESSION_RETRY_INTERVAL_MIN} min)`, "engine");
           }
         }
       }
 
-      // 3) 09:30 ET — entry (once per session, unless re-entry allowed)
+      // 2b) v17.2 retry loop — every 15 min from 09:00 to 10:45 while decision not qualified
+      if (this.sessionState.newsDone && !this.sessionState.decisionDone && !this.sessionState.retriesExhausted && minutes >= retryStartMin && minutes <= cutoffMin) {
+        // Compute which retry slot we're in (0-indexed from 09:00)
+        const slotIdx = Math.floor((minutes - retryStartMin) / SESSION_RETRY_INTERVAL_MIN);
+        const slotMinute = retryStartMin + slotIdx * SESSION_RETRY_INTERVAL_MIN;
+        // Only fire once per slot, and only if we haven't exhausted retries yet
+        if (
+          this.sessionState.retryCount < SESSION_MAX_RETRIES &&
+          (this.sessionState.lastRetryMinute === undefined || this.sessionState.lastRetryMinute < slotMinute) &&
+          minutes >= slotMinute
+        ) {
+          const pplxKey = process.env.PERPLEXITY_API_KEY || "";
+          if (pplxKey) {
+            const attemptNum = this.sessionState.retryCount + 1; // 1-indexed in log
+            log(`[SESSION] ${dateKey} retry ${attemptNum}/${SESSION_MAX_RETRIES} at ET minute ${slotMinute} — fresh news + decision`, "engine");
+            // Fresh Sonar news for this retry (overwrite prior)
+            try {
+              const news = await fetchBtcNews(pplxKey);
+              this.sessionState.news = news;
+              await storage.createLog({
+                type: "system",
+                message: `[SESSION] RETRY ${attemptNum} NEWS: ${news.sentimentHint.toUpperCase()} | ${news.summary.slice(0, 180)}`,
+                timestamp: new Date().toISOString(),
+              });
+            } catch (e) {
+              log(`[SESSION] Retry news fetch error: ${e}`, "engine");
+            }
+            this.sessionState.lastRetryMinute = slotMinute;
+            await this.runQualificationPass(pplxKey, minutes, `retry ${attemptNum}`);
+            // If all retries exhausted and still not qualified — give up
+            if (!this.sessionState.decisionDone && this.sessionState.retryCount >= SESSION_MAX_RETRIES) {
+              log(`[SESSION] ${dateKey} — ${SESSION_MAX_RETRIES} retries exhausted, no qualifying setup`, "engine");
+              this.sessionState.retriesExhausted = true;
+              this.sessionState.entryDone = true;
+              this.sessionState.notes = `${SESSION_MAX_RETRIES} retries exhausted — no qualifying setup`;
+              await this.saveSessionState();
+              await storage.createLog({
+                type: "system",
+                message: `[SESSION] NO TRADE — ${SESSION_MAX_RETRIES} retries exhausted, qualification gate never passed`,
+                timestamp: new Date().toISOString(),
+              });
+            }
+          }
+        }
+      }
+
+      // 3) Entry — 09:30+ at NY open, or immediately (market) if retry qualified after 09:30
       if (this.sessionState.decisionDone && !this.sessionState.entryDone && minutes >= openMin && minutes <= cutoffMin) {
-        await this.tryEnterSession(config, minutes >= cutoffMin);
+        // v17.2 Plan A: if qualification passed on a retry at or after 09:30, enter at MARKET immediately
+        const qualifiedOnRetry = this.sessionState.retryCount > 0;
+        const forceMarketNow = qualifiedOnRetry || minutes >= cutoffMin;
+        await this.tryEnterSession(config, forceMarketNow);
       }
 
       // 3b) Poll limit order timeout — if a limit has been resting >1 min and not filled, upgrade to market
@@ -1102,9 +1152,9 @@ class TradingEngine {
         }
       }
 
-      // 4) 10:00 ET — cutoff. If still no entry, take market if decision was valid
+      // 4) 10:45 ET — hard cutoff. If still no entry and decision was valid, take market. Otherwise end session.
       if (this.sessionState.decisionDone && !this.sessionState.entryDone && minutes >= cutoffMin) {
-        log(`[SESSION] ${dateKey} 10:00 ET cutoff — forcing market entry if decision valid`, "engine");
+        log(`[SESSION] ${dateKey} 10:45 ET cutoff — forcing market entry if decision valid`, "engine");
         await this.cancelRestingSessionOrders(config);
         await this.tryEnterSession(config, true);
         // Mark session done regardless — no more entries this day
@@ -1122,6 +1172,45 @@ class TradingEngine {
     }
     this.isSessionRunning = false;
     this.scheduleNextSessionTick();
+  }
+
+  // v17.2 qualification pass — runs Opus decision, either marks decisionDone (on pass) or increments retryCount (on fail).
+  // Returns true if qualification passed.
+  private async runQualificationPass(pplxKey: string, minutes: number, attemptLabel: string): Promise<boolean> {
+    if (!this.sessionState.news) return false;
+    const mids = await fetchAllMids();
+    const currentPrice = parseFloat(mids["BTC"] || "0");
+    if (currentPrice <= 0) {
+      log(`[SESSION] ${attemptLabel}: cannot fetch BTC mid price — skipping this pass`, "engine");
+      return false;
+    }
+    const tech = await computeBtcTechnicals(currentPrice);
+    const decision = await fetchBtcDecision(pplxKey, this.sessionState.news, tech, currentPrice);
+    this.sessionState.decision = decision;
+    const passed = decision.direction !== "skip" && decision.confidence >= SESSION_CONFIDENCE_THRESHOLD;
+
+    await storage.createLog({
+      type: "system",
+      message: `[SESSION] ${attemptLabel.toUpperCase()} DECISION: ${decision.direction.toUpperCase()} conf=${decision.confidence}/10 entry=${decision.entry ?? "MARKET"} — ${passed ? "PASS" : "FAIL"} | ${decision.reasoning.slice(0, 180)}`,
+      timestamp: new Date().toISOString(),
+    });
+
+    if (passed) {
+      this.sessionState.decisionDone = true;
+      log(`[SESSION] ${attemptLabel} PASSED qualification (${decision.direction} conf=${decision.confidence}) → proceeding to entry`, "engine");
+    } else {
+      this.sessionState.retryCount = (this.sessionState.retryCount || 0) + 1;
+      if (!this.sessionState.retryHistory) this.sessionState.retryHistory = [];
+      this.sessionState.retryHistory.push({
+        at: new Date().toISOString(),
+        minute: minutes,
+        confidence: decision.confidence,
+        direction: decision.direction,
+      });
+      log(`[SESSION] ${attemptLabel} FAILED qualification (dir=${decision.direction} conf=${decision.confidence}) — retryCount=${this.sessionState.retryCount}/${SESSION_MAX_RETRIES}`, "engine");
+    }
+    await this.saveSessionState();
+    return passed;
   }
 
   private async cancelRestingSessionOrders(config: any) {
@@ -1746,7 +1835,7 @@ class TradingEngine {
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
       sessionState: this.sessionState,
-      version: "v17.1",
+      version: "v17.2",
       strategyStats: {
         btc_session: {
           trades: sessionTrades.length,

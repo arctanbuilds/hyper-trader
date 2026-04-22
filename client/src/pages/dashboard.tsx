@@ -36,9 +36,10 @@ function getPhase(hour: number, minute: number, weekday: string) {
   const mins = hour * 60 + minute;
   if (mins < 8 * 60 + 30) return { key: "pre", label: "Pre-session", next: "News · 08:30 ET", active: 0 };
   if (mins < 8 * 60 + 45) return { key: "news", label: "News fetch", next: "Decision · 08:45 ET", active: 1 };
-  if (mins < 9 * 60 + 30) return { key: "decision", label: "Decision", next: "Entry · 09:30 ET", active: 2 };
-  if (mins < 10 * 60) return { key: "entry", label: "Entry window", next: "Cutoff · 10:00 ET", active: 3 };
-  return { key: "closed", label: "Session closed", next: "Tomorrow 08:30 ET", active: 4 };
+  if (mins < 9 * 60) return { key: "decision", label: "First decision", next: "Retry window · 09:00 ET", active: 2 };
+  if (mins < 9 * 60 + 30) return { key: "retry", label: "Qualification retry", next: "Entry · 09:30 ET", active: 3 };
+  if (mins < 10 * 60 + 45) return { key: "entry", label: "Entry window", next: "Cutoff · 10:45 ET", active: 4 };
+  return { key: "closed", label: "Session closed", next: "Tomorrow 08:30 ET", active: 5 };
 }
 
 function fmtUsd0(v: number) {
@@ -107,6 +108,8 @@ export default function Dashboard() {
   const entryDone = sessionState?.entryDone;
   const sessionResult = sessionState?.sessionResult;
   const newsSummary = sessionState?.newsSummary;
+  const retryCount: number = sessionState?.retryCount || 0;
+  const retriesExhausted: boolean = !!sessionState?.retriesExhausted;
 
   const todayClosedTrades = (closedTrades || []).filter((t: any) => {
     if (!t.closedAt || t.strategy !== "btc_session") return false;
@@ -202,9 +205,14 @@ export default function Dashboard() {
                     {ny.weekday}, {ny.dateStr}
                   </h2>
                 </div>
-                <Pill tone={phase.key === "entry" ? "positive" : phase.key === "closed" ? "muted" : "neutral"}>
-                  {phase.label}
-                </Pill>
+                <div className="flex items-center gap-2">
+                  {retryCount > 0 && !entryDone && !retriesExhausted && (
+                    <Pill tone="neutral">Retry {retryCount}/8</Pill>
+                  )}
+                  <Pill tone={phase.key === "entry" ? "positive" : phase.key === "closed" ? "muted" : "neutral"}>
+                    {phase.label}
+                  </Pill>
+                </div>
               </div>
 
               {/* Timeline */}
@@ -224,8 +232,14 @@ export default function Dashboard() {
                 {phase.key === "decision" && !decision && (
                   <p className="text-muted-foreground">Claude Opus 4.7 is reading the tape and composing today&apos;s trade thesis.</p>
                 )}
+                {phase.key === "retry" && !decision && (
+                  <p className="text-muted-foreground">Qualification gate didn&apos;t pass. Retrying every 15 minutes with fresh news and a fresh decision until 10:45 ET.</p>
+                )}
+                {phase.key === "retry" && decision && !entryDone && (
+                  <p className="text-muted-foreground">Setup qualified. Waiting for the 09:30 ET NY open to enter.</p>
+                )}
                 {phase.key === "entry" && !entryDone && (
-                  <p className="text-muted-foreground">Entry window is live. Limit rests for one minute, then promotes to market if unfilled.</p>
+                  <p className="text-muted-foreground">Entry window is live. Limit rests for one minute, then promotes to market if unfilled. Cutoff is 10:45 ET.</p>
                 )}
                 {entryDone && sessionResult === "tp" && (
                   <p className="text-[hsl(var(--positive))]">Take-profit captured. Re-entry is permitted within this session window.</p>
@@ -569,8 +583,9 @@ function Timeline({ activeIdx }: { activeIdx: number }) {
   const steps = [
     { time: "08:30", label: "News" },
     { time: "08:45", label: "Decision" },
+    { time: "09:00", label: "Retry" },
     { time: "09:30", label: "Entry" },
-    { time: "10:00", label: "Cutoff" },
+    { time: "10:45", label: "Cutoff" },
   ];
   return (
     <div className="relative flex items-center justify-between pt-2">
