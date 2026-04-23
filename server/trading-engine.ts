@@ -1817,6 +1817,7 @@ class TradingEngine {
       }
 
       log(`[TLBR] Discovery scan starting — ${(sinceLastDiscovery / 60000).toFixed(0)}min since last call`, "engine");
+      await storage.createLog({ type: "tlbr_discovery", message: `TLBR discovery scan starting (BTC $${currentPrice.toFixed(2)}, ${(sinceLastDiscovery / 60000).toFixed(0)}min since last)`, timestamp: new Date().toISOString() });
       this.tlbrState.lastDiscoveryAt = now;
       await this.saveTlbrState();
 
@@ -1827,29 +1828,41 @@ class TradingEngine {
       }
 
       const discovery = await fetchTlbrDiscovery(pplxKey, candles5m, currentPrice);
+
+      // Always write discovery outcome to activity feed for observability
       if (!discovery.setup) {
-        log(`[TLBR] Discovery: no qualified setup — ${discovery.reasoning.slice(0, 140)}`, "engine");
+        const msg = `TLBR discovery: NO SETUP (conf ${discovery.confidence}/10) — ${discovery.reasoning.slice(0, 200)}`;
+        log(`[TLBR] ${msg}`, "engine");
+        await storage.createLog({ type: "tlbr_discovery", message: msg, timestamp: new Date().toISOString() });
         return;
       }
       if (discovery.confidence < 7) {
-        log(`[TLBR] Discovery rejected: conf ${discovery.confidence}/10 < 7`, "engine");
+        const msg = `TLBR discovery: rejected low conf ${discovery.confidence}/10 < 7 | trendline $${discovery.setup.projectedRetest.toFixed(2)} ${discovery.setup.touches}T/${discovery.setup.durationHours.toFixed(1)}h | ${discovery.reasoning.slice(0, 140)}`;
+        log(`[TLBR] ${msg}`, "engine");
+        await storage.createLog({ type: "tlbr_discovery", message: msg, timestamp: new Date().toISOString() });
         return;
       }
 
       // Breakout must be within last 15min
       const breakoutAge = now - discovery.setup.breakoutAt;
       if (breakoutAge > TLBR_BREAKOUT_MAX_AGE_MS) {
-        log(`[TLBR] Discovery rejected: breakout age ${(breakoutAge / 60000).toFixed(1)}min > 15min`, "engine");
+        const msg = `TLBR discovery: rejected stale breakout ${(breakoutAge / 60000).toFixed(1)}min > 15min | trendline $${discovery.setup.projectedRetest.toFixed(2)}`;
+        log(`[TLBR] ${msg}`, "engine");
+        await storage.createLog({ type: "tlbr_discovery", message: msg, timestamp: new Date().toISOString() });
         return;
       }
 
       // Quality gates
       if (discovery.setup.touches < 3) {
-        log(`[TLBR] Discovery rejected: only ${discovery.setup.touches} touches (<3)`, "engine");
+        const msg = `TLBR discovery: rejected only ${discovery.setup.touches} touches (<3)`;
+        log(`[TLBR] ${msg}`, "engine");
+        await storage.createLog({ type: "tlbr_discovery", message: msg, timestamp: new Date().toISOString() });
         return;
       }
       if (discovery.setup.durationHours < 5) {
-        log(`[TLBR] Discovery rejected: span ${discovery.setup.durationHours.toFixed(1)}h (<5h)`, "engine");
+        const msg = `TLBR discovery: rejected span ${discovery.setup.durationHours.toFixed(1)}h (<5h)`;
+        log(`[TLBR] ${msg}`, "engine");
+        await storage.createLog({ type: "tlbr_discovery", message: msg, timestamp: new Date().toISOString() });
         return;
       }
 
