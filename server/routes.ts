@@ -310,14 +310,15 @@ export async function registerRoutes(
     });
 
     const sessionBucket = makeBucket();
+    const tlbrBucket = makeBucket();
 
     const closedTrades = allTrades
-      .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V15_START && t.strategy === "btc_session")
+      .filter((t: any) => t.status === "closed" && t.closedAt && t.openedAt >= V15_START && (t.strategy === "btc_session" || t.strategy === "tlbr"))
       .sort((a: any, b: any) => new Date(a.closedAt).getTime() - new Date(b.closedAt).getTime());
 
     for (const t of closedTrades) {
       const pnl = t.hlPnlUsd ?? 0;
-      const bucket = sessionBucket;
+      const bucket = t.strategy === "tlbr" ? tlbrBucket : sessionBucket;
 
       bucket.trades.push(t);
       bucket.totalPnl += pnl;
@@ -349,6 +350,7 @@ export async function registerRoutes(
 
     const openTrades = allTrades.filter((t: any) => t.status === "open");
     const openSession = openTrades.filter((t: any) => t.strategy === "btc_session").length;
+    const openTlbr = openTrades.filter((t: any) => t.strategy === "tlbr").length;
 
     const raceStartMs = new Date(V15_START).getTime();
     const raceHours = parseFloat(((Date.now() - raceStartMs) / 3600000).toFixed(1));
@@ -378,6 +380,7 @@ export async function registerRoutes(
 
     const result = [
       formatBucket(sessionBucket, "btc_session", "BTC NY Open Session (Opus 4.7)", openSession),
+      formatBucket(tlbrBucket, "tlbr", "BTC Trendline Breakout-Retest (Opus 4.7)", openTlbr),
     ];
 
     res.json({ raceStartedAt: V15_START, raceHours, strategies: result });

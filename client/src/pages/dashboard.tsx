@@ -92,6 +92,13 @@ export default function Dashboard() {
   });
 
   const btcStrat = strategyData?.strategies?.find((s: any) => s.strategy === "btc_session");
+  const tlbrStrat = strategyData?.strategies?.find((s: any) => s.strategy === "tlbr");
+  const tlbrStatus = status?.strategyStats?.tlbr || {};
+  const tlbrMode: string = tlbrStatus?.mode || "discovery";
+  const tlbrSetup: any = tlbrStatus?.setup || null;
+  const tlbrLimitOrder: any = tlbrStatus?.limitOrder || null;
+  const tlbrCumPnl = parseFloat(tlbrStatus?.cumulativeTlbrPnl || "0");
+  const tlbrDisabled: boolean = (tlbrStatus?.status || "").includes("disabled");
 
   const ny = getNyParts();
   const phase = getPhase(ny.hour, ny.minute, ny.weekday);
@@ -403,6 +410,102 @@ export default function Dashboard() {
               />
               <MiniStat label="Avg · trade" value={(btcStrat?.avgPnlPerTrade || 0) >= 0 ? `+$${(btcStrat?.avgPnlPerTrade || 0).toFixed(2)}` : `−$${Math.abs(btcStrat?.avgPnlPerTrade || 0).toFixed(2)}`} />
             </div>
+          </div>
+        </section>
+
+        {/* ──────── TLBR Strategy Card ──────── */}
+        <section className="rounded-[14px] bg-card border border-card-border shadow-[var(--shadow-sm)] p-6 space-y-5" data-testid="tlbr-card">
+          <div className="flex items-start justify-between gap-6">
+            <div className="flex-1">
+              <p className="label-mono mb-1">Strategy</p>
+              <h3 className="font-serif text-[18px] tracking-tight">BTC · Trendline Breakout-Retest (TLBR)</h3>
+              <p className="text-[12px] text-muted-foreground mt-1 leading-relaxed max-w-[620px]">
+                Opus hunts descending trendlines with ≥3 rejections and ≥5h span. On a fresh breakout,
+                a 1-min watch decides enter-market vs. rest a limit at trendline +0.1%.
+                $100 margin · 20× · TP +0.5% / SL −0.5% · 1 shot per trendline · kill switch −$50.
+              </p>
+            </div>
+            <div className="flex flex-col items-end gap-2">
+              <Pill tone={tlbrDisabled ? "negative" : tlbrMode === "in_trade" ? "positive" : tlbrMode === "discovery" ? "muted" : "neutral"}>
+                {tlbrDisabled ? "Disabled" : tlbrMode.replace(/_/g, " ")}
+              </Pill>
+              <p className="text-[11px] text-muted-foreground font-mono">
+                cum P&L {tlbrCumPnl >= 0 ? "+" : "−"}${Math.abs(tlbrCumPnl).toFixed(2)}
+              </p>
+            </div>
+          </div>
+
+          {/* Live state panel */}
+          {(tlbrSetup || tlbrLimitOrder) && (
+            <div className="rounded-[10px] bg-panel-soft/40 border border-dashed border-border p-4 space-y-2">
+              <p className="label-mono">Live state</p>
+              {tlbrSetup && (
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-[12px] font-mono">
+                  <div>
+                    <span className="text-muted-foreground">Breakout</span>
+                    <div>${tlbrSetup.breakoutPrice}</div>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Trendline</span>
+                    <div>${tlbrSetup.projectedRetest}</div>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Quality</span>
+                    <div>{tlbrSetup.touches}T · {tlbrSetup.durationHours}h</div>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Confidence</span>
+                    <div>{tlbrSetup.confidence}</div>
+                  </div>
+                </div>
+              )}
+              {tlbrLimitOrder && (
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-[12px] font-mono pt-2 border-t border-dashed border-border">
+                  <div>
+                    <span className="text-muted-foreground">Limit</span>
+                    <div>${tlbrLimitOrder.price}</div>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Age</span>
+                    <div>{tlbrLimitOrder.ageMin}min / 15min</div>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">HL oid</span>
+                    <div className="truncate">{tlbrLimitOrder.hlOid || "—"}</div>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Watch attempts</span>
+                    <div>{tlbrStatus?.watchAttempts || 0}/15</div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!tlbrSetup && !tlbrLimitOrder && (
+            <div className="rounded-[10px] bg-panel-soft/30 border border-dashed border-border py-5 text-center">
+              <p className="font-serif italic text-[13px] text-muted-foreground">
+                {tlbrDisabled
+                  ? "Kill switch tripped. Strategy paused."
+                  : tlbrMode === "discovery"
+                  ? "Scanning for the next trendline. Opus wakes every 60 minutes."
+                  : "Awaiting market context."}
+              </p>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4 border-t border-dashed border-border">
+            <MiniStat label="Trades" value={`${tlbrStrat?.totalTrades || 0}`} />
+            <MiniStat label="Win rate" value={`${tlbrStrat?.winRate || 0}%`} />
+            <MiniStat
+              label="Realized P&L"
+              value={(tlbrStrat?.totalPnlUsd || 0) >= 0 ? `+$${(tlbrStrat?.totalPnlUsd || 0).toFixed(2)}` : `−$${Math.abs(tlbrStrat?.totalPnlUsd || 0).toFixed(2)}`}
+              tone={(tlbrStrat?.totalPnlUsd || 0) >= 0 ? "positive" : (tlbrStrat?.totalPnlUsd || 0) < 0 ? "negative" : "muted"}
+            />
+            <MiniStat
+              label="Avg · trade"
+              value={(tlbrStrat?.avgPnlPerTrade || 0) >= 0 ? `+$${(tlbrStrat?.avgPnlPerTrade || 0).toFixed(2)}` : `−$${Math.abs(tlbrStrat?.avgPnlPerTrade || 0).toFixed(2)}`}
+            />
           </div>
         </section>
 
