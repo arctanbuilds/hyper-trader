@@ -93,11 +93,15 @@ type StrategyType = "btc_session" | "breakout" | "obos" | "oil_news" | "trendlin
 // Kill switch: cumulative TLBR P&L ≤ -$50 disables TLBR only (SESSION keeps running).
 const TLBR_MARGIN_USD = 100;                       // fixed $100 margin per trade
 const TLBR_LEVERAGE = 20;                          // 20x → $2,000 notional
-const TLBR_TP_PCT = 0.0035;                        // +0.35%
-const TLBR_SL_PCT = 0.003;                         // -0.30%
-const TLBR_OPUS_INTERVAL_MIN = 60;                 // discovery cadence (weekdays only)
+const TLBR_TP_PCT = 0.005;                         // +0.5%
+const TLBR_SL_PCT = 0.005;                         // -0.5%
+const TLBR_DISCOVERY_INTERVAL_MIN = 60;            // discovery Opus cadence (weekdays only)
+const TLBR_WATCH_INTERVAL_MIN = 1;                 // post-breakout Opus 1-min scan cadence
+const TLBR_WATCH_MAX_ATTEMPTS = 15;                // max 15 watch calls (≈15 min)
+const TLBR_LIMIT_LIFETIME_MS = 15 * 60 * 1000;     // 15min — cancel unfilled limit
 const TLBR_KILL_SWITCH_USD = -50;                  // cumulative P&L floor
-const TLBR_SETUP_MAX_AGE_MS = 15 * 60 * 1000;      // 15min — expire pending setup if no retest touches
+const TLBR_BREAKOUT_MAX_AGE_MS = 15 * 60 * 1000;   // breakout must be within last 15min to enter WATCH
+const TLBR_PROXIMITY_PCT = 0.002;                  // 0.2% — price within this of trendline = place limit
 const TLBR_INVALIDATE_DISTANCE_PCT = 0.01;         // 1% below retest level = trendline broken
 
 interface TlbrTrendline {
@@ -105,39 +109,56 @@ interface TlbrTrendline {
   p2: { t: number; price: number };   // anchor point 2 (later high)
   slope: number;                       // price change per ms
 }
-interface TlbrFvg {
-  low: number;  // FVG lower bound
-  high: number; // FVG upper bound
-}
-interface TlbrPendingSetup {
+
+// v17.6 state machine modes
+type TlbrMode = "discovery" | "watching_retest" | "limit_resting" | "in_trade";
+
+interface TlbrSetup {
   trendline: TlbrTrendline;
-  breakoutPrice: number;        // price at which breakout was confirmed
-  retestLevel: number;          // projected retest price
-  retestZoneLow: number;        // zone tolerance (usually retestLevel * 0.998)
-  retestZoneHigh: number;       // retestLevel * 1.002
-  fvg: TlbrFvg | null;
-  confidence: number;           // 1-10 from Opus
+  touches: number;                 // ≥3
+  durationHours: number;           // ≥5
+  breakoutPrice: number;           // price at breakout candle close
+  breakoutAt: number;              // ms timestamp of breakout candle close
+  projectedRetest: number;         // current projected trendline value (midpoint of retest zone)
+  confidence: number;
   reasoning: string;
-  discoveredAt: number;         // ms timestamp
+  discoveredAt: number;
 }
+
+interface TlbrLimitOrder {
+  price: number;                   // limit buy price (midpoint = trendline + 0.1%)
+  placedAt: number;                // ms timestamp
+  hlOid?: number;                  // HL resting order id (for cancel)
+}
+
 interface TlbrState {
-  disabled: boolean;            // killed by kill switch
-  cumulativePnlUsd: number;     // running total of TLBR trade P&L
-  lastOpusCallAt: number;       // ms timestamp of last discovery scan
-  pendingSetup: TlbrPendingSetup | null;
-  consumedTrendlineIds: string[];   // hashes of trendlines already traded — never retry
-  openTradeId: number | null;   // id of current open TLBR trade (if any)
+  mode: TlbrMode;
+  disabled: boolean;                       // killed by kill switch
+  cumulativePnlUsd: number;                // running total of TLBR trade P&L
+  lastDiscoveryAt: number;                 // ms timestamp of last discovery Opus call
+  lastWatchAt: number;                     // ms timestamp of last watch-mode Opus call
+  watchAttempts: number;                   // 0..TLBR_WATCH_MAX_ATTEMPTS
+  setup: TlbrSetup | null;                 // current active setup (watching or limit-resting)
+  limitOrder: TlbrLimitOrder | null;       // active HL limit order
+  consumedTrendlineIds: string[];          // hashes of trendlines already traded
+  openTradeId: number | null;              // id of current open TLBR trade (if any)
 }
+
 function emptyTlbrState(): TlbrState {
   return {
+    mode: "discovery",
     disabled: false,
     cumulativePnlUsd: 0,
-    lastOpusCallAt: 0,
-    pendingSetup: null,
+    lastDiscoveryAt: 0,
+    lastWatchAt: 0,
+    watchAttempts: 0,
+    setup: null,
+    limitOrder: null,
     consumedTrendlineIds: [],
     openTradeId: null,
   };
 }
+
 function tlbrTrendlineId(tl: TlbrTrendline): string {
   return `${Math.round(tl.p1.price)}_${Math.round(tl.p2.price)}_${tl.p1.t}_${tl.p2.t}`;
 }
@@ -352,19 +373,21 @@ Decide direction for the NY session. Return the JSON object only.`;
 }
 
 // ============ v17.6 TLBR OPUS ANALYSIS ============
-// Sends 96x5m candles (8 hours) + current price to Claude Opus 4.7. Opus returns a
-// structured JSON with trendline, breakout confirmation, retest zone, and FVG.
-// Response is parsed into TlbrPendingSetup. Called every 60 min on weekdays by the
-// main scan cycle when tlbrState has no pendingSetup.
+// Two modes:
+//   DISCOVERY: send 96x5m candles, ask Opus to find a qualified descending trendline
+//              with >=3 rejections + >=5h span + breakout in last 15min
+//   WATCH:     send last 12x5m candles + trendline context, ask Opus whether to
+//              (a) ENTER at market (retest already formed), (b) PLACE_LIMIT at
+//              projected trendline (price within 0.2%), or (c) KEEP_WATCHING
 
-interface TlbrAnalysisResult {
-  setup: TlbrPendingSetup | null;
+interface TlbrDiscoveryResult {
+  setup: TlbrSetup | null;
   raw: string;
   confidence: number;
   reasoning: string;
 }
 
-async function fetchTlbrAnalysis(apiKey: string, candles5m: OHLCVCandle[], currentPrice: number): Promise<TlbrAnalysisResult> {
+async function fetchTlbrDiscovery(apiKey: string, candles5m: OHLCVCandle[], currentPrice: number): Promise<TlbrDiscoveryResult> {
   // Build a compact OHLCV table for Opus. Use last 96 candles (8h of 5m data).
   const slice = candles5m.slice(-96);
   const now = Date.now();
@@ -380,20 +403,19 @@ async function fetchTlbrAnalysis(apiKey: string, candles5m: OHLCVCandle[], curre
 YOUR JOB: Given 96 candles of BTC 5m OHLCV data, identify a VALID descending-trendline breakout that has broken UP through a descending resistance line, and project where the retest should occur.
 
 === A VALID SETUP REQUIRES ALL OF ===
-1. QUALIFIED DESCENDING TRENDLINE (STRICT): at least 3 distinct swing-high rejections where price touched or pierced the trendline and then sold off. Each subsequent rejection must occur at a LOWER price than the prior. The trendline must span AT LEAST 3 HOURS (36+ candles) and ideally 4–5 hours between the first and last rejection. A trendline drawn on only 2 touches or spanning less than 3 hours is NOT valid — return setup=null.
-2. BREAKOUT: at least one 5m candle closed ABOVE the extended trendline, with the close > trendline value at that time by at least 0.10%. Must have occurred within the last 20 candles (last 100 min).
-3. RETEST PROJECTION: after the breakout, project where the extended trendline line now sits. The retest zone is that price ± 0.2%. The retest level must be BELOW current price (so price has to pull back to retest).
-4. FVG (Fair Value Gap) CONFLUENCE (optional but preferred): look for a bullish FVG (gap where candle N+1 low > candle N-1 high) within 0.5% of the retest level. If found, report its low/high.
+1. QUALIFIED DESCENDING TRENDLINE (STRICT): at least 3 distinct swing-high rejections where price touched or pierced the trendline and then sold off. Each subsequent rejection must occur at a LOWER price than the prior. The trendline must span AT LEAST 5 HOURS (60+ candles) between the first and last rejection. A trendline drawn on only 2 touches or spanning less than 5 hours is NOT valid — return setup=null.
+2. BREAKOUT JUST HAPPENED: at least one 5m candle closed ABOVE the extended trendline, with close > trendline value by at least 0.10%. The breakout MUST have occurred within the last 3 candles (last 15 minutes). If the breakout is older than 15 minutes, return setup=null — the retest window has already passed.
+3. PROJECTED RETEST: compute where the extended trendline now sits at the current moment. This is the price level price should pull back to for a retest.
 
 === REPORT TRENDLINE QUALITY ===
-Return "touches" = number of distinct rejections (must be ≥3). Return "durationHours" = hours between first and last rejection (must be ≥3.0).
+Return "touches" = number of distinct rejections (must be ≥3). Return "durationHours" = hours between first and last rejection (must be ≥5.0). Return "breakoutAt" = ms timestamp of the breakout candle close (must be within last 15min).
 
 === HARD RULES ===
 - LONG-ONLY (we only trade descending-trendline breakouts = bullish reversal).
 - If no valid setup exists, return setup=null. DO NOT force a setup.
-- Confidence: 1-4 weak (no setup), 5-6 marginal (report setup but mark low conf), 7-8 strong (textbook setup), 9-10 very strong (multi-touch trendline + FVG + volume expansion on breakout).
+- Confidence: 1-4 weak (no setup), 5-6 marginal (report setup but mark low conf), 7-8 strong (textbook setup), 9-10 very strong (multi-touch trendline + volume expansion on breakout).
 - We will only enter setups with confidence ≥ 7.
-- Retest level must be between (currentPrice * 0.985) and currentPrice. If the projected retest is above current price or more than 1.5% below, return setup=null (too stale).
+- Projected retest must be between (currentPrice * 0.99) and currentPrice. If the projected retest is above current price or more than 1% below, return setup=null.
 
 === OUTPUT ===
 RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no code fences):
@@ -401,10 +423,10 @@ RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no code fences):
   "setup": {
     "trendline": { "p1": { "t": <ms_timestamp>, "price": <number> }, "p2": { "t": <ms_timestamp>, "price": <number> } },
     "touches": <integer ≥3>,
-    "durationHours": <number ≥3.0>,
+    "durationHours": <number ≥5.0>,
     "breakoutPrice": <number>,
-    "retestLevel": <number>,
-    "fvg": { "low": <number>, "high": <number> } | null
+    "breakoutAt": <ms_timestamp>,
+    "projectedRetest": <number>
   } | null,
   "confidence": 1-10,
   "reasoning": "2-4 sentences explaining what you see, or why no setup"
@@ -457,30 +479,36 @@ Analyze the chart for a descending-trendline breakout + retest setup. Return the
     const reasoning = String(parsed.reasoning || "").slice(0, 600);
 
     // Validate setup structure
-    if (!parsed.setup || !parsed.setup.trendline || !parsed.setup.retestLevel) {
-      log(`[TLBR] No setup found (conf=${confidence}): ${reasoning.slice(0, 150)}`, "engine");
+    if (!parsed.setup || !parsed.setup.trendline || !parsed.setup.projectedRetest) {
+      log(`[TLBR DISCOVERY] No setup (conf=${confidence}): ${reasoning.slice(0, 150)}`, "engine");
       return { setup: null, raw: text.slice(0, 1000), confidence, reasoning };
     }
     const tl = parsed.setup.trendline;
-    const retestLevel = Number(parsed.setup.retestLevel);
+    const projectedRetest = Number(parsed.setup.projectedRetest);
     const breakoutPrice = Number(parsed.setup.breakoutPrice) || currentPrice;
-    if (!tl.p1 || !tl.p2 || !Number.isFinite(retestLevel) || retestLevel <= 0) {
-      log(`[TLBR] Malformed setup — rejecting. reasoning=${reasoning.slice(0, 120)}`, "engine");
+    const breakoutAt = Number(parsed.setup.breakoutAt) || 0;
+    if (!tl.p1 || !tl.p2 || !Number.isFinite(projectedRetest) || projectedRetest <= 0) {
+      log(`[TLBR DISCOVERY] Malformed setup — rejecting`, "engine");
       return { setup: null, raw: text.slice(0, 1000), confidence, reasoning };
     }
 
-    // Sanity: retest must be below current price and within 1.5%
-    const minRetest = currentPrice * 0.985;
-    if (retestLevel >= currentPrice || retestLevel < minRetest) {
-      log(`[TLBR] Retest level $${retestLevel.toFixed(2)} out of band (current $${currentPrice.toFixed(2)}, min $${minRetest.toFixed(2)}) — rejecting`, "engine");
+    // Retest must be below current price and within 1%
+    const minRetest = currentPrice * 0.99;
+    if (projectedRetest >= currentPrice || projectedRetest < minRetest) {
+      log(`[TLBR DISCOVERY] Retest $${projectedRetest.toFixed(2)} out of band (current $${currentPrice.toFixed(2)}) — rejecting`, "engine");
       return { setup: null, raw: text.slice(0, 1000), confidence, reasoning };
     }
 
-    // Quality gate: enforce ≥3 touches and ≥3h duration (code-level double-check)
+    // Quality gate: ≥3 touches, ≥5h duration, breakout ≤15min old
     const touches = Number(parsed.setup.touches) || 0;
     const durationHours = Number(parsed.setup.durationHours) || 0;
-    if (touches < 3 || durationHours < 3.0) {
-      log(`[TLBR] Trendline quality insufficient — touches=${touches} (need ≥3), durationHours=${durationHours.toFixed(1)} (need ≥3.0) — rejecting`, "engine");
+    if (touches < 3 || durationHours < 5.0) {
+      log(`[TLBR DISCOVERY] Quality insufficient — touches=${touches} (need ≥3), dur=${durationHours.toFixed(1)}h (need ≥5) — rejecting`, "engine");
+      return { setup: null, raw: text.slice(0, 1000), confidence, reasoning };
+    }
+    const breakoutAge = now - breakoutAt;
+    if (breakoutAt <= 0 || breakoutAge > 15 * 60 * 1000 || breakoutAge < -60 * 1000) {
+      log(`[TLBR DISCOVERY] Breakout age ${(breakoutAge / 60000).toFixed(1)}min out of bounds (need ≤15min old) — rejecting`, "engine");
       return { setup: null, raw: text.slice(0, 1000), confidence, reasoning };
     }
 
@@ -489,26 +517,124 @@ Analyze the chart for a descending-trendline breakout + retest setup. Return the
       p2: { t: Number(tl.p2.t), price: Number(tl.p2.price) },
       slope: (Number(tl.p2.price) - Number(tl.p1.price)) / Math.max(1, (Number(tl.p2.t) - Number(tl.p1.t))),
     };
-    const fvg: TlbrFvg | null = parsed.setup.fvg && typeof parsed.setup.fvg.low === "number" && typeof parsed.setup.fvg.high === "number"
-      ? { low: Number(parsed.setup.fvg.low), high: Number(parsed.setup.fvg.high) }
-      : null;
 
-    const setup: TlbrPendingSetup = {
+    const setup: TlbrSetup = {
       trendline,
+      touches,
+      durationHours,
       breakoutPrice,
-      retestLevel,
-      retestZoneLow: retestLevel * 0.998,
-      retestZoneHigh: retestLevel * 1.002,
-      fvg,
+      breakoutAt,
+      projectedRetest,
       confidence,
       reasoning,
       discoveredAt: now,
     };
-    log(`[TLBR] Setup found: retest $${retestLevel.toFixed(2)} (zone $${setup.retestZoneLow.toFixed(2)}-$${setup.retestZoneHigh.toFixed(2)}) | touches=${touches} dur=${durationHours.toFixed(1)}h | FVG ${fvg ? `[${fvg.low.toFixed(0)}-${fvg.high.toFixed(0)}]` : "none"} | conf ${confidence}/10`, "engine");
+    log(`[TLBR DISCOVERY] Setup: retest $${projectedRetest.toFixed(2)} | touches=${touches} dur=${durationHours.toFixed(1)}h | breakout ${(breakoutAge / 60000).toFixed(1)}min ago @ $${breakoutPrice.toFixed(2)} | conf ${confidence}/10`, "engine");
     return { setup, raw: text.slice(0, 1000), confidence, reasoning };
   } catch (e) {
-    log(`[TLBR] Analysis error: ${e}`, "engine");
+    log(`[TLBR DISCOVERY] Error: ${e}`, "engine");
     return { setup: null, raw: "", confidence: 0, reasoning: `Error: ${e}` };
+  }
+}
+
+// ============ TLBR WATCH-MODE OPUS (1-min cadence after breakout) ============
+// Sends last 12x5m candles + setup context. Opus decides:
+//   "enter"         — retest already formed (wick touched trendline + bullish reaction)
+//   "place_limit"   — price within 0.2% of trendline but no wick yet; place limit & stop watching
+//   "keep_watching" — price still too far from trendline; try again in 1 min
+//   "abort"         — trendline invalidated (price broke below by >0.5%)
+
+interface TlbrWatchDecision {
+  action: "enter" | "place_limit" | "keep_watching" | "abort";
+  updatedProjectedRetest: number;   // recomputed trendline level at current moment
+  reasoning: string;
+}
+
+async function fetchTlbrWatchDecision(apiKey: string, setup: TlbrSetup, candles5m: OHLCVCandle[], currentPrice: number): Promise<TlbrWatchDecision> {
+  const slice = candles5m.slice(-12);
+  const now = Date.now();
+  const intervalMs = 5 * 60 * 1000;
+  const baseTs = now - slice.length * intervalMs;
+  const candleRows = slice.map((c, i) => {
+    const t = baseTs + i * intervalMs;
+    return `${i},${t},${c.open.toFixed(1)},${c.high.toFixed(1)},${c.low.toFixed(1)},${c.close.toFixed(1)}`;
+  }).join("\n");
+
+  const systemPrompt = `You are monitoring a qualified descending-trendline breakout on BTC 5m for a retest entry. A breakout has already occurred. Your job is to decide whether RIGHT NOW is the moment to enter, whether to set a resting limit order at the trendline, or whether to keep watching.
+
+=== CONTEXT ===
+Breakout confirmed at $${setup.breakoutPrice.toFixed(2)} (${((now - setup.breakoutAt) / 60000).toFixed(1)} min ago).
+Trendline anchors: p1 ($${setup.trendline.p1.price.toFixed(2)}), p2 ($${setup.trendline.p2.price.toFixed(2)}).
+Your original projected retest level: $${setup.projectedRetest.toFixed(2)}.
+Current price: $${currentPrice.toFixed(2)}.
+
+=== DECISION LOGIC ===
+First, recompute where the trendline now sits at the current moment (extrapolate from p1→p2 using the slope). Report this as updatedProjectedRetest.
+
+Then choose ONE action:
+- "enter": a clean retest has JUST formed — price wicked down to within 0.1% of the trendline and is now bouncing (current 5m candle showing a lower wick + bullish recovery OR a bullish engulfing off the line). Enter at market NOW.
+- "place_limit": price is within 0.5% ABOVE the trendline but no wick yet. Place a resting limit so we catch the retest passively. We will cancel it if unfilled in 15 min.
+- "keep_watching": price is still >0.5% above the trendline — too far for action. Check again in 1 min.
+- "abort": price has broken DOWN through the trendline by more than 0.5% OR momentum has clearly flipped (strong bearish engulfing, break of recent low with volume). Trendline invalidated.
+
+=== OUTPUT ===
+RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no code fences):
+{
+  "action": "enter" | "place_limit" | "keep_watching" | "abort",
+  "updatedProjectedRetest": <number>,
+  "reasoning": "1-2 sentences"
+}`;
+
+  const userPrompt = `CURRENT TIME (ms): ${now}
+
+Last 12 candles (5m): idx,timestamp_ms,open,high,low,close
+${candleRows}
+
+Decide the action. Return JSON only.`;
+
+  try {
+    const res = await fetch(PPLX_ENDPOINT, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OPUS_MODEL,
+        input: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        max_output_tokens: 400,
+      }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      log(`[TLBR WATCH] API error: ${res.status} ${errText.slice(0, 300)}`, "engine");
+      return { action: "keep_watching", updatedProjectedRetest: setup.projectedRetest, reasoning: `API error: ${res.status}` };
+    }
+    const data: any = await res.json();
+    let text = "";
+    if (data.output && Array.isArray(data.output)) {
+      for (const block of data.output) {
+        if (block.type === "message" && block.content) {
+          for (const c of block.content) {
+            if (c.type === "output_text") text = c.text;
+          }
+        }
+      }
+    }
+    if (!text && data.output_text) text = data.output_text;
+    if (!text) return { action: "keep_watching", updatedProjectedRetest: setup.projectedRetest, reasoning: "No output" };
+
+    let jsonStr = text.trim();
+    if (jsonStr.startsWith("```")) jsonStr = jsonStr.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
+    const parsed = JSON.parse(jsonStr);
+    const action = ["enter", "place_limit", "keep_watching", "abort"].includes(parsed.action) ? parsed.action : "keep_watching";
+    const updatedProjectedRetest = Number(parsed.updatedProjectedRetest) || setup.projectedRetest;
+    const reasoning = String(parsed.reasoning || "").slice(0, 300);
+    log(`[TLBR WATCH] Opus: ${action.toUpperCase()} | trendline now $${updatedProjectedRetest.toFixed(2)} | ${reasoning.slice(0, 120)}`, "engine");
+    return { action, updatedProjectedRetest, reasoning };
+  } catch (e) {
+    log(`[TLBR WATCH] Error: ${e}`, "engine");
+    return { action: "keep_watching", updatedProjectedRetest: setup.projectedRetest, reasoning: `Error: ${e}` };
   }
 }
 
@@ -910,15 +1036,21 @@ class TradingEngine {
       if (raw && typeof raw === "string") {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.disabled === "boolean") {
+          const validModes: TlbrMode[] = ["discovery", "watching_retest", "limit_resting", "in_trade"];
+          const mode: TlbrMode = validModes.includes(parsed.mode) ? parsed.mode : "discovery";
           this.tlbrState = {
+            mode,
             disabled: !!parsed.disabled,
             cumulativePnlUsd: Number(parsed.cumulativePnlUsd) || 0,
-            lastOpusCallAt: Number(parsed.lastOpusCallAt) || 0,
-            pendingSetup: parsed.pendingSetup || null,
+            lastDiscoveryAt: Number(parsed.lastDiscoveryAt) || 0,
+            lastWatchAt: Number(parsed.lastWatchAt) || 0,
+            watchAttempts: Number(parsed.watchAttempts) || 0,
+            setup: parsed.setup || null,
+            limitOrder: parsed.limitOrder || null,
             consumedTrendlineIds: Array.isArray(parsed.consumedTrendlineIds) ? parsed.consumedTrendlineIds : [],
             openTradeId: typeof parsed.openTradeId === "number" ? parsed.openTradeId : null,
           };
-          log(`[TLBR] State restored: disabled=${this.tlbrState.disabled} cumPnl=$${this.tlbrState.cumulativePnlUsd.toFixed(2)} pending=${this.tlbrState.pendingSetup ? "yes" : "no"}`, "engine");
+          log(`[TLBR] State restored: mode=${this.tlbrState.mode} disabled=${this.tlbrState.disabled} cumPnl=$${this.tlbrState.cumulativePnlUsd.toFixed(2)} setup=${this.tlbrState.setup ? "yes" : "no"} limit=${this.tlbrState.limitOrder ? "yes" : "no"}`, "engine");
         }
       }
     } catch (e) { log(`[TLBR] loadState error: ${e}`, "engine"); }
@@ -1011,10 +1143,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v17.6 started | SESSION (BTC NY 08:30–15:30 ET, 80% AUM, 20x, TP1/TP2 split, BE+, technicals-first) + TLBR (BTC trendline breakout/retest, $${TLBR_MARGIN_USD} margin × ${TLBR_LEVERAGE}x, TP+${(TLBR_TP_PCT*100).toFixed(2)}%/SL-${(TLBR_SL_PCT*100).toFixed(2)}%, Opus every ${TLBR_OPUS_INTERVAL_MIN}min weekdays, kill $${TLBR_KILL_SWITCH_USD}) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v17.6 started | SESSION (BTC NY 08:30–15:30 ET, 80% AUM, 20x, TP1/TP2 split, BE+, technicals-first) + TLBR (BTC trendline breakout/retest, $${TLBR_MARGIN_USD} margin × ${TLBR_LEVERAGE}x, TP+${(TLBR_TP_PCT*100).toFixed(2)}%/SL-${(TLBR_SL_PCT*100).toFixed(2)}%, discovery ${TLBR_DISCOVERY_INTERVAL_MIN}min weekdays + ${TLBR_WATCH_INTERVAL_MIN}min post-breakout watch, kill $${TLBR_KILL_SWITCH_USD}) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v17.6 started | SESSION (NY 08:30–15:30 ET retry-loop) + TLBR (Opus ${TLBR_OPUS_INTERVAL_MIN}min weekdays, $${TLBR_MARGIN_USD}×${TLBR_LEVERAGE}x, TP+${(TLBR_TP_PCT*100).toFixed(2)}%/SL-${(TLBR_SL_PCT*100).toFixed(2)}%, kill $${TLBR_KILL_SWITCH_USD}) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v17.6 started | SESSION (NY 08:30–15:30 ET retry-loop) + TLBR (discovery ${TLBR_DISCOVERY_INTERVAL_MIN}min + watch ${TLBR_WATCH_INTERVAL_MIN}min max ${TLBR_WATCH_MAX_ATTEMPTS} weekdays, $${TLBR_MARGIN_USD}×${TLBR_LEVERAGE}x, TP+${(TLBR_TP_PCT*100).toFixed(2)}%/SL-${(TLBR_SL_PCT*100).toFixed(2)}%, kill $${TLBR_KILL_SWITCH_USD}) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleNextSessionTick();
   }
@@ -1345,10 +1477,11 @@ class TradingEngine {
   }
 
   // ============ v17.6 TLBR TICK (runs every 5s from main scan cycle) ============
-  // Two modes:
-  //   DISCOVERY — no pendingSetup, weekday, ≥60min since last call → fetch Opus analysis
-  //   WATCH — pendingSetup exists → check if price in retestZone + FVG → execute LONG
-  //   EXPIRE — pendingSetup older than 4h, price >1% below retest, or trendline consumed → clear
+  // State machine:
+  //   discovery        — weekdays only, every 60min call Opus to find qualified trendline + breakout
+  //   watching_retest  — every 1min for max 15 attempts call Opus to decide enter / place_limit / keep / abort
+  //   limit_resting    — monitor HL for fill; cancel after 15min unfilled
+  //   in_trade         — do nothing (checkExits handles close; onTlbrTradeClosed resets to discovery)
 
   private async runTlbrTick(equity: number, config: any) {
     try {
@@ -1362,55 +1495,191 @@ class TradingEngine {
         return;
       }
 
-      // If TLBR already has an open trade — do nothing (max 1 position)
-      if (this.tlbrState.openTradeId !== null) {
-        const openTrade = (await storage.getOpenTrades()).find(t => t.id === this.tlbrState.openTradeId);
-        if (!openTrade) {
-          // Trade got closed elsewhere — clear reference (P&L accounted by onTlbrTradeClosed hook)
-          this.tlbrState.openTradeId = null;
-          await this.saveTlbrState();
-        } else {
-          return; // active trade, skip everything
-        }
-      }
-
+      const now = Date.now();
       const mids = await fetchAllMids();
       const currentPrice = parseFloat(mids["BTC"] || "0");
       if (!currentPrice || currentPrice <= 0) return;
 
-      // === WATCH MODE: check existing pendingSetup for fill ===
-      if (this.tlbrState.pendingSetup) {
-        const s = this.tlbrState.pendingSetup;
-        const age = Date.now() - s.discoveredAt;
+      // ===== IN_TRADE: reconcile, then idle =====
+      if (this.tlbrState.mode === "in_trade") {
+        if (this.tlbrState.openTradeId !== null) {
+          const openTrade = (await storage.getOpenTrades()).find(t => t.id === this.tlbrState.openTradeId);
+          if (!openTrade) {
+            // Trade closed elsewhere — onTlbrTradeClosed should have reset; defensively reset now
+            this.tlbrState.mode = "discovery";
+            this.tlbrState.openTradeId = null;
+            this.tlbrState.setup = null;
+            this.tlbrState.limitOrder = null;
+            this.tlbrState.watchAttempts = 0;
+            await this.saveTlbrState();
+          }
+        } else {
+          // Inconsistent state — reset to discovery
+          this.tlbrState.mode = "discovery";
+          await this.saveTlbrState();
+        }
+        return;
+      }
 
-        // Expire 15-min old setup (user rule: cancel if unfilled within 15min)
-        if (age > TLBR_SETUP_MAX_AGE_MS) {
-          log(`[TLBR] Setup expired (age ${(age / 60000).toFixed(1)}min > 15min) — clearing pendingSetup, returning to discovery`, "engine");
-          this.tlbrState.pendingSetup = null;
+      // ===== LIMIT_RESTING: poll HL for fill; cancel after 15min =====
+      if (this.tlbrState.mode === "limit_resting") {
+        const lim = this.tlbrState.limitOrder;
+        const setup = this.tlbrState.setup;
+        if (!lim || !setup) {
+          // Invalid state — reset to discovery
+          log(`[TLBR] limit_resting with missing limitOrder/setup — resetting to discovery`, "engine");
+          this.tlbrState.mode = "discovery";
+          this.tlbrState.limitOrder = null;
+          this.tlbrState.setup = null;
           await this.saveTlbrState();
           return;
         }
 
-        // Invalidate if price has blown >1% below retest level (trendline broken)
-        if (currentPrice < s.retestLevel * (1 - TLBR_INVALIDATE_DISTANCE_PCT)) {
-          log(`[TLBR] Trendline invalidated — price $${currentPrice.toFixed(2)} < retest $${s.retestLevel.toFixed(2)} by >1% — consuming & clearing`, "engine");
-          this.tlbrState.consumedTrendlineIds.push(tlbrTrendlineId(s.trendline));
-          this.tlbrState.pendingSetup = null;
+        // Check if trade appeared (our side auto-detects fill via openTradeId path below)
+        const openTrades = await storage.getOpenTrades();
+        const existing = openTrades.find(t => t.strategy === "tlbr");
+        if (existing) {
+          // Filled — but executeEntry was not used. Instead the resting limit filled on HL directly.
+          // We need to place TP/SL and record the trade in DB.
+          // NOTE: since we placed the raw limit via executor, no trade row exists yet. Handled below via HL state check.
+        }
+
+        // Poll HL directly for the resting order status via positions
+        let filled = false;
+        let fillPx: number | null = null;
+        let fillSz: number | null = null;
+        if (config.apiSecret && config.walletAddress) {
+          try {
+            const executor = createExecutor(config.apiSecret, config.walletAddress);
+            const positions = await executor.getPositions();
+            const btcPos = positions?.find((p: any) => (p?.position?.coin === "BTC") && parseFloat(p?.position?.szi || "0") > 0);
+            if (btcPos) {
+              // Check if existing DB trade already captures this (from another strategy opening BTC long)
+              // If no open BTC trade in DB with strategy=tlbr, this position is our fill
+              const dbTlbr = openTrades.find(t => t.coin === "BTC" && t.strategy === "tlbr");
+              if (!dbTlbr) {
+                filled = true;
+                fillPx = parseFloat(btcPos.position.entryPx || String(lim.price));
+                fillSz = parseFloat(btcPos.position.szi);
+              }
+            }
+          } catch (e) {
+            log(`[TLBR] limit_resting position poll error: ${e}`, "engine");
+          }
+        }
+
+        if (filled && fillPx && fillSz) {
+          log(`[TLBR] LIMIT FILLED @ $${fillPx.toFixed(2)} sz=${fillSz} — placing TP+SL and recording trade`, "engine");
+          await this.recordTlbrLimitFill(fillPx, fillSz, lim, setup, equity, config);
+          this.tlbrState.mode = "in_trade";
+          this.tlbrState.limitOrder = null;
           await this.saveTlbrState();
           return;
         }
 
-        // Entry condition: price inside retestZone + (FVG confluence if provided)
-        const inRetestZone = currentPrice >= s.retestZoneLow && currentPrice <= s.retestZoneHigh;
-        const inFvg = !s.fvg ? true : (currentPrice >= s.fvg.low && currentPrice <= s.fvg.high);
-        if (inRetestZone && inFvg && s.confidence >= 7) {
-          // Execute LONG — $100 margin × 20x, TP +0.35%, SL -0.30%
+        // Cancel if 15min elapsed without fill
+        const age = now - lim.placedAt;
+        if (age > TLBR_LIMIT_LIFETIME_MS) {
+          log(`[TLBR] Limit order expired (age ${(age / 60000).toFixed(1)}min > 15min) — cancelling oid=${lim.hlOid} and returning to discovery`, "engine");
+          if (lim.hlOid && config.apiSecret && config.walletAddress) {
+            try {
+              const executor = createExecutor(config.apiSecret, config.walletAddress);
+              await executor.cancelOrder("BTC", lim.hlOid);
+              log(`[TLBR] Cancelled resting limit oid=${lim.hlOid}`, "engine");
+            } catch (e) {
+              log(`[TLBR] cancelOrder error oid=${lim.hlOid}: ${e}`, "engine");
+            }
+          }
+          await storage.createLog({ type: "tlbr_limit_cancel", message: `TLBR limit cancelled (15min unfilled) @ $${lim.price.toFixed(2)}`, timestamp: new Date().toISOString() });
+          // Consume this trendline — one shot rule
+          if (setup) this.tlbrState.consumedTrendlineIds.push(tlbrTrendlineId(setup.trendline));
+          this.tlbrState.mode = "discovery";
+          this.tlbrState.setup = null;
+          this.tlbrState.limitOrder = null;
+          this.tlbrState.watchAttempts = 0;
+          await this.saveTlbrState();
+        }
+        return;
+      }
+
+      // ===== WATCHING_RETEST: 1-min Opus cadence =====
+      if (this.tlbrState.mode === "watching_retest") {
+        const setup = this.tlbrState.setup;
+        if (!setup) {
+          this.tlbrState.mode = "discovery";
+          this.tlbrState.watchAttempts = 0;
+          await this.saveTlbrState();
+          return;
+        }
+
+        // Hard invalidation: price crashed >1% below trendline
+        if (currentPrice < setup.projectedRetest * (1 - TLBR_INVALIDATE_DISTANCE_PCT)) {
+          log(`[TLBR] Trendline invalidated during watch — price $${currentPrice.toFixed(2)} < projected $${setup.projectedRetest.toFixed(2)} by >1% — consuming`, "engine");
+          this.tlbrState.consumedTrendlineIds.push(tlbrTrendlineId(setup.trendline));
+          this.tlbrState.setup = null;
+          this.tlbrState.mode = "discovery";
+          this.tlbrState.watchAttempts = 0;
+          await this.saveTlbrState();
+          return;
+        }
+
+        // Max attempts reached
+        if (this.tlbrState.watchAttempts >= TLBR_WATCH_MAX_ATTEMPTS) {
+          log(`[TLBR] Watch max attempts (${TLBR_WATCH_MAX_ATTEMPTS}) reached — consuming trendline, returning to discovery`, "engine");
+          this.tlbrState.consumedTrendlineIds.push(tlbrTrendlineId(setup.trendline));
+          this.tlbrState.setup = null;
+          this.tlbrState.mode = "discovery";
+          this.tlbrState.watchAttempts = 0;
+          await this.saveTlbrState();
+          return;
+        }
+
+        // Throttle to 1-min cadence
+        const sinceLastWatch = now - this.tlbrState.lastWatchAt;
+        if (sinceLastWatch < TLBR_WATCH_INTERVAL_MIN * 60 * 1000) return;
+
+        const pplxKey = config.perplexityApiKey;
+        if (!pplxKey) {
+          this.tlbrState.lastWatchAt = now;
+          await this.saveTlbrState();
+          return;
+        }
+
+        this.tlbrState.lastWatchAt = now;
+        this.tlbrState.watchAttempts += 1;
+        await this.saveTlbrState();
+
+        const candles5m = await fetchCandlesOHLCV("BTC", "5m", 20);
+        if (candles5m.length < 12) return;
+
+        const decision = await fetchTlbrWatchDecision(pplxKey, setup, candles5m, currentPrice);
+        setup.projectedRetest = decision.updatedProjectedRetest;
+
+        if (decision.action === "abort") {
+          log(`[TLBR] Opus ABORT — ${decision.reasoning.slice(0, 120)}`, "engine");
+          this.tlbrState.consumedTrendlineIds.push(tlbrTrendlineId(setup.trendline));
+          this.tlbrState.setup = null;
+          this.tlbrState.mode = "discovery";
+          this.tlbrState.watchAttempts = 0;
+          await this.saveTlbrState();
+          await storage.createLog({ type: "tlbr_abort", message: `TLBR aborted by Opus: ${decision.reasoning.slice(0, 200)}`, timestamp: new Date().toISOString() });
+          return;
+        }
+
+        if (decision.action === "keep_watching") {
+          log(`[TLBR] Opus KEEP_WATCHING — attempt ${this.tlbrState.watchAttempts}/${TLBR_WATCH_MAX_ATTEMPTS} | price $${currentPrice.toFixed(2)} vs trendline $${decision.updatedProjectedRetest.toFixed(2)}`, "engine");
+          await this.saveTlbrState();
+          return;
+        }
+
+        if (decision.action === "enter") {
+          // Market LONG now
           const equityPctForTlbr = Math.min(1.0, TLBR_MARGIN_USD / Math.max(1, equity));
-          const entryReason = `TLBR retest @ $${s.retestLevel.toFixed(2)} | conf ${s.confidence}/10 | ${s.fvg ? "FVG confirmed" : "no FVG"} | ${s.reasoning.slice(0, 120)}`;
-          log(`[TLBR] EXECUTING LONG — price $${currentPrice.toFixed(2)} in zone [$${s.retestZoneLow.toFixed(2)}-$${s.retestZoneHigh.toFixed(2)}] — ${entryReason}`, "engine");
+          const entryReason = `TLBR retest ENTER @ $${currentPrice.toFixed(2)} | trendline $${decision.updatedProjectedRetest.toFixed(2)} | conf ${setup.confidence}/10 | ${decision.reasoning.slice(0, 120)}`;
+          log(`[TLBR] EXECUTING MARKET LONG — ${entryReason}`, "engine");
 
-          // Mark trendline consumed BEFORE execute to prevent race on failed-entry retry
-          this.tlbrState.consumedTrendlineIds.push(tlbrTrendlineId(s.trendline));
+          // Consume trendline BEFORE executing (one shot rule)
+          this.tlbrState.consumedTrendlineIds.push(tlbrTrendlineId(setup.trendline));
 
           const entered = await this.executeEntry({
             asset: BTC_ASSET,
@@ -1427,35 +1696,128 @@ class TradingEngine {
           });
 
           if (entered) {
-            // Find the trade just created
             const openTrades = await storage.getOpenTrades();
             const tlbrOpen = openTrades.find(t => t.strategy === "tlbr");
-            if (tlbrOpen) {
-              this.tlbrState.openTradeId = tlbrOpen.id;
-            }
+            if (tlbrOpen) this.tlbrState.openTradeId = tlbrOpen.id;
+            this.tlbrState.mode = "in_trade";
+          } else {
+            this.tlbrState.mode = "discovery";
           }
-          // Regardless of entered=true/false, clear pendingSetup (one shot per setup rule)
-          this.tlbrState.pendingSetup = null;
+          this.tlbrState.setup = null;
+          this.tlbrState.limitOrder = null;
+          this.tlbrState.watchAttempts = 0;
           await this.saveTlbrState();
+          return;
+        }
+
+        if (decision.action === "place_limit") {
+          // Place resting limit at midpoint = trendline + 0.1%
+          const limitPrice = decision.updatedProjectedRetest * 1.001;
+          const equityPctForTlbr = Math.min(1.0, TLBR_MARGIN_USD / Math.max(1, equity));
+          const capitalForTrade = equity * equityPctForTlbr;
+          const notionalSize = capitalForTrade * TLBR_LEVERAGE;
+          const assetSize = notionalSize / limitPrice;
+
+          if (!config.apiSecret || !config.walletAddress) {
+            log(`[TLBR] place_limit requested but no wallet config — aborting`, "engine");
+            this.tlbrState.mode = "discovery";
+            this.tlbrState.setup = null;
+            this.tlbrState.watchAttempts = 0;
+            await this.saveTlbrState();
+            return;
+          }
+
+          try {
+            const executor = createExecutor(config.apiSecret, config.walletAddress);
+            await executor.setLeverage("BTC", TLBR_LEVERAGE, true);
+            const roundedSize = parseFloat(formatHLSize(assetSize, BTC_ASSET.szDecimals));
+            const roundedPx = parseFloat(formatHLPrice(limitPrice, BTC_ASSET.szDecimals));
+            if (roundedSize <= 0) {
+              log(`[TLBR] place_limit: rounded size 0 — aborting`, "engine");
+              this.tlbrState.mode = "discovery";
+              this.tlbrState.setup = null;
+              this.tlbrState.watchAttempts = 0;
+              await this.saveTlbrState();
+              return;
+            }
+            const result = await executor.placeOrder({
+              coin: "BTC", isBuy: true, sz: roundedSize,
+              limitPx: roundedPx,
+              orderType: { limit: { tif: "Gtc" } },
+              reduceOnly: false,
+            });
+            log(`[TLBR HL RAW] limit response: ${JSON.stringify(result).slice(0, 400)}`, "engine");
+            const status = result?.response?.data?.statuses?.[0];
+            const errorMsg = status?.error || result?.response?.data?.error || (result?.status !== "ok" ? JSON.stringify(result) : undefined);
+            if (errorMsg) {
+              log(`[TLBR] place_limit REJECTED: ${errorMsg}`, "engine");
+              this.tlbrState.mode = "discovery";
+              this.tlbrState.setup = null;
+              this.tlbrState.watchAttempts = 0;
+              await this.saveTlbrState();
+              return;
+            }
+            const restingOid = status?.resting?.oid;
+            const immediateFillPx = status?.filled?.avgPx ? parseFloat(status.filled.avgPx) : null;
+            const immediateFillSz = status?.filled?.totalSz ? parseFloat(status.filled.totalSz) : null;
+
+            if (immediateFillPx && immediateFillSz && immediateFillSz > 0) {
+              // Filled immediately (rare; limit crossed spread) — treat as market fill
+              log(`[TLBR] Limit filled immediately @ $${immediateFillPx.toFixed(2)} sz=${immediateFillSz}`, "engine");
+              const lim: TlbrLimitOrder = { price: roundedPx, placedAt: now };
+              await this.recordTlbrLimitFill(immediateFillPx, immediateFillSz, lim, setup, equity, config);
+              this.tlbrState.mode = "in_trade";
+              this.tlbrState.limitOrder = null;
+              this.tlbrState.setup = null;
+              this.tlbrState.watchAttempts = 0;
+              await this.saveTlbrState();
+              return;
+            }
+
+            this.tlbrState.limitOrder = { price: roundedPx, placedAt: now, hlOid: typeof restingOid === "number" ? restingOid : undefined };
+            this.tlbrState.mode = "limit_resting";
+            this.tlbrState.watchAttempts = 0;
+            await this.saveTlbrState();
+            log(`[TLBR] LIMIT RESTING @ $${roundedPx} sz=${roundedSize} oid=${restingOid} | 15min TTL`, "engine");
+            await storage.createLog({ type: "tlbr_limit_placed", message: `TLBR limit @ $${roundedPx.toFixed(2)} (trendline+0.1%) oid=${restingOid}`, timestamp: new Date().toISOString() });
+          } catch (e) {
+            log(`[TLBR] place_limit error: ${e}`, "engine");
+            this.tlbrState.mode = "discovery";
+            this.tlbrState.setup = null;
+            this.tlbrState.watchAttempts = 0;
+            await this.saveTlbrState();
+          }
+          return;
         }
         return;
       }
 
-      // === DISCOVERY MODE: no pendingSetup, check 60-min gate ===
-      if (!isWeekdayET()) return;  // weekdays only
-      const now = Date.now();
-      const sinceLast = now - this.tlbrState.lastOpusCallAt;
-      const intervalMs = TLBR_OPUS_INTERVAL_MIN * 60 * 1000;
-      if (sinceLast < intervalMs) return;
+      // ===== DISCOVERY: weekdays only, 60-min gate =====
+      if (this.tlbrState.mode !== "discovery") return;
+      if (!isWeekdayET()) return;
 
-      const pplxKey = config.perplexityApiKey;
-      if (!pplxKey) {
-        this.tlbrState.lastOpusCallAt = now; // avoid hammering logs
+      // Guard: if DB already has an open tlbr trade but state is discovery, reconcile to in_trade
+      const dbOpenTlbr = (await storage.getOpenTrades()).find(t => t.strategy === "tlbr");
+      if (dbOpenTlbr) {
+        this.tlbrState.openTradeId = dbOpenTlbr.id;
+        this.tlbrState.mode = "in_trade";
+        await this.saveTlbrState();
         return;
       }
 
-      log(`[TLBR] Discovery scan starting — ${(sinceLast / 60000).toFixed(0)}min since last call`, "engine");
-      this.tlbrState.lastOpusCallAt = now;
+      const sinceLastDiscovery = now - this.tlbrState.lastDiscoveryAt;
+      const intervalMs = TLBR_DISCOVERY_INTERVAL_MIN * 60 * 1000;
+      if (sinceLastDiscovery < intervalMs) return;
+
+      const pplxKey = config.perplexityApiKey;
+      if (!pplxKey) {
+        this.tlbrState.lastDiscoveryAt = now;
+        await this.saveTlbrState();
+        return;
+      }
+
+      log(`[TLBR] Discovery scan starting — ${(sinceLastDiscovery / 60000).toFixed(0)}min since last call`, "engine");
+      this.tlbrState.lastDiscoveryAt = now;
       await this.saveTlbrState();
 
       const candles5m = await fetchCandlesOHLCV("BTC", "5m", 96);
@@ -1464,29 +1826,119 @@ class TradingEngine {
         return;
       }
 
-      const analysis = await fetchTlbrAnalysis(pplxKey, candles5m, currentPrice);
-      if (!analysis.setup) return;
-      if (analysis.confidence < 7) {
-        log(`[TLBR] Setup rejected: conf ${analysis.confidence}/10 < 7`, "engine");
+      const discovery = await fetchTlbrDiscovery(pplxKey, candles5m, currentPrice);
+      if (!discovery.setup) {
+        log(`[TLBR] Discovery: no qualified setup — ${discovery.reasoning.slice(0, 140)}`, "engine");
+        return;
+      }
+      if (discovery.confidence < 7) {
+        log(`[TLBR] Discovery rejected: conf ${discovery.confidence}/10 < 7`, "engine");
         return;
       }
 
-      // Skip if this trendline was already consumed
-      const tlId = tlbrTrendlineId(analysis.setup.trendline);
+      // Breakout must be within last 15min
+      const breakoutAge = now - discovery.setup.breakoutAt;
+      if (breakoutAge > TLBR_BREAKOUT_MAX_AGE_MS) {
+        log(`[TLBR] Discovery rejected: breakout age ${(breakoutAge / 60000).toFixed(1)}min > 15min`, "engine");
+        return;
+      }
+
+      // Quality gates
+      if (discovery.setup.touches < 3) {
+        log(`[TLBR] Discovery rejected: only ${discovery.setup.touches} touches (<3)`, "engine");
+        return;
+      }
+      if (discovery.setup.durationHours < 5) {
+        log(`[TLBR] Discovery rejected: span ${discovery.setup.durationHours.toFixed(1)}h (<5h)`, "engine");
+        return;
+      }
+
+      const tlId = tlbrTrendlineId(discovery.setup.trendline);
       if (this.tlbrState.consumedTrendlineIds.includes(tlId)) {
         log(`[TLBR] Trendline ${tlId} already consumed — skipping`, "engine");
         return;
       }
 
-      this.tlbrState.pendingSetup = analysis.setup;
+      // Transition to watching_retest
+      this.tlbrState.setup = discovery.setup;
+      this.tlbrState.mode = "watching_retest";
+      this.tlbrState.watchAttempts = 0;
+      this.tlbrState.lastWatchAt = 0;
       await this.saveTlbrState();
+      log(`[TLBR] DISCOVERY → WATCHING_RETEST | breakout $${discovery.setup.breakoutPrice.toFixed(2)} ${(breakoutAge / 60000).toFixed(1)}min ago | trendline $${discovery.setup.projectedRetest.toFixed(2)} | ${discovery.setup.touches} touches / ${discovery.setup.durationHours.toFixed(1)}h span | conf ${discovery.confidence}/10`, "engine");
       await storage.createLog({
         type: "tlbr_setup",
-        message: `TLBR setup: retest $${analysis.setup.retestLevel.toFixed(2)} zone [$${analysis.setup.retestZoneLow.toFixed(2)}-$${analysis.setup.retestZoneHigh.toFixed(2)}] conf ${analysis.confidence}/10 | ${analysis.reasoning.slice(0, 200)}`,
+        message: `TLBR setup discovered: breakout $${discovery.setup.breakoutPrice.toFixed(2)} | trendline $${discovery.setup.projectedRetest.toFixed(2)} | ${discovery.setup.touches}T/${discovery.setup.durationHours.toFixed(1)}h | conf ${discovery.confidence}/10 | ${discovery.reasoning.slice(0, 200)}`,
         timestamp: new Date().toISOString(),
       });
     } catch (e) {
       log(`[TLBR] runTlbrTick error: ${e}`, "engine");
+    }
+  }
+
+  // Helper: when a resting limit order fills, create the DB trade row and place TP+SL
+  private async recordTlbrLimitFill(fillPx: number, fillSz: number, lim: TlbrLimitOrder, setup: TlbrSetup, equity: number, config: any) {
+    try {
+      const actualTP = fillPx * (1 + TLBR_TP_PCT);
+      const actualSL = fillPx * (1 - TLBR_SL_PCT);
+      const notional = fillSz * fillPx;
+
+      const trade = await storage.createTrade({
+        coin: "BTC", side: "long", entryPrice: fillPx, size: Math.round((TLBR_MARGIN_USD / Math.max(1, equity)) * 100), leverage: TLBR_LEVERAGE,
+        entryEquity: equity,
+        notionalValue: notional,
+        rsiAtEntry: 0, rsi4h: 0, rsi1d: 0,
+        ema10: 0, ema21: 0, ema50: 0,
+        stopLoss: actualSL,
+        takeProfit1: actualTP,
+        takeProfit2: actualTP,
+        tp1Hit: false,
+        confluenceScore: 0,
+        confluenceDetails: `TLBR limit fill | trendline $${setup.projectedRetest.toFixed(2)} | conf ${setup.confidence}/10`,
+        riskRewardRatio: 1.0,
+        status: "open",
+        reason: `[TLBR] BTC LONG | LIMIT fill @ $${fillPx.toFixed(2)} | trendline $${setup.projectedRetest.toFixed(2)} | TP +${(TLBR_TP_PCT*100).toFixed(2)}% SL -${(TLBR_SL_PCT*100).toFixed(2)}% | ${TLBR_LEVERAGE}x`,
+        setupType: "tlbr",
+        strategy: "tlbr",
+        openedAt: new Date().toISOString(),
+      });
+
+      // Place SL + TP reduce-only orders on HL
+      if (config.apiSecret && config.walletAddress) {
+        const executor = createExecutor(config.apiSecret, config.walletAddress);
+        const slTriggerPx = parseFloat(formatHLPrice(actualSL, BTC_ASSET.szDecimals));
+        const slFillPx = parseFloat(formatHLPrice(actualSL * 0.98, BTC_ASSET.szDecimals));
+        try {
+          await executor.placeOrder({
+            coin: "BTC", isBuy: false, sz: fillSz,
+            limitPx: slFillPx,
+            orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
+            reduceOnly: true,
+          });
+          log(`[TLBR SL] placed @ $${slTriggerPx} sz=${fillSz}`, "engine");
+        } catch (e) { log(`[TLBR SL] error: ${e}`, "engine"); }
+
+        const tpLimitPx = parseFloat(formatHLPrice(actualTP, BTC_ASSET.szDecimals));
+        try {
+          await executor.placeOrder({
+            coin: "BTC", isBuy: false, sz: fillSz,
+            limitPx: tpLimitPx,
+            orderType: { limit: { tif: "Gtc" } },
+            reduceOnly: true,
+          });
+          log(`[TLBR TP] placed @ $${tpLimitPx} sz=${fillSz}`, "engine");
+        } catch (e) { log(`[TLBR TP] error: ${e}`, "engine"); }
+      }
+
+      this.tlbrState.openTradeId = trade.id;
+      await storage.createLog({
+        type: "trade_open",
+        message: `[TLBR] BTC LONG @ $${fillPx.toFixed(2)} | ${TLBR_LEVERAGE}x | LIMIT fill (trendline+0.1%) | TP +${(TLBR_TP_PCT*100).toFixed(2)}% / SL -${(TLBR_SL_PCT*100).toFixed(2)}% | $${TLBR_MARGIN_USD}`,
+        data: JSON.stringify(trade),
+        timestamp: new Date().toISOString(),
+      });
+    } catch (e) {
+      log(`[TLBR] recordTlbrLimitFill error: ${e}`, "engine");
     }
   }
 
@@ -1495,7 +1947,12 @@ class TradingEngine {
     try {
       this.tlbrState.cumulativePnlUsd += pnlUsd;
       if (this.tlbrState.openTradeId === tradeId) this.tlbrState.openTradeId = null;
-      log(`[TLBR] Trade #${tradeId} closed | P&L $${pnlUsd.toFixed(2)} | cumulative $${this.tlbrState.cumulativePnlUsd.toFixed(2)} / kill $${TLBR_KILL_SWITCH_USD}`, "engine");
+      // Reset state machine back to discovery after trade closes
+      this.tlbrState.mode = "discovery";
+      this.tlbrState.setup = null;
+      this.tlbrState.limitOrder = null;
+      this.tlbrState.watchAttempts = 0;
+      log(`[TLBR] Trade #${tradeId} closed | P&L $${pnlUsd.toFixed(2)} | cumulative $${this.tlbrState.cumulativePnlUsd.toFixed(2)} / kill $${TLBR_KILL_SWITCH_USD} | mode → discovery`, "engine");
       if (this.tlbrState.cumulativePnlUsd <= TLBR_KILL_SWITCH_USD && !this.tlbrState.disabled) {
         this.tlbrState.disabled = true;
         log(`[TLBR] KILL SWITCH TRIPPED on close — disabled`, "engine");
@@ -2411,16 +2868,25 @@ class TradingEngine {
           direction: "LONG only (descending trendline breakout retest)",
           asset: "BTC",
           schedule: "Mon–Fri 24h (Opus discovery every 60min)",
-          riskReward: `TP +${(TLBR_TP_PCT * 100).toFixed(2)}% / SL -${(TLBR_SL_PCT * 100).toFixed(2)}% | 1 shot per trendline | setup expires 15min | kill switch $${TLBR_KILL_SWITCH_USD}`,
+          riskReward: `TP +${(TLBR_TP_PCT * 100).toFixed(2)}% / SL -${(TLBR_SL_PCT * 100).toFixed(2)}% | 1 shot per trendline | limit TTL 15min | kill switch $${TLBR_KILL_SWITCH_USD}`,
           sizing: `$${TLBR_MARGIN_USD} margin × ${TLBR_LEVERAGE}x = $${TLBR_MARGIN_USD * TLBR_LEVERAGE} notional`,
           confidenceThreshold: "7/10",
-          llm: "Claude Opus 4.7 (trendline + retest + FVG detection)",
-          pendingSetup: this.tlbrState.pendingSetup ? {
-            retestLevel: this.tlbrState.pendingSetup.retestLevel.toFixed(2),
-            retestZone: `$${this.tlbrState.pendingSetup.retestZoneLow.toFixed(2)}–$${this.tlbrState.pendingSetup.retestZoneHigh.toFixed(2)}`,
-            confidence: `${this.tlbrState.pendingSetup.confidence}/10`,
-            hasFvg: !!this.tlbrState.pendingSetup.fvg,
-            ageMin: Math.floor((Date.now() - this.tlbrState.pendingSetup.discoveredAt) / 60000),
+          llm: "Claude Opus 4.7 (discovery + watch decisioning)",
+          mode: this.tlbrState.mode,
+          watchAttempts: this.tlbrState.watchAttempts,
+          setup: this.tlbrState.setup ? {
+            breakoutPrice: this.tlbrState.setup.breakoutPrice.toFixed(2),
+            projectedRetest: this.tlbrState.setup.projectedRetest.toFixed(2),
+            touches: this.tlbrState.setup.touches,
+            durationHours: this.tlbrState.setup.durationHours.toFixed(1),
+            confidence: `${this.tlbrState.setup.confidence}/10`,
+            ageMin: Math.floor((Date.now() - this.tlbrState.setup.discoveredAt) / 60000),
+            breakoutAgeMin: Math.floor((Date.now() - this.tlbrState.setup.breakoutAt) / 60000),
+          } : null,
+          limitOrder: this.tlbrState.limitOrder ? {
+            price: this.tlbrState.limitOrder.price.toFixed(2),
+            ageMin: Math.floor((Date.now() - this.tlbrState.limitOrder.placedAt) / 60000),
+            hlOid: this.tlbrState.limitOrder.hlOid || null,
           } : null,
         },
       },
