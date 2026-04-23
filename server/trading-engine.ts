@@ -1,5 +1,5 @@
 /**
- * HyperTrader — Trading Engine v17.4.1
+ * HyperTrader — Trading Engine v17.5
  *
  * SINGLE STRATEGY: BTC NY Open Session Trader (Mon–Fri)
  *
@@ -13,8 +13,10 @@
  *       Until 10:00 ET — if zone was provided but not touched, take MARKET at 10:00 cutoff
  *                       (user rule: "open market always if you see an opportunity")
  *   - Size: 80% of AUM, 20x leverage
- *   - TP +1.0% / SL -1.0%
- *   - BE+ rule: when price moves +0.5% in favor → SL moves to +0.25% profit lock
+ *   - TP1 +0.5% (close 50%) → TP2 +1.0% (close remaining 50%) / SL -0.5%
+ *   - On TP1 fill: SL moves to entry +0.25% (BE+ profit lock) on remaining 50%
+ *   - Technicals-first prompt + hard-veto guard (overbought at EMA200 = SKIP regardless of news)
+ *   - BE+ rule (v17.5): triggered on TP1 fill (position size halved), SL moves to +0.25% profit lock
  *   - Re-entry: allowed if TP hits within the same session window; blocked if SL hits (one failed setup = done)
  *   - Confidence threshold: ≥ 7/10
  *
@@ -56,11 +58,12 @@ const ALLOWED_ASSETS: AssetConfig[] = [
 ];
 const BTC_ASSET = ALLOWED_ASSETS[0];
 
-// v17.3 Session constants
-const SESSION_TP_PCT = 0.01;              // +1.0%
-const SESSION_SL_PCT = 0.01;              // -1.0%
-const SESSION_BE_TRIGGER_PCT = 0.5;       // price moves +0.5% in favor → trigger BE+
-const SESSION_BE_LOCK_PCT = 0.0025;       // new SL at entry ± 0.25% profit
+// v17.5 Session constants — technicals-first, TP1/TP2 scale-out
+const SESSION_TP1_PCT = 0.005;            // +0.5% — close 50%, move SL to BE+
+const SESSION_TP2_PCT = 0.01;             // +1.0% — close remaining 50%
+const SESSION_SL_PCT  = 0.005;            // -0.5%
+const SESSION_TP1_SIZE_PCT = 0.50;        // 50% of position at TP1
+const SESSION_BE_LOCK_PCT = 0.0025;       // after TP1 fills, SL moves to entry ± 0.25%
 const SESSION_EQUITY_PCT = 0.80;          // 80% of AUM per trade
 const SESSION_LEVERAGE = 20;              // 20x
 const SESSION_CONFIDENCE_THRESHOLD = 7;   // min confidence to trade
@@ -172,15 +175,29 @@ interface SessionDecision {
 }
 
 async function fetchBtcDecision(apiKey: string, news: SessionNews, tech: BtcTechnicals, currentPrice: number): Promise<SessionDecision> {
-  const systemPrompt = `You are an institutional-grade Bitcoin day-trader preparing for the US cash session open (09:30 ET). You have access to overnight news and multi-timeframe technicals. Your job is to decide ONE directional call for the NY morning session (09:30–16:00 ET).
+  const systemPrompt = `You are an institutional-grade Bitcoin day-trader preparing for the US cash session (09:30–16:00 ET). You have overnight news AND multi-timeframe technicals. Your job is to decide ONE directional call.
 
-Rules:
+=== DECISION HIERARCHY (strict order) ===
+1. TECHNICALS ARE PRIMARY — price action, RSI, EMAs, key levels determine direction and can VETO any trade.
+2. NEWS IS SECONDARY — used only to CONFIRM a technical setup or add marginal confidence. News NEVER overrides technicals. A bullish news tape into overbought technicals is a SHORT candidate, not a LONG chase.
+
+=== HARD VETOES — force SKIP regardless of news sentiment ===
+- LONG VETO: if 1h RSI ≥ 68 AND 24h change ≥ +3% AND price within 0.3% of 4h EMA200 → SKIP (do not chase overbought into resistance)
+- SHORT VETO: if 1h RSI ≤ 32 AND 24h change ≤ -3% AND price within 0.3% of 4h EMA200 → SKIP (do not short oversold into support)
+- If news contradicts technicals → cap confidence at 6 (= SKIP).
+
+=== DIRECTION LOGIC (technicals-first) ===
+- LONG setup: pullback into support, RSI oversold recovering (1h RSI rising from <40), EMA stack bullish (price above EMA20>EMA50 on 1h, above 4h EMA200). News bullish = confirm.
+- SHORT setup: rejection at resistance, RSI overbought rolling over (1h RSI falling from >65), EMA stack bearish (price below EMA20<EMA50 on 1h, below 4h EMA200). News bearish = confirm.
+- SKIP: chop, mid-range, RSI 45–55 with no clear momentum, price between key levels, news-only setups.
+
+=== OUTPUT RULES ===
 - Output "long", "short", or "skip"
-- If you pick long or short, provide a confidence score 1–10
-- Only recommend a trade you would take yourself at 10/10 institutional standards
-- If conditions are unclear, mixed, or low-conviction → "skip"
+- confidence 1-4 = weak (= skip), 5-6 = moderate (= skip), 7-8 = strong, 9-10 = very strong
+- Only recommend a trade you would take at 10/10 institutional standards
 - Entry price: provide a specific BTC price if you see a better-than-market entry zone within 0.3% of current price; otherwise set entry = null (meaning "market at open")
-- confidence 1-4 = weak (= skip), 5-6 = moderate, 7-8 = strong, 9-10 = very strong
+- In reasoning, state the TECHNICAL thesis FIRST, then use news as confirmation/tiebreaker.
+- If any HARD VETO triggers, you must output "skip" and state which veto fired.
 
 RESPOND IN EXACTLY THIS JSON FORMAT (no markdown, no code fences):
 {
@@ -247,11 +264,27 @@ Decide direction for the NY session. Return the JSON object only.`;
     let jsonStr = text.trim();
     if (jsonStr.startsWith("```")) jsonStr = jsonStr.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
     const parsed = JSON.parse(jsonStr);
-    const direction = parsed.direction === "long" || parsed.direction === "short" ? parsed.direction : "skip";
-    const confidence = typeof parsed.confidence === "number" ? Math.min(10, Math.max(0, parsed.confidence)) : 0;
+    let direction = parsed.direction === "long" || parsed.direction === "short" ? parsed.direction : "skip";
+    let confidence = typeof parsed.confidence === "number" ? Math.min(10, Math.max(0, parsed.confidence)) : 0;
     let entry: number | null = null;
     if (typeof parsed.entry === "number" && parsed.entry > 0) entry = parsed.entry;
-    const reasoning = String(parsed.reasoning || "").slice(0, 800);
+    let reasoning = String(parsed.reasoning || "").slice(0, 800);
+
+    // v17.5 CODE-LEVEL VETO GUARD — belt-and-suspenders: override Opus if it still picks long/short under extreme conditions
+    const distToEma200Pct = tech.ema200_4h > 0 ? Math.abs(currentPrice - tech.ema200_4h) / tech.ema200_4h * 100 : 999;
+    const longVeto  = tech.rsi1h >= 68 && tech.change24h >= 3.0 && distToEma200Pct <= 0.3;
+    const shortVeto = tech.rsi1h <= 32 && tech.change24h <= -3.0 && distToEma200Pct <= 0.3;
+    if (direction === "long" && longVeto) {
+      const vetoMsg = `VETO-LONG: 1h RSI ${tech.rsi1h.toFixed(1)}≥68, 24h chg ${tech.change24h.toFixed(2)}%≥+3%, dist to 4h EMA200 ${distToEma200Pct.toFixed(2)}%≤0.3% — forcing SKIP`;
+      log(`[SESSION VETO] ${vetoMsg}`, "engine");
+      reasoning = `[CODE VETO] ${vetoMsg} | Original Opus: ${reasoning}`;
+      direction = "skip"; confidence = Math.min(confidence, 4); entry = null;
+    } else if (direction === "short" && shortVeto) {
+      const vetoMsg = `VETO-SHORT: 1h RSI ${tech.rsi1h.toFixed(1)}≤32, 24h chg ${tech.change24h.toFixed(2)}%≤-3%, dist to 4h EMA200 ${distToEma200Pct.toFixed(2)}%≤0.3% — forcing SKIP`;
+      log(`[SESSION VETO] ${vetoMsg}`, "engine");
+      reasoning = `[CODE VETO] ${vetoMsg} | Original Opus: ${reasoning}`;
+      direction = "skip"; confidence = Math.min(confidence, 4); entry = null;
+    }
 
     log(`[SESSION DECISION] Opus: ${direction.toUpperCase()} conf=${confidence}/10 entry=${entry ?? "MARKET"} | ${reasoning.slice(0, 150)}`, "engine");
     return { direction, entry, confidence, reasoning, raw: text.slice(0, 1500) };
@@ -728,10 +761,10 @@ class TradingEngine {
 
     await storage.createLog({
       type: "system",
-      message: `Engine v17.4.1 started | BTC NY Session Trader (Mon–Fri, 08:30–15:30 ET w/ qualification-gate retry every 15m, 80% AUM, 20x, TP+1% / SL-1% / BE+@0.5%→+0.25%) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
+      message: `Engine v17.5 started | BTC NY Session Trader (Mon–Fri, 08:30–15:30 ET w/ qualification-gate retry every 15m, 80% AUM, 20x, TP1+0.5%/TP2+1.0% split 50/50 / SL-0.5% / BE+@TP1→+0.25% | technicals-first + hard-veto) | AUM: $${this.lastKnownEquity.toLocaleString()}`,
       timestamp: new Date().toISOString(),
     });
-    log(`Engine v17.4.1 started | BTC NY Session Trader (retry-loop 08:45–15:30 ET) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
+    log(`Engine v17.5 started | BTC NY Session Trader (retry-loop 08:45–15:30 ET, TP1/TP2 split, technicals-first) | AUM: $${this.lastKnownEquity.toFixed(2)}`, "engine");
     this.scheduleNextScan();
     this.scheduleNextSessionTick();
   }
@@ -795,8 +828,11 @@ class TradingEngine {
     side: "long" | "short";
     equityPct: number;
     leverage: number;
-    tpPct: number;
+    tpPct: number;          // legacy/single-TP strategies (PURE_RSI, HSTAR) — used when tp1Pct not provided
     slPct: number;
+    tp1Pct?: number;        // v17.5: if provided, split TP into TP1+TP2 (session engine)
+    tp2Pct?: number;        // v17.5
+    tp1SizePct?: number;    // v17.5: fraction of position closed at TP1 (default 0.5)
     price: number;
     equity: number;
     entryReason: string;
@@ -805,6 +841,10 @@ class TradingEngine {
     limitExpiresAtMs?: number;       // optional: drop to market if unfilled after this timestamp
   }): Promise<boolean> {
     const { asset, strategy, side, equityPct, leverage, tpPct, slPct, price, equity, entryReason, config, useLimit } = params;
+    const hasDualTp = typeof params.tp1Pct === "number" && typeof params.tp2Pct === "number";
+    const tp1Pct = hasDualTp ? params.tp1Pct! : tpPct;
+    const tp2Pct = hasDualTp ? params.tp2Pct! : tpPct;
+    const tp1SizePct = typeof params.tp1SizePct === "number" ? params.tp1SizePct : 0.5;
     const stratLabel = strategy === "btc_session" ? "SESSION" : strategy.toUpperCase();
     const isBuy = side === "long";
 
@@ -817,12 +857,14 @@ class TradingEngine {
       return false;
     }
 
-    const tp = isBuy ? price * (1 + tpPct) : price * (1 - tpPct);
+    const tp = isBuy ? price * (1 + tp1Pct) : price * (1 - tp1Pct);
     const sl = isBuy ? price * (1 - slPct) : price * (1 + slPct);
-    const tpPctLabel = `+${(tpPct * 100).toFixed(2)}%`;
+    const tpPctLabel = hasDualTp
+      ? `TP1 +${(tp1Pct * 100).toFixed(2)}% (50%) → TP2 +${(tp2Pct * 100).toFixed(2)}% (50%)`
+      : `+${(tpPct * 100).toFixed(2)}%`;
     const slPctLabel = `SL -${(slPct * 100).toFixed(1)}%`;
 
-    log(`[${stratLabel}] ${asset.coin} ${side.toUpperCase()} ${useLimit ? "LIMIT" : "MKT"} @ $${price} | TP ${tpPctLabel} | ${slPctLabel} | ${leverage}x | ${entryReason}`, "engine");
+    log(`[${stratLabel}] ${asset.coin} ${side.toUpperCase()} ${useLimit ? "LIMIT" : "MKT"} @ $${price} | ${tpPctLabel} | ${slPctLabel} | ${leverage}x | ${entryReason}`, "engine");
 
     let fillPrice = price;
     let filledSz = 0;
@@ -892,9 +934,14 @@ class TradingEngine {
 
     if (filledSz <= 0) return false;
 
-    const actualTP = isBuy ? fillPrice * (1 + tpPct) : fillPrice * (1 - tpPct);
-    const actualSL = isBuy ? fillPrice * (1 - slPct) : fillPrice * (1 + slPct);
+    const actualTP1 = isBuy ? fillPrice * (1 + tp1Pct) : fillPrice * (1 - tp1Pct);
+    const actualTP2 = isBuy ? fillPrice * (1 + tp2Pct) : fillPrice * (1 - tp2Pct);
+    const actualSL  = isBuy ? fillPrice * (1 - slPct)  : fillPrice * (1 + slPct);
     const actualNotional = filledSz * fillPrice;
+
+    // v17.5: split filled size into TP1 + TP2 halves (rounded to szDecimals)
+    const tp1Sz = hasDualTp ? parseFloat(formatHLSize(filledSz * tp1SizePct, asset.szDecimals)) : filledSz;
+    const tp2Sz = hasDualTp ? parseFloat(formatHLSize(filledSz - tp1Sz, asset.szDecimals)) : filledSz;
 
     const trade = await storage.createTrade({
       coin: asset.coin, side, entryPrice: fillPrice, size: Math.round(equityPct * 100), leverage,
@@ -903,14 +950,14 @@ class TradingEngine {
       rsiAtEntry: 0, rsi4h: 0, rsi1d: 0,
       ema10: 0, ema21: 0, ema50: 0,
       stopLoss: actualSL,
-      takeProfit1: actualTP,
-      takeProfit2: actualTP,
+      takeProfit1: actualTP1,
+      takeProfit2: hasDualTp ? actualTP2 : actualTP1,
       tp1Hit: false,
       confluenceScore: 0,
       confluenceDetails: `${stratLabel}: ${entryReason}`,
-      riskRewardRatio: 1.0,
+      riskRewardRatio: hasDualTp ? (tp2Pct / slPct) : 1.0,
       status: "open",
-      reason: `[${stratLabel}] ${asset.coin} ${side.toUpperCase()} | ${entryReason} | ${slPctLabel} | TP ${tpPctLabel} | ${leverage}x`,
+      reason: `[${stratLabel}] ${asset.coin} ${side.toUpperCase()} | ${entryReason} | ${slPctLabel} | ${tpPctLabel} | ${leverage}x`,
       setupType: strategy,
       strategy,
       openedAt: new Date().toISOString(),
@@ -928,16 +975,40 @@ class TradingEngine {
           orderType: { trigger: { triggerPx: String(slTriggerPx), isMarket: true, tpsl: "sl" } },
           reduceOnly: true,
         });
-        log(`[SL ORDER] ${asset.coin} SL placed @ $${slTriggerPx} (${slPctLabel})`, "engine");
+        log(`[SL ORDER] ${asset.coin} SL placed @ $${slTriggerPx} (${slPctLabel}) sz=${filledSz}`, "engine");
 
-        const tpLimitPx = parseFloat(formatHLPrice(actualTP, asset.szDecimals));
-        await executor.placeOrder({
-          coin: asset.coin, isBuy: !isBuy, sz: filledSz,
-          limitPx: tpLimitPx,
-          orderType: { limit: { tif: "Gtc" } },
-          reduceOnly: true,
-        });
-        log(`[TP ORDER] ${asset.coin} TP placed @ $${tpLimitPx} (${tpPctLabel})`, "engine");
+        if (hasDualTp) {
+          // v17.5: TP1 at +0.5% (50% size)  +  TP2 at +1.0% (50% size)
+          const tp1LimitPx = parseFloat(formatHLPrice(actualTP1, asset.szDecimals));
+          if (tp1Sz > 0) {
+            await executor.placeOrder({
+              coin: asset.coin, isBuy: !isBuy, sz: tp1Sz,
+              limitPx: tp1LimitPx,
+              orderType: { limit: { tif: "Gtc" } },
+              reduceOnly: true,
+            });
+            log(`[TP1 ORDER] ${asset.coin} TP1 placed @ $${tp1LimitPx} (+${(tp1Pct*100).toFixed(2)}%) sz=${tp1Sz}`, "engine");
+          }
+          const tp2LimitPx = parseFloat(formatHLPrice(actualTP2, asset.szDecimals));
+          if (tp2Sz > 0) {
+            await executor.placeOrder({
+              coin: asset.coin, isBuy: !isBuy, sz: tp2Sz,
+              limitPx: tp2LimitPx,
+              orderType: { limit: { tif: "Gtc" } },
+              reduceOnly: true,
+            });
+            log(`[TP2 ORDER] ${asset.coin} TP2 placed @ $${tp2LimitPx} (+${(tp2Pct*100).toFixed(2)}%) sz=${tp2Sz}`, "engine");
+          }
+        } else {
+          const tpLimitPx = parseFloat(formatHLPrice(actualTP1, asset.szDecimals));
+          await executor.placeOrder({
+            coin: asset.coin, isBuy: !isBuy, sz: filledSz,
+            limitPx: tpLimitPx,
+            orderType: { limit: { tif: "Gtc" } },
+            reduceOnly: true,
+          });
+          log(`[TP ORDER] ${asset.coin} TP placed @ $${tpLimitPx} (+${(tp1Pct*100).toFixed(2)}%)`, "engine");
+        }
       } catch (orderErr) {
         log(`[SL/TP ORDER] FAILED ${asset.coin}: ${orderErr} — will monitor in checkExits`, "engine");
       }
@@ -1303,8 +1374,11 @@ class TradingEngine {
       side: dec.direction as "long" | "short",
       equityPct: SESSION_EQUITY_PCT,
       leverage: SESSION_LEVERAGE,
-      tpPct: SESSION_TP_PCT,
+      tpPct: SESSION_TP1_PCT,  // legacy field (kept for back-compat)
       slPct: SESSION_SL_PCT,
+      tp1Pct: SESSION_TP1_PCT,
+      tp2Pct: SESSION_TP2_PCT,
+      tp1SizePct: SESSION_TP1_SIZE_PCT,
       price: entryPrice,
       equity,
       entryReason,
@@ -1458,13 +1532,37 @@ class TradingEngine {
       }
       const pnlOfAum = eqForTrade > 0 ? (pnlUsd / eqForTrade) * 100 : 0;
 
-      // v17.1 BE+: when price moves +0.5% in favor → SL moves to +0.25% profit lock
+      // v17.5 BE+: trigger on TP1 FILL (position size halved) — SL moves to entry +0.25% profit lock on remaining 50%.
+      // Detection: if HL position size is now <= ~55% of original tp1+tp2 intended size, TP1 filled.
       const priceMovePct = trade.entryPrice > 0
         ? (isLong ? (currentPrice - trade.entryPrice) / trade.entryPrice * 100 : (trade.entryPrice - currentPrice) / trade.entryPrice * 100)
         : 0;
       const isBESL = this.beApplied.has(trade.id);
 
-      if (isSession && !isBESL && priceMovePct >= SESSION_BE_TRIGGER_PCT && config.apiSecret && config.walletAddress) {
+      // v17.5: detect TP1 fill via HL position size shrinking relative to original notional
+      let tp1Filled = trade.tp1Hit === true;
+      if (isSession && !tp1Filled && hlPos?.szi !== undefined) {
+        const currentAbsSz = Math.abs(parseFloat(String(hlPos.szi)));
+        const originalNotional = (trade as any).notionalValue || 0;
+        const originalSz = originalNotional > 0 && trade.entryPrice > 0 ? originalNotional / trade.entryPrice : 0;
+        // TP1 considered filled when remaining size ≤ 60% of original (50% +10% rounding buffer)
+        if (originalSz > 0 && currentAbsSz > 0 && currentAbsSz <= originalSz * 0.60) {
+          tp1Filled = true;
+          await storage.updateTrade(trade.id, { tp1Hit: true });
+          trade.tp1Hit = true;
+          const tp1PctStr = (trade.takeProfit1 && trade.takeProfit1 > 0 && trade.entryPrice > 0)
+            ? Math.abs((trade.takeProfit1 - trade.entryPrice) / trade.entryPrice * 100).toFixed(2)
+            : "?";
+          log(`[TP1 FILLED] Trade #${trade.id} ${trade.coin} ${trade.side.toUpperCase()} | orig size ${originalSz.toFixed(5)} → remaining ${currentAbsSz.toFixed(5)} (~50% closed at TP1)`, "engine");
+          await storage.createLog({
+            type: "system",
+            message: `[TP1 FILLED SESSION] ${trade.coin} ${trade.side.toUpperCase()} +${tp1PctStr}% — 50% closed, moving SL to BE+`,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+
+      if (isSession && !isBESL && tp1Filled && config.apiSecret && config.walletAddress) {
         try {
           const executor = createExecutor(config.apiSecret, config.walletAddress);
           const newSL = isLong
@@ -1490,10 +1588,10 @@ class TradingEngine {
             trade.stopLoss = newSL;
             this.beApplied.add(trade.id);
             const sideLabel = isLong ? "LONG" : "SHORT";
-            log(`[BE+ SESSION] Trade #${trade.id} ${trade.coin} ${sideLabel} | +${priceMovePct.toFixed(2)}% in favor → SL $${displayPrice(newSL, szd)} (+0.25% profit lock)`, "engine");
+            log(`[BE+ SESSION] Trade #${trade.id} ${trade.coin} ${sideLabel} | TP1 filled → SL $${displayPrice(newSL, szd)} (+0.25% profit lock on remaining ${sz.toFixed(5)})`, "engine");
             await storage.createLog({
               type: "system",
-              message: `[BE+ SESSION] ${trade.coin} ${sideLabel} | +${priceMovePct.toFixed(2)}% → SL locked at +0.25% ($${displayPrice(newSL, szd)})`,
+              message: `[BE+ SESSION] ${trade.coin} ${sideLabel} | TP1 hit → SL locked at +0.25% ($${displayPrice(newSL, szd)})`,
               timestamp: new Date().toISOString(),
             });
           }
@@ -1850,7 +1948,7 @@ class TradingEngine {
       allowedAssets: ALLOWED_ASSETS.map(a => ({ coin: a.coin, name: a.displayName, category: a.category, maxLev: a.maxLeverage })),
       openTradesWithUsd,
       sessionState: this.sessionState,
-      version: "v17.4.1",
+      version: "v17.5",
       strategyStats: {
         btc_session: {
           trades: sessionTrades.length,
@@ -1862,7 +1960,7 @@ class TradingEngine {
           direction: "LONG + SHORT",
           asset: "BTC",
           schedule: "Mon–Fri 08:30–10:00 ET (Sonar→Opus→NY Open)",
-          riskReward: "TP +1.0% / SL -1.0% | BE+ @ +0.5% → SL +0.25% profit lock",
+          riskReward: "TP1 +0.5% (50%) → TP2 +1.0% (50%) / SL -0.5% | BE+ @ TP1 fill → SL +0.25% profit lock | Technicals-first + hard veto",
           sizing: `${(SESSION_EQUITY_PCT * 100).toFixed(0)}% of AUM, ${SESSION_LEVERAGE}x leverage`,
           confidenceThreshold: `${SESSION_CONFIDENCE_THRESHOLD}/10`,
           llm: "Claude Opus 4.7 (decision) + Sonar (news)",
