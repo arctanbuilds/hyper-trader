@@ -1645,8 +1645,9 @@ class TradingEngine {
         const sinceLastWatch = now - this.tlbrState.lastWatchAt;
         if (sinceLastWatch < TLBR_WATCH_INTERVAL_MIN * 60 * 1000) return;
 
-        const pplxKey = config.perplexityApiKey;
+        const pplxKey = process.env.PERPLEXITY_API_KEY || "";
         if (!pplxKey) {
+          log(`[TLBR] watch: PERPLEXITY_API_KEY missing in env—cannot run Opus`, "engine");
           this.tlbrState.lastWatchAt = now;
           await this.saveTlbrState();
           return;
@@ -1816,8 +1817,10 @@ class TradingEngine {
       const intervalMs = TLBR_DISCOVERY_INTERVAL_MIN * 60 * 1000;
       if (sinceLastDiscovery < intervalMs) return;
 
-      const pplxKey = config.perplexityApiKey;
+      const pplxKey = process.env.PERPLEXITY_API_KEY || "";
       if (!pplxKey) {
+        log(`[TLBR] discovery: PERPLEXITY_API_KEY missing in env—cannot run Opus`, "engine");
+        await storage.createLog({ type: "tlbr_discovery", message: `TLBR discovery blocked: PERPLEXITY_API_KEY not set in env`, timestamp: new Date().toISOString() });
         this.tlbrState.lastDiscoveryAt = now;
         await this.saveTlbrState();
         return;
