@@ -1005,6 +1005,7 @@ class TradingEngine {
 
   // v17.6 TLBR state (in-memory cache; persisted to storage.config.tlbrState)
   private tlbrState: TlbrState = emptyTlbrState();
+  private _lastTlbrTickLog: number = 0;
 
   private resetLossTrackers() {
     this.dailyTradeCount = 0;
@@ -1485,6 +1486,12 @@ class TradingEngine {
 
   private async runTlbrTick(equity: number, config: any) {
     try {
+      // Diagnostic: log tick every 60s so we can confirm loop health
+      const __tickNow = Date.now();
+      if (!this._lastTlbrTickLog || __tickNow - this._lastTlbrTickLog > 60_000) {
+        log(`[TLBR TICK] mode=${this.tlbrState.mode} disabled=${this.tlbrState.disabled} cumPnl=$${this.tlbrState.cumulativePnlUsd.toFixed(2)} lastDiscovery=${this.tlbrState.lastDiscoveryAt ? ((__tickNow - this.tlbrState.lastDiscoveryAt)/60000).toFixed(1)+"min ago" : "never"} openTradeId=${this.tlbrState.openTradeId}`, "engine");
+        this._lastTlbrTickLog = __tickNow;
+      }
       // Kill switch
       if (this.tlbrState.disabled) return;
       if (this.tlbrState.cumulativePnlUsd <= TLBR_KILL_SWITCH_USD) {
